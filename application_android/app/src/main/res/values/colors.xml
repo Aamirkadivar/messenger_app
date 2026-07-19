@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Light Theme Colors - Telegram Inspired -->
+
+    <!-- Primary Colors - Telegram Blue -->
+    <color name="primary_color">#007AFF</color>
+    <color name="primary_dark">#0056CC</color>
+    <color name="on_primary">#FFFFFF</color>
+
+    <!-- Secondary Colors -->
+    <color name="secondary_color">#34B7F1</color>
+    <color name="secondary_dark">#2196F3</color>
+    <color name="on_secondary">#FFFFFF</color>
+
+    <!-- Background Colors -->
+    <color name="window_background">#F0F2F5</color>
+    <color name="background_color">#FFFFFF</color>
+    <color name="surface_color">#FFFFFF</color>
+    <color name="surface_variant">#F8F9FA</color>
+
+    <!-- Chat Bubbles - Sent Messages -->
+    <color name="bubble_sent">#E3F2FD</color>
+    <color name="bubble_sent_pressed">#BBDEFB</color>
+
+    <!-- Chat Bubbles - Received Messages -->
+    <color name="bubble_received">#FFFFFF</color>
+
+    <!-- Status Colors -->
+    <color name="color_online">#4CAF50</color>
+    <color name="color_offline">#9E9E9E</color>
+    <color name="color_typing">#007AFF</color>
+    <color name="color_error">#F44336</color>
+    <color name="color_warning">#FF9800</color>
+    <color name="color_success">#4CAF50</color>
+
+    <!-- Text Colors -->
+    <color name="text_primary">#1A1A1A</color>
+    <color name="text_secondary">#65676B</color>
+    <color name="text_tertiary">#8E8E93</color>
+    <color name="text_on_primary">#FFFFFF</color>
+
+    <!-- Divider & Border -->
+    <color name="divider_color">#E4E4E8</color>
+    <color name="border_color">#E0E0E0</color>
+
+    <!-- Overlay & Shadow -->
+    <color name="overlay_dark">#80000000</color>
+    <color name="shadow_color">#00000026</color>
+
+    <!-- Special -->
+    <color name="transparent">@android:color/transparent</color>
+    <color name="white">#FFFFFF</color>
+    <color name="black">#000000</color>
+
+    <!-- Time Stamp Color -->
+    <color name="timestamp_color">#8E8E93</color>
+
+    <!-- Read Receipt Color -->
+    <color name="read_receipt_blue">#007AFF</color>
+    <color name="read_receipt_gray">#8E8E93</color>
+
+    <!-- Link Color -->
+    <color name="link_color">#007AFF</color>
+
+    <!-- Mention Color -->
+    <color name="mention_bg">#007AFF20</color>
+    <color name="mention_text">#007AFF</color>
+
+    <!-- Reply Preview -->
+    <color name="reply_preview_line">#007AFF</color>
+    <color name="reply_preview_bg">#F2F2F7</color>
+
+    <!-- Input Field -->
+    <color name="input_background">#F2F2F7</color>
+    <color name="input_border">#E4E4E8</color>
+
+    <!-- Icon Colors -->
+    <color name="icon_primary">#1A1A1A</color>
+    <color name="icon_secondary">#65676B</color>
+    <color name="icon_disabled">#C7C7CC</color>
+
+    <!-- Attachment Menu -->
+    <color name="attachment_menu_bg">#FFFFFF</color>
+
+    <!-- Search -->
+    <color name="search_background">#E3E4E8</color>
+
+    <!-- Status Bar -->
+    <color name="status_bar_color">#007AFF</color>
+
+    <!-- Notification -->
+    <color name="notification_bg">#007AFF</color>
+    <color name="notification_text">#FFFFFF</color>
+
+    <!-- Loading / Shimmer -->
+    <color name="shimmer_base">#E0E0E0</color>
+    <color name="shimmer_highlight">#F0F0F0</color>
+
+    <!-- ==================== -->
+    <!-- DARK THEME COLORS    -->
+    <!-- ==================== -->
+
+    <color name="dark_background_color">#1C1C1E</color>
+    <color name="dark_surface_color">#2C2C2E</color>
+    <color name="dark_surface_variant">#3A3A3C</color>
+    <color name="dark_window_background">#000000</color>
+    <color name="dark_primary_color">#0A84FF</color>
+    <color name="dark_primary_dark">#0056CC</color>
+    <color name="dark_on_primary">#FFFFFF</color>
+    <color name="dark_secondary_color">#5AC8FA</color>
+    <color name="dark_secondary_dark">#0070E0</color>
+    <color name="dark_on_secondary">#FFFFFF</color>
+    <color name="dark_text_primary">#FFFFFF</color>
+    <color name="dark_text_secondary">#98989F</color>
+    <color name="dark_text_tertiary">#636366</color>
+    <color name="dark_divider_color">#38383A</color>
+    <color name="dark_border_color">#48484A</color>
+    <color name="dark_bubble_sent">#0056CC</color>
+    <color name="dark_bubble_received">#2C2C2E</color>
+    <color name="dark_timestamp_color">#636366</color>
+    <color name="dark_input_background">#3A3A3C</color>
+    <color name="dark_search_background">#2C2C2E</color>
+    <color name="dark_reply_preview_bg">#2C2C2E</color>
+    <color name="dark_reply_preview_line">#0A84FF</color>
+    <color name="dark_status_bar_color">#000000</color>
+    <color name="dark_icon_primary">#FFFFFF</color>
+    <color name="dark_icon_secondary">#98989F</color>
+    <color name="dark_icon_disabled">#636366</color>
+    <color name="dark_attachment_menu_bg">#2C2C2E</color>
+    <color name="dark_shimmer_base">#3A3A3C</color>
+    <color name="dark_shimmer_highlight">#48484A</color>
+    <color name="dark_mention_bg">#0A84FF20</color>
+    <color name="dark_mention_text">#5AC8FA</color>
+</resources>

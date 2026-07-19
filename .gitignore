@@ -1,0 +1,67 @@
+# Android/Flutter
+build/
+.dart_tool/
+.packages
+package_config.json
+*.iml
+.idea/
+*.DS_Store
+*.swp
+*.swo
+*~
+
+# Go
+vendor/
+
+# Docker
+.env
+.env.local
+.env.*.local
+
+# IDE - VS Code
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Firebase
+firebase-debug.log
+firebase-debug.%.log
+
+# Crypto keys and sensitive data
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# Local configuration files
+config/local.yml
+config/local.json

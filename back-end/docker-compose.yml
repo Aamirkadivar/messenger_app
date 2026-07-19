@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: messenger_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: messenger
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - messenger_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: messenger_app
+    restart: unless-stopped
+    environment:
+      APP_PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: messenger
+      DB_SSLMODE: disable
+      JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      JWT_EXPIRATION: 24
+      REFRESH_TOKEN_EXPIRATION: 168
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-your-32-byte-encryption-key-here}
+      FIREBASE_SERVICE_ACCOUNT_PATH: /app/firebase/service-account.json
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./firebase:/app/firebase:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - messenger_network
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  messenger_network:
+    driver: bridge

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark Theme Color Overrides -->
+    <color name="primary_color">@color/dark_primary_color</color>
+    <color name="primary_dark">@color/dark_primary_dark</color>
+    <color name="on_primary">@color/dark_on_primary</color>
+    <color name="secondary_color">@color/dark_secondary_color</color>
+    <color name="secondary_variant">@color/dark_secondary_dark</color>
+    <color name="on_secondary">@color/dark_on_secondary</color>
+    <color name="background_color">@color/dark_background_color</color>
+    <color name="surface_color">@color/dark_surface_color</color>
+    <color name="surface_variant">@color/dark_surface_variant</color>
+    <color name="window_background">@color/dark_window_background</color>
+    <color name="text_primary">@color/dark_text_primary</color>
+    <color name="text_secondary">@color/dark_text_secondary</color>
+    <color name="text_tertiary">@color/dark_text_tertiary</color>
+    <color name="divider_color">@color/dark_divider_color</color>
+    <color name="border_color">@color/dark_border_color</color>
+    <color name="bubble_sent">@color/dark_bubble_sent</color>
+    <color name="bubble_received">@color/dark_bubble_received</color>
+    <color name="timestamp_color">@color/dark_timestamp_color</color>
+    <color name="input_background">@color/dark_input_background</color>
+    <color name="search_background">@color/dark_search_background</color>
+    <color name="reply_preview_bg">@color/dark_reply_preview_bg</color>
+    <color name="reply_preview_line">@color/dark_reply_preview_line</color>
+    <color name="status_bar_color">@color/dark_status_bar_color</color>
+    <color name="icon_primary">@color/dark_icon_primary</color>
+    <color name="icon_secondary">@color/dark_icon_secondary</color>
+    <color name="icon_disabled">@color/dark_icon_disabled</color>
+    <color name="attachment_menu_bg">@color/dark_attachment_menu_bg</color>
+    <color name="shimmer_base">@color/dark_shimmer_base</color>
+    <color name="shimmer_highlight">@color/dark_shimmer_highlight</color>
+    <color name="mention_bg">@color/dark_mention_bg</color>
+    <color name="mention_text">@color/dark_mention_text</color>
+</resources>
