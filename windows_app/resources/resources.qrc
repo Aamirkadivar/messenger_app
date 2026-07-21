@@ -1,0 +1,14 @@
+<RCC>
+    <qresource prefix="/">
+        <file>../qml/main.qml</file>
+        <file>../qml/Login.qml</file>
+        <file>../qml/Register.qml</file>
+        <file>../qml/ChatList.qml</file>
+        <file>../qml/ChatView.qml</file>
+        <file>../qml/MessageBubble.qml</file>
+        <file>../qml/Settings.qml</file>
+    </qresource>
+    <qresource prefix="/icons">
+        <file>icons/send.svg</file>
+    </qresource>
+</RCC>

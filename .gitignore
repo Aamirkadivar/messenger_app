@@ -65,3 +65,85 @@ firebase-debug.%.log
 # Local configuration files
 config/local.yml
 config/local.json
+
+# ---- Qt ----
+*.pro.user
+*.pro.user.*
+*.qbs.user
+*.qbs.user.*
+*.moc
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.qmlc
+*.jsc
+Makefile*
+*build-*/
+
+# ---- Qt Creator ----
+CMakeLists.txt.user
+CMakeLists.txt.user.*
+.qtc_clangd/
+.qtc/
+
+# ---- CMake ----
+build/
+out/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+*_autogen/
+*_autogen.dir/
+
+# ---- vcpkg ----
+vcpkg_installed/
+/vcpkg/
+!/vcpkg.json
+!/vcpkg-configuration.json
+
+# ---- Visual Studio / Windows ----
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.VC.opendb
+Debug/
+Release/
+x64/
+x86/
+*.ilk
+*.pdb
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.log
+
+# ---- Installer / packaging output ----
+*.msi
+*.exe.manifest
+_CPack_Packages/
+CPackConfig.cmake
+CPackSourceConfig.cmake
+windows_app/dist/
+
+# ---- General ----
+*.bak
+*.tmp
+*.user
+*.autosave
+.DS_Store
+Thumbs.db

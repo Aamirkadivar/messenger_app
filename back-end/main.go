@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"messenger-app/config"
+	"messenger-app/crypto"
 	"messenger-app/database"
 	"messenger-app/firebase"
 	"messenger-app/handlers"
@@ -48,6 +49,7 @@ func main() {
 	messageService := handlers.NewMessageService(hub)
 	groupService := handlers.NewGroupService(hub)
 	userHandler := handlers.NewUserHandler()
+	cryptoHandler := handlers.NewCryptoHandler()
 	_ = middleware.AuthMiddleware // referenced for documentation
 
 	// Create Fiber app
@@ -129,6 +131,13 @@ func main() {
 	messageRoutes.Get("/:chat_id", messageService.GetMessages)
 	messageRoutes.Delete("/:chat_id/:message_id", messageService.DeleteMessage)
 	messageRoutes.Post("/:chat_id/unread", messageService.GetUnreadCount)
+
+	// Crypto/E2EE routes
+	cryptoRoutes := protected.Group("/crypto")
+	cryptoRoutes.Post("/public-key", cryptoHandler.SavePublicKey)
+	cryptoRoutes.Get("/public-key", cryptoHandler.GetPublicKey)
+	cryptoRoutes.Get("/public-key/:user_id", cryptoHandler.GetPublicKeyByUserId)
+	cryptoRoutes.Post("/generate-keypair", cryptoHandler.GenerateKeyPairHandler)
 
 	// WebSocket route
 	app.Get("/ws", middleware.WebSocketAuth(cfg), websocket.WSHandler(hub))

@@ -1,0 +1,19 @@
+{
+  "name": "messenger-app",
+  "version": "1.0.0",
+  "dependencies": [
+    "libsodium",
+    "nlohmann-json"
+  ],
+  "builtin-baseline": "0878b5224d4a4968940ee296a2e7fae2d3b62983",
+  "overrides": [
+    {
+      "name": "libsodium",
+      "version": "1.0.20"
+    },
+    {
+      "name": "nlohmann-json",
+      "version": "3.11.3"
+    }
+  ]
+}
