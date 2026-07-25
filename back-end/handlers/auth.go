@@ -49,6 +49,9 @@ func (h *AuthService) Register(c *fiber.Ctx) error {
 		})
 	}
 
+	// Normalize so "Foo@Bar.com" and "foo@bar.com" are treated as the same account
+	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+
 	// Check if user already exists
 	var existingUser models.User
 	if err := database.DB.Where("email = ?", input.Email).First(&existingUser).Error; err == nil {
@@ -123,6 +126,9 @@ func (h *AuthService) Login(c *fiber.Ctx) error {
 			"error": "Invalid request body",
 		})
 	}
+
+	// Normalize so login matches regardless of the case the user types
+	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
 
 	// Find user
 	var user models.User

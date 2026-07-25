@@ -8,7 +8,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.firebase.messaging.RemoteMessage
-import com.messenger.app.MainActivity
+import com.messenger.app.ui.MainActivity
 import com.messenger.app.R
 
 /**
@@ -43,8 +43,9 @@ class FcmPushNotificationService : com.google.firebase.messaging.FirebaseMessagi
         }
 
         // Check if message has notification payload
-        if (remoteMessage.notification != null) {
-            Log.d(TAG, "Message Notification Body: ${remoteMessage.notification.body}")
+        val notification = remoteMessage.notification
+        if (notification != null) {
+            Log.d(TAG, "Message Notification Body: ${notification.body}")
             showNotification(remoteMessage)
         }
     }
@@ -144,7 +145,7 @@ class FcmPushNotificationService : com.google.firebase.messaging.FirebaseMessagi
 
         // For Android 12+ (API 31+), set color based on accent
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            notificationBuilder.color = getColor(R.color.primary)
+            notificationBuilder.color = getColor(R.color.primary_color)
         }
 
         // Get notification manager
@@ -204,14 +205,14 @@ class FcmPushNotificationService : com.google.firebase.messaging.FirebaseMessagi
     /**
      * Called when FCM successfully sends a downstream message
      */
-    override fun onMessageSent(msgId: Int) {
+    override fun onMessageSent(msgId: String) {
         Log.d(TAG, "Message sent: $msgId")
     }
 
     /**
      * Called when sending a downstream message fails
      */
-    override fun onSendError(msgId: Int, exception: Exception) {
+    override fun onSendError(msgId: String, exception: Exception) {
         Log.e(TAG, "Send error: $msgId - ${exception.message}")
     }
 

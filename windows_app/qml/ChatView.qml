@@ -4,21 +4,21 @@ import QtQuick.Layouts 1.15
 
 Rectangle {
     id: chatViewRoot
-    radius: 0
 
     // External properties from parent
     property bool darkMode: true
-    property color bgColor: "#1A1A2E"
-    property color surfaceColor: "#16213E"
-    property color textColor: "#E8E8E8"
-    property color textSecondary: "#8B8B9E"
-    property color borderColor: "#2A2A4A"
+    property color bgColor: "#15152B"
+    property color surfaceColor: "#1B1B36"
+    property color textColor: "#EDEDF2"
+    property color textSecondary: "#9494AC"
+    property color borderColor: Qt.rgba(1, 1, 1, 0.08)
     property color accentColor: "#6C63FF"
     property color myMessageBg: "#6C63FF"
-    property color theirMessageBg: "#2A2A4A"
+    property color theirMessageBg: "#26264A"
     property color onlineColor: "#4CAF50"
     property string currentChatId: ""
     property string currentChatName: ""
+    property bool isOnline: true
     property bool typingIndicator: false
     property string typingUser: ""
 
@@ -28,13 +28,71 @@ Rectangle {
     signal openChatInfo(string chatId)
     signal createGroupClicked()
 
-    // Component properties
-    property var messages: []
-    property bool isSearching: false
+    property bool typingVisible: false
+    property bool isLoadingMore: false
+    property string joinedChatId: ""
 
     color: bgColor
 
-    // Main column
+    onCurrentChatIdChanged: {
+        if (joinedChatId && joinedChatId.length > 0 && joinedChatId !== currentChatId) {
+            websocketService.leaveChat(joinedChatId)
+        }
+        messagesModel.clear()
+        if (currentChatId && currentChatId.length > 0) {
+            isLoadingMore = true
+            chatService.fetchMessages(currentChatId)
+            chatService.markAsRead(currentChatId)
+            websocketService.joinChat(currentChatId)
+            joinedChatId = currentChatId
+        } else {
+            joinedChatId = ""
+        }
+    }
+
+    Connections {
+        target: chatService
+
+        function onMessagesFetched(chatId, messages) {
+            if (chatId !== chatViewRoot.currentChatId) return
+            messagesModel.clear()
+            for (var i = 0; i < messages.length; i++) {
+                var m = messages[i]
+                var isMine = m.senderId === authService.currentUserId
+                chatViewRoot.addMessage(m.senderId, m.senderName, m.content, chatViewRoot.formatTime(m.createdAt), isMine)
+            }
+            chatViewRoot.isLoadingMore = false
+        }
+
+        function onMessageError(error) {
+            console.log("[ChatView] Error:", error)
+            chatViewRoot.isLoadingMore = false
+        }
+    }
+
+    Connections {
+        target: websocketService
+
+        function onMessageReceived(chatId, message) {
+            if (chatId !== chatViewRoot.currentChatId) return
+            // Our own sends are already shown optimistically when we hit send
+            if (message.senderId === authService.currentUserId) return
+            var text = chatService.decryptMessage(chatId, message.content, message.encrypted === true)
+            chatViewRoot.addMessage(message.senderId, chatViewRoot.currentChatName, text,
+                                     chatViewRoot.formatTime(message.createdAt), false)
+        }
+
+        function onConnected() {
+            if (chatViewRoot.currentChatId && chatViewRoot.currentChatId.length > 0) {
+                websocketService.joinChat(chatViewRoot.currentChatId)
+            }
+        }
+    }
+
+    ListModel {
+        id: messagesModel
+    }
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
@@ -42,334 +100,367 @@ Rectangle {
         // Chat header
         Rectangle {
             Layout.fillWidth: true
-            height: 64
-            color: darkMode ? "rgba(22, 33, 62, 0.95)" : "rgba(255, 255, 255, 0.95)"
-            border.color: borderColor
-            border.width: 0
+            height: 60
+            color: chatViewRoot.surfaceColor
 
             RowLayout {
                 anchors.fill: parent
-                anchors.margins: 16
+                anchors.leftMargin: 12
+                anchors.rightMargin: 12
                 spacing: 12
 
                 // Back button
-                Button {
-                    width: 40
-                    height: 40
-                    background: Rectangle {
-                        radius: 8
-                        color: mouseArea.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.3)" : "rgba(108, 99, 255, 0.1)") : "transparent"
-                        MouseArea { id: mouseArea; anchors.fill: parent; hoverEnabled: true; onClicked: chatViewRoot.backClicked() }
-                    }
-                    Image {
+                Rectangle {
+                    Layout.preferredWidth: 36
+                    Layout.preferredHeight: 36
+                    radius: 9
+                    color: backMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (backMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
+                    Behavior on color { ColorAnimation { duration: 100 } }
+
+                    Canvas {
                         anchors.centerIn: parent
-                        source: "qrc:/icons/back.svg"
-                        width: 20
-                        height: 20
+                        width: 16
+                        height: 16
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.strokeStyle = chatViewRoot.textColor
+                            ctx.lineWidth = 1.8
+                            ctx.lineCap = "round"
+                            ctx.lineJoin = "round"
+                            ctx.beginPath()
+                            ctx.moveTo(10, 2); ctx.lineTo(4, 8); ctx.lineTo(10, 14)
+                            ctx.stroke()
+                        }
+                    }
+                    MouseArea {
+                        id: backMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: chatViewRoot.backClicked()
                     }
                 }
 
-                // User avatar
-                Rectangle {
-                    Layout.preferredWidth: 40
-                    Layout.preferredHeight: 40
-                    radius: 20
-                    color: chatViewRoot.accentColor
+                // Avatar
+                Item {
+                    Layout.preferredWidth: 38
+                    Layout.preferredHeight: 38
 
-                    Text {
-                        anchors.centerIn: parent
-                        text: chatViewRoot.currentChatName ? chatViewRoot.currentChatName.substring(0, 1).toUpperCase() : "?"
-                        font.pixelSize: 16
-                        font.bold: true
-                        color: "#FFFFFF"
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 19
+                        color: chatViewRoot.accentColor
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: chatViewRoot.currentChatName ? chatViewRoot.currentChatName.substring(0, 1).toUpperCase() : "?"
+                            font.pixelSize: 15
+                            font.bold: true
+                            color: "#FFFFFF"
+                        }
                     }
 
-                    // Online indicator
                     Rectangle {
                         anchors.bottom: parent.bottom
                         anchors.right: parent.right
-                        anchors.margins: -2
-                        width: 10
-                        height: 10
-                        radius: 5
+                        width: 11
+                        height: 11
+                        radius: 5.5
                         color: chatViewRoot.onlineColor
-                        border.color: darkMode ? "#16213E" : "#FFFFFF"
+                        border.color: chatViewRoot.surfaceColor
                         border.width: 2
-                        visible: modelOnline
+                        visible: chatViewRoot.isOnline
                     }
                 }
 
-                // User info
+                // Name + status
                 ColumnLayout {
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: 2
                     Layout.fillWidth: true
+                    spacing: 1
 
                     Text {
-                        text: chatViewRoot.currentChatName || "Unknown"
-                        font.pixelSize: 16
+                        Layout.fillWidth: true
+                        text: chatViewRoot.currentChatName || "Select a chat"
+                        font.pixelSize: 15
                         font.bold: true
                         color: chatViewRoot.textColor
                         elide: Text.ElideRight
-                        Layout.fillWidth: true
                     }
 
                     Text {
-                        id: statusText
-                        text: chatViewRoot.typingIndicator ? chatViewRoot.typingUser + " is typing..." : (modelOnline ? "Online" : "Offline")
-                        font.pixelSize: 12
-                        color: chatViewRoot.typingIndicator ? chatViewRoot.onlineColor : (modelOnline ? chatViewRoot.onlineColor : chatViewRoot.textSecondary)
-                        elide: Text.ElideRight
                         Layout.fillWidth: true
+                        text: chatViewRoot.typingIndicator ? chatViewRoot.typingUser + " is typing…" : (chatViewRoot.isOnline ? "Online" : "Offline")
+                        font.pixelSize: 12
+                        color: chatViewRoot.typingIndicator ? chatViewRoot.accentColor : (chatViewRoot.isOnline ? chatViewRoot.onlineColor : chatViewRoot.textSecondary)
+                        elide: Text.ElideRight
                     }
                 }
 
                 // More options
-                Button {
-                    width: 40
-                    height: 40
-                    background: Rectangle {
-                        radius: 8
-                        color: mouseArea.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.3)" : "rgba(108, 99, 255, 0.1)") : "transparent"
-                        MouseArea { id: mouseArea2; anchors.fill: parent; hoverEnabled: true }
-                    }
-                    Image {
+                Rectangle {
+                    Layout.preferredWidth: 36
+                    Layout.preferredHeight: 36
+                    radius: 9
+                    color: moreMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (moreMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
+                    Behavior on color { ColorAnimation { duration: 100 } }
+
+                    Canvas {
                         anchors.centerIn: parent
-                        source: "qrc:/icons/more.svg"
-                        width: 20
-                        height: 20
+                        width: 16
+                        height: 4
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.fillStyle = chatViewRoot.textSecondary
+                            for (var i = 0; i < 3; i++) {
+                                ctx.beginPath()
+                                ctx.arc(2 + i * 6, 2, 1.8, 0, Math.PI * 2)
+                                ctx.fill()
+                            }
+                        }
+                    }
+                    MouseArea {
+                        id: moreMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: chatViewRoot.openChatInfo(chatViewRoot.currentChatId)
                     }
                 }
             }
         }
 
+        Rectangle {
+            Layout.fillWidth: true
+            height: 1
+            color: chatViewRoot.borderColor
+        }
+
         // Messages area
         ScrollView {
+            id: messagesScroll
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            anchors.margins: 0
-            ScrollBar.policy: ScrollBar.AsNeeded
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
-            Rectangle {
-                id: messagesContainer
-                width: ScrollView.contentWidth
-                height: ScrollView.contentHeight
-                color: "transparent"
+            ColumnLayout {
+                width: messagesScroll.width
+                spacing: 2
 
-                Column {
-                    id: messagesColumn
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.bottom: parent.bottom
+                Item { Layout.fillHeight: true }
+
+                BusyIndicator {
+                    Layout.alignment: Qt.AlignHCenter
+                    running: chatViewRoot.isLoadingMore
+                    visible: chatViewRoot.isLoadingMore
+                    width: 24
+                    height: 24
+                }
+
+                Repeater {
+                    id: messageRepeater
+                    model: messagesModel
+
+                    MessageBubble {
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 16
+                        Layout.rightMargin: 16
+                        Layout.topMargin: model.showSender ? 10 : 2
+                        darkMode: chatViewRoot.darkMode
+                        messageText: model.messageText
+                        messageTime: model.messageTime
+                        isMine: model.isMine
+                        senderName: model.senderName
+                        showSender: model.showSender
+                        myMessageBg: chatViewRoot.myMessageBg
+                        theirMessageBg: chatViewRoot.theirMessageBg
+                        isEncrypted: true
+                    }
+                }
+
+                // Typing indicator
+                RowLayout {
+                    Layout.leftMargin: 16
+                    Layout.topMargin: 4
+                    Layout.bottomMargin: 8
+                    visible: chatViewRoot.typingVisible
                     spacing: 4
 
-                    // Reverse model to show oldest at top
                     Repeater {
-                        id: messageRepeater
-                        model: Qt.listModelToView(messagesViewRoot.reverseModel)
-
-                        MessageBubble {
-                            width: messagesContainer.width - 32
-                            messageText: model.messageText
-                            messageTime: model.messageTime
-                            isMine: model.isMine
-                            senderName: model.senderName
-                            isEncrypted: true
-                        }
-                    }
-
-                    // Typing indicator
-                    Item {
-                        width: messagesContainer.width
-                        height: typingVisible ? 40 : 0
-                        visible: typingVisible
-
-                        Row {
-                            anchors.centerIn: parent
-                            spacing: 8
-                            visible: typingVisible
-
-                            Rectangle {
-                                width: 8; height: 8; radius: 4
-                                color: chatViewRoot.textSecondary
-                                opacity: 0.6
-                                NumberAnimation {
-                                    target: parent
-                                    property: "opacity"
-                                    to: 1; duration: 600
-                                    running: true; loops: Animation.Infinite
-                                }
-                            }
-                            Rectangle {
-                                width: 8; height: 8; radius: 4
-                                color: chatViewRoot.textSecondary
-                                opacity: 0.6
-                                NumberAnimation {
-                                    target: parent
-                                    property: "opacity"
-                                    to: 1; duration: 600; start: 200
-                                    running: true; loops: Animation.Infinite
-                                }
-                            }
-                            Rectangle {
-                                width: 8; height: 8; radius: 4
-                                color: chatViewRoot.textSecondary
-                                opacity: 0.6
-                                NumberAnimation {
-                                    target: parent
-                                    property: "opacity"
-                                    to: 1; duration: 600; start: 400
-                                    running: true; loops: Animation.Infinite
-                                }
+                        model: 3
+                        Rectangle {
+                            width: 7; height: 7; radius: 3.5
+                            color: chatViewRoot.textSecondary
+                            SequentialAnimation on opacity {
+                                running: chatViewRoot.typingVisible
+                                loops: Animation.Infinite
+                                PauseAnimation { duration: index * 150 }
+                                NumberAnimation { to: 1; duration: 350 }
+                                NumberAnimation { to: 0.3; duration: 350 }
                             }
                         }
-                    }
-
-                    // Loading indicator for pagination
-                    BusyIndicator {
-                        anchors.centerIn: parent
-                        running: isLoadingMore
-                        visible: isLoadingMore
-                        width: 24
-                        height: 24
                     }
                 }
             }
+        }
+
+        Rectangle {
+            Layout.fillWidth: true
+            height: 1
+            color: chatViewRoot.borderColor
         }
 
         // Message input area
         Rectangle {
             Layout.fillWidth: true
-            height: 60
-            color: darkMode ? "rgba(22, 33, 62, 0.95)" : "rgba(255, 255, 255, 0.95)"
-            border.top.color: borderColor
-            border.top.width: 1
+            height: 68
+            color: chatViewRoot.surfaceColor
 
             RowLayout {
                 anchors.fill: parent
-                anchors.margins: 8
-                spacing: 8
+                anchors.margins: 12
+                spacing: 10
 
                 // Attachment button
-                Button {
-                    width: 40
-                    height: 40
-                    background: Rectangle {
-                        radius: 8
-                        color: attMouse.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.3)" : "rgba(108, 99, 255, 0.1)") : "transparent"
-                        MouseArea { id: attMouse; anchors.fill: parent; hoverEnabled: true }
-                    }
-                    Image {
+                Rectangle {
+                    Layout.preferredWidth: 40
+                    Layout.preferredHeight: 40
+                    radius: 10
+                    color: attMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (attMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
+                    Behavior on color { ColorAnimation { duration: 100 } }
+
+                    Canvas {
                         anchors.centerIn: parent
-                        source: "qrc:/icons/attach.svg"
-                        width: 20
-                        height: 20
+                        width: 17
+                        height: 17
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.strokeStyle = chatViewRoot.textSecondary
+                            ctx.lineWidth = 1.6
+                            ctx.lineCap = "round"
+                            ctx.beginPath()
+                            ctx.moveTo(11, 3)
+                            ctx.lineTo(4.5, 9.5)
+                            ctx.arc(6, 11, 2.2, Math.PI * 1.1, Math.PI * 2.4, false)
+                            ctx.lineTo(13, 6)
+                            ctx.arcTo(15, 4, 13, 2, 2)
+                            ctx.lineTo(6, 9)
+                            ctx.stroke()
+                        }
+                    }
+                    MouseArea {
+                        id: attMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
                     }
                 }
 
                 // Message input
-                TextField {
-                    id: messageInput
+                Rectangle {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 40
-                    placeholderText: "Type a message..."
-                    placeholderTextColor: textSecondary
-                    font.pixelSize: 14
-                    color: textColor
-                    background: Rectangle {
-                        radius: 20
-                        color: darkMode ? "rgba(42, 42, 74, 0.5)" : "rgba(240, 240, 245, 1)"
-                        border.color: messageInput.focus ? accentColor : "transparent"
-                        border.width: 1
-                    }
-                    Keys.onReturnPressed: {
-                        if (Keys.shiftModifier) {
-                            messageInput.text += "\n"
-                        } else {
-                            sendButton.clicked()
-                        }
-                    }
-                    onTextChanged: {
-                        sendButton.enabled = text.trim().length > 0
+                    Layout.preferredHeight: 42
+                    radius: 21
+                    color: darkMode ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.03)"
+                    border.color: messageInput.activeFocus ? chatViewRoot.accentColor : "transparent"
+                    border.width: 1.5
+                    Behavior on border.color { ColorAnimation { duration: 100 } }
+
+                    TextField {
+                        id: messageInput
+                        anchors.fill: parent
+                        leftPadding: 16
+                        rightPadding: 16
+                        verticalAlignment: TextInput.AlignVCenter
+                        background: Item {}
+                        placeholderText: "Type a message…"
+                        placeholderTextColor: chatViewRoot.textSecondary
+                        font.pixelSize: 14
+                        color: chatViewRoot.textColor
+                        selectByMouse: true
+                        wrapMode: TextInput.Wrap
+                        Keys.onReturnPressed: sendButton.trigger()
                     }
                 }
 
                 // Send button
-                Button {
+                Rectangle {
                     id: sendButton
-                    width: 44
-                    height: 44
-                    enabled: messageInput.text.trim().length > 0
-                    background: Rectangle {
-                        radius: 22
-                        color: sendButton.enabled ? chatViewRoot.myMessageBg : (darkMode ? "#2A2A4A" : "#E0E0E5")
-                        NumberAnimation {
-                            target: sendButton
-                            property: "opacity"
-                            to: 0.8; duration: 100
-                            running: sendButton.enabled
+                    Layout.preferredWidth: 42
+                    Layout.preferredHeight: 42
+                    radius: 21
+                    property bool canSend: messageInput.text.trim().length > 0
+                    color: !canSend ? (darkMode ? "#2A2A4A" : "#E0E0E5")
+                           : sendMouse.pressed ? Qt.darker(chatViewRoot.myMessageBg, 1.15) : (sendMouse.containsMouse ? Qt.lighter(chatViewRoot.myMessageBg, 1.08) : chatViewRoot.myMessageBg)
+                    Behavior on color { ColorAnimation { duration: 100 } }
+
+                    function trigger() {
+                        if (!canSend) return
+                        var text = messageInput.text.trim()
+                        chatViewRoot.addMessage(authService.currentUserId, "Me", text, chatViewRoot.formatTime(new Date().toISOString()), true)
+                        chatService.sendMessage(chatViewRoot.currentChatId, text)
+                        chatViewRoot.sendMessage(text)
+                        messageInput.text = ""
+                    }
+
+                    Canvas {
+                        anchors.centerIn: parent
+                        width: 18
+                        height: 18
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.fillStyle = "#FFFFFF"
+                            ctx.beginPath()
+                            ctx.moveTo(2, 9)
+                            ctx.lineTo(16, 2)
+                            ctx.lineTo(10, 16)
+                            ctx.lineTo(8, 10)
+                            ctx.lineTo(2, 9)
+                            ctx.closePath()
+                            ctx.fill()
                         }
                     }
-                    Image {
-                        anchors.centerIn: parent
-                        source: "qrc:/icons/send.svg"
-                        width: 20
-                        height: 20
-                    }
-                    onClicked: {
-                        chatViewRoot.sendMessage(messageInput.text.trim())
-                        messageInput.text = ""
+                    MouseArea {
+                        id: sendMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: sendButton.canSend ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        onClicked: sendButton.trigger()
                     }
                 }
             }
         }
     }
 
-    // State
-    property bool typingVisible: false
-    property bool isLoadingMore: false
-
-    // Message model
-    ListModel {
-        id: messagesViewRoot
-        property var reverseModel: []
-
-        function addMessage(senderId, senderName, text, time, isMine) {
-            append({
-                senderId: senderId,
-                senderName: senderName,
-                messageText: text,
-                messageTime: time,
-                isMine: isMine,
-                encrypted: true
-            })
-        }
-
-        function loadSampleMessages() {
-            clear()
-            const samples = [
-                { senderId: "1", senderName: "Alice", text: "Hey there!", time: "10:00 AM", isMine: false },
-                { senderId: "me", senderName: "Me", text: "Hi Alice! How are you?", time: "10:02 AM", isMine: true },
-                { senderId: "1", senderName: "Alice", text: "I'm good! Did you see the new feature?", time: "10:03 AM", isMine: false },
-                { senderId: "me", senderName: "Me", text: "Yes, it looks amazing! 🎉", time: "10:05 AM", isMine: true },
-                { senderId: "1", senderName: "Alice", text: "The encryption is top-notch", time: "10:06 AM", isMine: false },
-                { senderId: "1", senderName: "Alice", text: "Finally a secure messaging app!", time: "10:06 AM", isMine: false },
-            ]
-            for (let i = 0; i < samples.length; i++) {
-                append(samples[i])
-            }
-        }
+    function addMessage(senderId, senderName, text, time, isMine) {
+        const prev = messagesModel.count > 0 ? messagesModel.get(messagesModel.count - 1) : null
+        const showSender = !isMine && (!prev || prev.senderId !== senderId)
+        messagesModel.append({
+            senderId: senderId,
+            senderName: senderName,
+            messageText: text,
+            messageTime: time,
+            isMine: isMine,
+            showSender: showSender
+        })
     }
 
-    // Load sample data
+    function formatTime(isoString) {
+        if (!isoString) return ""
+        var d = new Date(isoString)
+        if (isNaN(d.getTime())) return ""
+        return Qt.formatTime(d, "h:mm AP")
+    }
+
     Component.onCompleted: {
-        messagesViewRoot.loadSampleMessages()
-    }
-
-    // Scroll to bottom when messages change
-    function scrollToBottom() {
-        // ScrollView doesn't have direct scroll-to-bottom in QtQuick
-        // This would be implemented with a custom component
+        if (currentChatId && currentChatId.length > 0) {
+            isLoadingMore = true
+            chatService.fetchMessages(currentChatId)
+            chatService.markAsRead(currentChatId)
+        }
     }
 }

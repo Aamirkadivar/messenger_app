@@ -7,8 +7,6 @@ plugins {
     alias(libs.plugins.hilt)
     alias(libs.plugins.room)
     alias(libs.plugins.google.services)
-    alias(libs.plugins.firebase.crashlytics)
-    alias(libs.plugins.firebase.firebase.perf)
     alias(libs.plugins.secrets.gradle)
 }
 
@@ -31,17 +29,9 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Secrets
-        buildConfigField(
-            "String",
-            "API_BASE_URL",
-            "\"${secrets.get("API_BASE_URL").get()}\""
-        )
-        buildConfigField(
-            "String",
-            "FIREBASE_SERVER_KEY",
-            "\"${secrets.get("FIREBASE_SERVER_KEY").get()}\""
-        )
+        // API_BASE_URL and FIREBASE_SERVER_KEY are read from local.properties
+        // (or secrets.defaults.properties as a fallback) and exposed on
+        // BuildConfig automatically by the secrets-gradle-plugin.
     }
 
     buildFeatures {
@@ -66,9 +56,6 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            firebaseCrashlytics {
-                nativeSymbolUploadEnabled = true
-            }
         }
         debug {
             isMinifyEnabled = false
@@ -90,6 +77,7 @@ dependencies {
     // Lifecycle & ViewModel
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.lifecycle.process)
 
     // Activity Compose
     implementation(libs.androidx.activity.activity.compose)
@@ -98,6 +86,7 @@ dependencies {
     platform(libs.androidx.compose.bom)
     implementation(libs.bundles.compose)
     debugImplementation(libs.bundles.compose.debug)
+    implementation(libs.androidx.compose.material.icons.extended)
 
     // Navigation
     implementation(libs.androidx.navigation.compose)
@@ -118,12 +107,8 @@ dependencies {
     // Kotlinx Serialization
     implementation(libs.kotlinx.serialization.json)
 
-    // Ktor Client (WebSocket)
-    implementation(libs.ktor.client.core)
-    implementation(libs.ktor.client.websockets)
-    implementation(libs.ktor.client.okhttp)
-    implementation(libs.ktor.client.content.negotiation)
-    implementation(libs.ktor.serialization.kotlinx.json)
+    // WebSocket client (used directly by WebSocketManager)
+    implementation(libs.java.websocket)
 
     // Room
     implementation(libs.androidx.room.runtime)
@@ -134,9 +119,10 @@ dependencies {
     // DataStore
     implementation(libs.androidx.datastore.preferences)
 
-    // Firebase
+    // Firebase (messaging only - no real project configured, so Crashlytics/
+    // Performance Monitoring are omitted since they crash on an invalid API key)
     implementation(platform(libs.firebase.bom))
-    implementation(libs.bundles.firebase)
+    implementation(libs.firebase.messaging)
 
     // Coil (Image Loading)
     implementation(libs.coil.compose)
@@ -157,8 +143,13 @@ dependencies {
     // Security Crypto
     implementation(libs.androidx.security.crypto)
 
-    // Encryption (Sodium)
-    implementation(libs.sodium.android)
+    // libsodium (NaCl crypto_box) for real E2EE. lazysodium pulls JNA as a jar
+    // transitively; exclude it and use only the Android aar variant to avoid
+    // duplicate-class conflicts.
+    implementation(libs.lazysodium.android) {
+        exclude(group = "net.java.dev.jna", module = "jna")
+    }
+    implementation(libs.jna) { artifact { type = "aar" } }
 
     // Timber
     implementation(libs.timber)

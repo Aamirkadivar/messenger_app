@@ -11,7 +11,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Find required Qt6 modules
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Network Sql)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Qml Quick QuickControls2 Network Sql)
 
 # Qt6 Base Path Configuration
 # Primary: D:/qt, fallback to common locations
@@ -74,9 +74,13 @@ set(PROJECT_SOURCES
     src/services/authservice.h
     src/services/websocketservice.cpp
     src/services/websocketservice.h
+    src/services/chatservice.cpp
+    src/services/chatservice.h
     src/utils/config.h
     src/utils/credentialmanager.cpp
     src/utils/credentialmanager.h
+    src/utils/traynotifier.cpp
+    src/utils/traynotifier.h
 )
 
 # ---- QML Resources ----
@@ -86,6 +90,7 @@ set(PROJECT_QML
     qml/Register.qml
     qml/ChatList.qml
     qml/ChatView.qml
+    qml/NewChatDialog.qml
     qml/MessageBubble.qml
     qml/Settings.qml
     resources/resources.qrc
@@ -101,6 +106,7 @@ qt_add_executable(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::Core
     Qt6::Gui
+    Qt6::Widgets
     Qt6::Qml
     Qt6::Quick
     Qt6::QuickControls2

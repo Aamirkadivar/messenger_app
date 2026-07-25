@@ -486,4 +486,14 @@ Item {
         active: visible
         source: "qrc:/qml/Register.qml"
     }
+
+    Component.onCompleted: {
+        authService.loginFailed.connect(function(message) {
+            isLoading = false
+            passwordError.text = message
+        })
+        authService.loginSuccess.connect(function(userId, username) {
+            isLoading = false
+        })
+    }
 }

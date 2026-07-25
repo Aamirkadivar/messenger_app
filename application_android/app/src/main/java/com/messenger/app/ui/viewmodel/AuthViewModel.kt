@@ -3,19 +3,18 @@ package com.messenger.app.ui.viewmodel
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.messenger.app.data.model.AuthResponse
-import com.messenger.app.data.model.LoginRequest
-import com.messenger.app.data.model.RegisterRequest
 import com.messenger.app.data.repository.AuthRepository
 import com.messenger.app.security.TokenManager
+import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import javax.inject.Inject
 
 /**
  * UI state for login screen
  */
 data class LoginUiState(
-    val username: String = "",
+    val email: String = "",
     val password: String = "",
     val isLoading: Boolean = false,
     val error: String? = null,
@@ -38,8 +37,9 @@ data class RegisterUiState(
 /**
  * ViewModel for authentication screens (login and registration)
  */
-class AuthViewModel(
-    private val authRepository: com.messenger.app.data.repository.AuthRepository,
+@HiltViewModel
+class AuthViewModel @Inject constructor(
+    private val authRepository: AuthRepository,
     private val tokenManager: TokenManager
 ) : ViewModel() {
 
@@ -70,10 +70,10 @@ class AuthViewModel(
     // ==================== Login ====================
 
     /**
-     * Update login username field
+     * Update login email field
      */
-    fun setLoginUsername(username: String) {
-        _loginState.update { it.copy(username = username, error = null) }
+    fun setLoginEmail(email: String) {
+        _loginState.update { it.copy(email = email, error = null) }
     }
 
     /**
@@ -88,20 +88,20 @@ class AuthViewModel(
      */
     fun login() {
         val currentState = _loginState.value
-        if (currentState.username.isBlank() || currentState.password.isBlank()) {
-            _loginState.update { it.copy(error = "Username and password are required") }
+        if (currentState.email.isBlank() || currentState.password.isBlank()) {
+            _loginState.update { it.copy(error = "Email and password are required") }
             return
         }
 
         viewModelScope.launch {
             _loginState.update { it.copy(isLoading = true, error = null) }
 
-            authRepository.login(currentState.username, currentState.password)
-                .onSuccess { authResponse ->
+            authRepository.login(currentState.email, currentState.password)
+                .onSuccess {
                     Log.d(TAG, "Login successful")
                     _loginState.update {
                         LoginUiState(
-                            username = currentState.username,
+                            email = currentState.email,
                             password = currentState.password,
                             isLoading = false,
                             isLoggedIn = true
@@ -113,7 +113,7 @@ class AuthViewModel(
                     Log.e(TAG, "Login failed", exception)
                     _loginState.update {
                         LoginUiState(
-                            username = currentState.username,
+                            email = currentState.email,
                             password = currentState.password,
                             isLoading = false,
                             error = exception.message ?: "Login failed"
@@ -182,19 +182,32 @@ class AuthViewModel(
             _registerState.update { it.copy(isLoading = true, error = null) }
 
             authRepository.register(currentState.username, currentState.email, currentState.password)
-                .onSuccess { authResponse ->
-                    Log.d(TAG, "Registration successful")
-                    _registerState.update {
-                        RegisterUiState(
-                            username = currentState.username,
-                            email = currentState.email,
-                            password = currentState.password,
-                            confirmPassword = currentState.confirmPassword,
-                            isLoading = false,
-                            isRegistered = true
-                        )
-                    }
-                    _isAuthenticated.value = true
+                .onSuccess {
+                    // Registration succeeded but issues no tokens (matches the real
+                    // backend contract) - log in with the same credentials to get one.
+                    Log.d(TAG, "Registration successful, logging in")
+                    authRepository.login(currentState.email, currentState.password)
+                        .onSuccess {
+                            _registerState.update {
+                                RegisterUiState(
+                                    username = currentState.username,
+                                    email = currentState.email,
+                                    password = currentState.password,
+                                    confirmPassword = currentState.confirmPassword,
+                                    isLoading = false,
+                                    isRegistered = true
+                                )
+                            }
+                            _isAuthenticated.value = true
+                        }
+                        .onFailure { exception ->
+                            _registerState.update {
+                                it.copy(
+                                    isLoading = false,
+                                    error = "Account created - please sign in"
+                                )
+                            }
+                        }
                 }
                 .onFailure { exception ->
                     Log.e(TAG, "Registration failed", exception)

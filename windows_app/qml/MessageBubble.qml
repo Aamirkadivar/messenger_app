@@ -1,7 +1,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 
-Rectangle {
+Item {
     id: bubbleRoot
 
     property string messageText: ""
@@ -9,101 +9,91 @@ Rectangle {
     property bool isMine: true
     property string senderName: ""
     property bool isEncrypted: true
-    property bool showSender: true
+    property bool showSender: false
+    property bool darkMode: true
 
-    // Colors
-    property color bgColor: isMine ? myMessageBg : theirMessageBg
-    property color textColor: isMine ? "#FFFFFF" : (darkMode ? "#E8E8E8" : "#1A1A2E")
     property color myMessageBg: "#6C63FF"
-    property color theirMessageBg: "#2A2A4A"
-    property color timeColor: isMine ? "rgba(255,255,255,0.6)" : "#8B8B9E"
+    property color theirMessageBg: darkMode ? "#26264A" : "#EDEDF2"
+    property color myTextColor: "#FFFFFF"
+    property color theirTextColor: darkMode ? "#EDEDF2" : "#1A1A2E"
 
-    // Layout
-    property real maxWidth: parent ? parent.width - 32 : 400
+    property real maxWidth: parent ? parent.width * 0.68 : 400
+    property real minContentWidth: 68
 
-    width: Math.min(contentItem.implicitWidth + 24, maxWidth)
-    height: contentColumn.height + 16
-    radius: 16
-    color: bgColor
+    width: parent ? parent.width : 400
+    height: bubble.height + 4
 
-    // Easing
-    property easing outEasing: Easing.OutBack
+    Rectangle {
+        id: bubble
+        anchors.right: isMine ? parent.right : undefined
+        anchors.left: isMine ? undefined : parent.left
+        width: Math.min(
+                   Math.max(contentText.implicitWidth, timeRow.implicitWidth, bubbleRoot.minContentWidth) + 28,
+                   bubbleRoot.maxWidth
+               )
+        height: contentColumn.implicitHeight + 20
+        radius: 16
+        color: isMine ? bubbleRoot.myMessageBg : bubbleRoot.theirMessageBg
 
-    Column {
-        id: contentColumn
-        anchors.fill: parent
-        anchors.margins: 12
-        spacing: 4
-        verticalAlignment: isMine ? Qt.AlignBottom : Qt.AlignTop
-
-        // Sender name
-        Text {
-            id: senderText
-            visible: showSender && !isMine
-            text: senderName
-            font.pixelSize: 11
-            font.bold: true
-            color: isMine ? "rgba(255,255,255,0.7)" : "#6C63FF"
-            elide: Text.ElideRight
-        }
-
-        // Message content
-        Text {
-            id: contentItem
+        Column {
+            id: contentColumn
+            anchors.left: parent.left
             anchors.right: parent.right
-            text: messageText
-            font.pixelSize: 14
-            color: textColor
-            wrapMode: Text.Wrap
-            elide: Text.ElideMiddle
-            style: isEncrypted ? Text.Normal : Text.Normal
-            styleColor: "transparent"
-        }
-
-        // Time stamp
-        Row {
-            anchors.right: parent.right
-            spacing: 4
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: -2
+            anchors.top: parent.top
+            anchors.margins: 10
+            spacing: 3
 
             Text {
-                text: messageTime
-                font.pixelSize: 10
-                color: timeColor
+                visible: bubbleRoot.showSender && !bubbleRoot.isMine
+                text: bubbleRoot.senderName
+                font.pixelSize: 12
+                font.bold: true
+                color: "#8B84FF"
+                elide: Text.ElideRight
+                width: parent.width
             }
 
-            // Read receipt for sent messages
-            Image {
-                width: 12
-                height: 12
-                source: isMine ? "qrc:/icons/doublecheck.svg" : ""
-                visible: isMine
+            Text {
+                id: contentText
+                width: parent.width
+                text: bubbleRoot.messageText
+                font.pixelSize: 14
+                color: isMine ? bubbleRoot.myTextColor : bubbleRoot.theirTextColor
+                wrapMode: Text.Wrap
             }
-        }
-    }
 
-    // Shadow effect
-    layer.enabled: true
-    layer.effect: DropShadow {
-        horizontalOffset: 0
-        verticalOffset: 2
-        radius: 8
-        samples: 16
-        color: isMine ? "rgba(108, 99, 255, 0.3)" : "rgba(0, 0, 0, 0.2)"
-    }
+            Row {
+                id: timeRow
+                anchors.right: parent.right
+                spacing: 4
+                topPadding: 2
 
-    // Hover effect
-    property bool isHovered: hoverArea.containsMouse
-    Rectangle {
-        anchors.fill: parent
-        radius: bubbleRoot.radius
-        color: bubbleRoot.isHovered ? Qt.lighter(bubbleRoot.bgColor, 1.05) : "transparent"
-        opacity: 0.3
-        MouseArea {
-            id: hoverArea
-            anchors.fill: parent
-            hoverEnabled: true
+                Text {
+                    text: bubbleRoot.messageTime
+                    font.pixelSize: 11
+                    color: isMine ? "rgba(255,255,255,0.65)" : (darkMode ? "#8B8B9E" : "#6B6B7B")
+                }
+
+                Canvas {
+                    width: 14
+                    height: 10
+                    visible: bubbleRoot.isMine
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        ctx.strokeStyle = "rgba(255,255,255,0.75)"
+                        ctx.lineWidth = 1.4
+                        ctx.lineCap = "round"
+                        ctx.lineJoin = "round"
+                        ctx.beginPath()
+                        ctx.moveTo(0, 5); ctx.lineTo(3, 8); ctx.lineTo(8, 2)
+                        ctx.stroke()
+                        ctx.beginPath()
+                        ctx.moveTo(5, 5); ctx.lineTo(8, 8); ctx.lineTo(14, 1)
+                        ctx.stroke()
+                    }
+                }
+            }
         }
     }
 }

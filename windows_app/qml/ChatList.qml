@@ -4,15 +4,15 @@ import QtQuick.Layouts 1.15
 
 Rectangle {
     id: chatListRoot
-    radius: 0
 
     // External properties from parent
     property bool darkMode: true
-    property color bgColor: "#1A1A2E"
-    property color surfaceColor: "#16213E"
-    property color textColor: "#E8E8E8"
-    property color textSecondary: "#8B8B9E"
-    property color borderColor: "#2A2A4A"
+    property color bgColor: "#15152B"
+    property color surfaceColor: "#1B1B36"
+    property color surfaceColorHover: "#22224A"
+    property color textColor: "#EDEDF2"
+    property color textSecondary: "#9494AC"
+    property color borderColor: Qt.rgba(1, 1, 1, 0.08)
     property color accentColor: "#6C63FF"
     property color onlineColor: "#4CAF50"
     property color offlineColor: "#9E9E9E"
@@ -23,51 +23,78 @@ Rectangle {
     signal chatSelected(string chatId, string chatName)
     signal newChatClicked()
 
-    // Column
+    property bool searchVisible: false
+    property var onlineUsers: []
+    property var originalChats: []
+    property bool chatsLoaded: false
+    // Whichever chat is currently open in the main window (set by main.qml),
+    // so a live-arriving message for it doesn't also bump its own unread badge.
+    property string activeChatId: ""
+
+    // Avatar color palette for users
+    property var avatarPalette: ["#6C63FF", "#4CAF50", "#FF9800", "#E91E63", "#9C27B0", "#00BCD4", "#FF5722", "#795548", "#607D8B", "#3F51B5"]
+
+    ListModel {
+        id: chatModel
+    }
+
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 0
         spacing: 0
 
         // Header
-        Item {
+        RowLayout {
             Layout.fillWidth: true
-            height: 64
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Layout.topMargin: 20
+            Layout.bottomMargin: 16
+            spacing: 8
 
-            ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: 20
-                spacing: 0
-
-                Text {
-                    Layout.fillWidth: true
-                    text: "Chats"
-                    font.pixelSize: 24
-                    font.bold: true
-                    color: chatListRoot.textColor
-                }
+            Text {
+                Layout.fillWidth: true
+                text: "Chats"
+                font.pixelSize: 24
+                font.weight: Font.Bold
+                font.letterSpacing: -0.3
+                color: chatListRoot.textColor
             }
 
-            // Search button
-            Button {
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                width: 40
-                height: 40
-                background: Rectangle {
-                    radius: 8
-                    color: mouseArea.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.3)" : "rgba(108, 99, 255, 0.1)") : "transparent"
+            Rectangle {
+                Layout.preferredWidth: 38
+                Layout.preferredHeight: 38
+                radius: 11
+                scale: searchMouse.pressed ? 0.94 : 1.0
+                color: searchMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.22)
+                       : (searchVisible || searchMouse.containsMouse) ? Qt.rgba(108/255, 99/255, 255/255, 0.12) : "transparent"
+                Behavior on color { ColorAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
+                Canvas {
+                    anchors.centerIn: parent
+                    width: 16
+                    height: 16
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        ctx.strokeStyle = chatListRoot.searchVisible ? chatListRoot.accentColor : chatListRoot.textSecondary
+                        ctx.lineWidth = 1.7
+                        ctx.lineCap = "round"
+                        ctx.beginPath(); ctx.arc(6.5, 6.5, 5, 0, Math.PI * 2); ctx.stroke()
+                        ctx.beginPath(); ctx.moveTo(10.3, 10.3); ctx.lineTo(15, 15); ctx.stroke()
+                    }
                 }
+
                 MouseArea {
-                    id: mouseArea
+                    id: searchMouse
                     anchors.fill: parent
                     hoverEnabled: true
-                }
-                Image {
-                    anchors.centerIn: parent
-                    source: "qrc:/icons/search.svg"
-                    width: 20
-                    height: 20
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        chatListRoot.searchVisible = !chatListRoot.searchVisible
+                        if (chatListRoot.searchVisible) searchField.forceActiveFocus()
+                        else { searchField.text = ""; filterChats("") }
+                    }
                 }
             }
         }
@@ -76,150 +103,233 @@ Rectangle {
         Rectangle {
             id: searchBar
             Layout.fillWidth: true
-            height: searchVisible ? 48 : 0
-            color: darkMode ? "rgba(22, 33, 62, 0.95)" : "rgba(255, 255, 255, 0.95)"
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Layout.bottomMargin: searchVisible ? 16 : 0
+            Layout.preferredHeight: searchVisible ? 42 : 0
+            radius: 12
+            color: darkMode ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.03)"
+            border.color: searchField.activeFocus ? chatListRoot.accentColor : Qt.rgba(1, 1, 1, 0.08)
+            border.width: searchField.activeFocus ? 1.5 : 1
+            clip: true
             opacity: searchVisible ? 1 : 0
-            visible: searchVisible
+            Behavior on Layout.preferredHeight { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+            Behavior on Layout.bottomMargin { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+            Behavior on opacity { NumberAnimation { duration: 150 } }
+            Behavior on border.color { ColorAnimation { duration: 150 } }
 
-            TextField {
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
-                anchors.margins: 12
-                placeholderText: "Search chats..."
-                placeholderTextColor: textSecondary
-                font.pixelSize: 14
-                color: textColor
-                background: Rectangle {
-                    radius: 8
-                    color: "transparent"
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 12
+                anchors.rightMargin: 12
+                spacing: 8
+
+                Canvas {
+                    Layout.preferredWidth: 15
+                    Layout.preferredHeight: 15
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        ctx.strokeStyle = chatListRoot.textSecondary
+                        ctx.lineWidth = 1.6
+                        ctx.lineCap = "round"
+                        ctx.beginPath(); ctx.arc(6, 6, 4.6, 0, Math.PI * 2); ctx.stroke()
+                        ctx.beginPath(); ctx.moveTo(9.3, 9.3); ctx.lineTo(14, 14); ctx.stroke()
+                    }
                 }
-                onTextChanged: filterChats(text)
+
+                TextField {
+                    id: searchField
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    leftPadding: 0
+                    rightPadding: 0
+                    verticalAlignment: TextInput.AlignVCenter
+                    background: Item {}
+                    placeholderText: "Search chats..."
+                    placeholderTextColor: textSecondary
+                    font.pixelSize: 13
+                    color: textColor
+                    selectByMouse: true
+                    onTextChanged: filterChats(text)
+                }
             }
         }
 
         // New chat button
-        Button {
+        Rectangle {
+            id: newChatButton
             Layout.fillWidth: true
-            height: 56
-            contentItem: RowLayout {
-                spacing: 12
-                Image {
-                    source: "qrc:/icons/plus.svg"
-                    width: 20
-                    height: 20
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Layout.bottomMargin: 20
+            height: 46
+            radius: 13
+            scale: newChatMouse.pressed ? 0.98 : 1.0
+            color: newChatMouse.pressed ? Qt.darker(chatListRoot.accentColor, 1.15)
+                   : (newChatMouse.containsMouse ? Qt.lighter(chatListRoot.accentColor, 1.08) : chatListRoot.accentColor)
+            Behavior on color { ColorAnimation { duration: 150; easing.type: Easing.OutCubic } }
+            Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
+            // Soft accent glow behind the primary action
+            Rectangle {
+                anchors.fill: parent
+                anchors.margins: -6
+                radius: parent.radius + 6
+                color: chatListRoot.accentColor
+                opacity: newChatMouse.containsMouse ? 0.18 : 0.10
+                z: -1
+                Behavior on opacity { NumberAnimation { duration: 150 } }
+            }
+
+            RowLayout {
+                anchors.centerIn: parent
+                spacing: 8
+
+                Canvas {
+                    width: 16
+                    height: 16
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        ctx.strokeStyle = "#FFFFFF"
+                        ctx.lineWidth = 1.9
+                        ctx.lineCap = "round"
+                        ctx.beginPath(); ctx.moveTo(8, 1); ctx.lineTo(8, 15); ctx.stroke()
+                        ctx.beginPath(); ctx.moveTo(1, 8); ctx.lineTo(15, 8); ctx.stroke()
+                    }
                 }
                 Text {
                     text: "New Chat"
-                    font.pixelSize: 15
-                    font.bold: true
+                    font.pixelSize: 14
+                    font.weight: Font.DemiBold
                     color: "#FFFFFF"
                 }
             }
-            background: Rectangle {
-                radius: 0
-                color: mouseArea.containsPress ? Qt.darker(chatListRoot.accentColor, 1.1) : chatListRoot.accentColor
-                MouseArea {
-                    id: mouseArea2
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    onClicked: chatListRoot.newChatClicked()
+
+            MouseArea {
+                id: newChatMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: chatListRoot.newChatClicked()
+            }
+        }
+
+        // Online users
+        Item {
+            Layout.fillWidth: true
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Layout.bottomMargin: 8
+            Layout.preferredHeight: onlineUsers.length > 0 ? 56 : 0
+            visible: onlineUsers.length > 0
+
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 8
+
+                Text {
+                    text: "ONLINE NOW"
+                    font.pixelSize: 11
+                    font.weight: Font.DemiBold
+                    font.letterSpacing: 0.5
+                    color: chatListRoot.textSecondary
+                }
+
+                RowLayout {
+                    spacing: 12
+
+                    Repeater {
+                        model: onlineUsers.slice(0, 6)
+                        Item {
+                            width: 32
+                            height: 32
+
+                            // Gradient ring to signal "online" (story-ring style)
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: width / 2
+                                gradient: Gradient {
+                                    orientation: Gradient.Horizontal
+                                    GradientStop { position: 0.0; color: chatListRoot.onlineColor }
+                                    GradientStop { position: 1.0; color: chatListRoot.accentColor }
+                                }
+                            }
+
+                            Rectangle {
+                                anchors.centerIn: parent
+                                width: parent.width - 4
+                                height: parent.height - 4
+                                radius: width / 2
+                                color: Qt.darker(chatListRoot.accentColor, 1.3)
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData ? modelData.substring(0, 1).toUpperCase() : "?"
+                                    font.pixelSize: 11
+                                    font.weight: Font.DemiBold
+                                    color: "#FFFFFF"
+                                }
+                            }
+
+                            ToolTip.visible: onlineHover.containsMouse
+                            ToolTip.text: modelData || "Online"
+                            MouseArea { id: onlineHover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor }
+                        }
+                    }
+
+                    Text {
+                        text: "+" + (onlineUsers.length - 6)
+                        font.pixelSize: 11
+                        font.weight: Font.Medium
+                        color: chatListRoot.textSecondary
+                        visible: onlineUsers.length > 6
+                    }
+
+                    Item { Layout.fillWidth: true }
                 }
             }
         }
 
-        // Divider
         Rectangle {
             Layout.fillWidth: true
             height: 1
-            color: borderColor
-        }
-
-        // Online users section
-        Rectangle {
-            Layout.fillWidth: true
-            height: 60
-            color: darkMode ? "rgba(76, 175, 80, 0.05)" : "rgba(76, 175, 80, 0.03)"
-            visible: onlineUsers.length > 0
-
-            RowLayout {
-                anchors.fill: parent
-                anchors.margins: 16
-                spacing: 12
-
-                Text {
-                    text: "Online"
-                    font.pixelSize: 12
-                    font.bold: true
-                    color: onlineColor
-                    Layout.preferredWidth: 80
-                    elide: Text.ElideRight
-                }
-
-                Repeater {
-                    model: onlineUsers.slice(0, 5)
-                    Rectangle {
-                        width: 28
-                        height: 28
-                        radius: 14
-                        color: "#4CAF50"
-                        border.color: darkMode ? bgColor : "#FFFFFF"
-                        border.width: 2
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: modelData ? modelData.substring(0, 1).toUpperCase() : "?"
-                            font.pixelSize: 11
-                            font.bold: true
-                            color: "#FFFFFF"
-                        }
-
-                        ToolTip {
-                            text: modelData || "Online"
-                            timeout: 2000
-                        }
-                    }
-                }
-
-                Item { Layout.fillWidth: true }
-
-                Text {
-                    text: "+" + (onlineUsers.length - 5) + " more"
-                    font.pixelSize: 11
-                    color: onlineColor
-                    visible: onlineUsers.length > 5
-                }
-            }
+            color: chatListRoot.borderColor
         }
 
         // Chat list
         ScrollView {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            Layout.margins: 0
             clip: true
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
-            Rectangle {
-                width: ScrollView.contentWidth
-                height: ScrollView.contentHeight
-                color: "transparent"
+            Column {
+                width: parent.width
+                topPadding: 6
 
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: 0
+                Repeater {
+                    id: chatRepeater
+                    model: chatModel
 
-                    Repeater {
-                        id: chatRepeater
-                        model: chatModel
+                    Item {
+                        width: parent.width
+                        height: 76
 
                         Rectangle {
-                            Layout.fillWidth: true
-                            height: 76
-                            color: mouseArea.containsMouse ? (darkMode ? "rgba(108, 99, 255, 0.08)" : "rgba(108, 99, 255, 0.05)") : "transparent"
+                            anchors.fill: parent
+                            anchors.leftMargin: 8
+                            anchors.rightMargin: 8
+                            anchors.topMargin: 2
+                            anchors.bottomMargin: 2
+                            radius: 14
+                            color: itemMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.16)
+                                   : (itemMouse.containsMouse ? chatListRoot.surfaceColorHover : "transparent")
+                            Behavior on color { ColorAnimation { duration: 130; easing.type: Easing.OutCubic } }
 
                             MouseArea {
-                                id: mouseArea
+                                id: itemMouse
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
@@ -228,108 +338,145 @@ Rectangle {
 
                             RowLayout {
                                 anchors.fill: parent
-                                anchors.margins: 16
-                                spacing: 14
+                                anchors.leftMargin: 12
+                                anchors.rightMargin: 14
+                                spacing: 12
 
                                 // Avatar
-                                Rectangle {
-                                    id: avatarRect
-                                    Layout.preferredWidth: 44
-                                    Layout.preferredHeight: 44
-                                    radius: 22
-                                    color: model.avatarColor !== "" ? model.avatarColor : chatListRoot.accentColor
+                                Item {
+                                    Layout.preferredWidth: 48
+                                    Layout.preferredHeight: 48
 
-                                    // Online indicator
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        radius: 24
+                                        color: model.avatarColor !== "" ? model.avatarColor : chatListRoot.accentColor
+
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: (model.chatName && model.chatName.length > 0) ? model.chatName.substring(0, 1).toUpperCase() : "?"
+                                            font.pixelSize: 18
+                                            font.weight: Font.DemiBold
+                                            color: "#FFFFFF"
+                                        }
+                                    }
+
                                     Rectangle {
                                         anchors.bottom: parent.bottom
                                         anchors.right: parent.right
-                                        anchors.margins: -2
-                                        width: 12
-                                        height: 12
-                                        radius: 6
-                                        color: model.online ? chatListRoot.onlineColor : chatListRoot.bgColor
-                                        border.color: chatListRoot.onlineColor
-                                        border.width: 2
+                                        width: 14
+                                        height: 14
+                                        radius: 7
+                                        color: chatListRoot.onlineColor
+                                        border.color: chatListRoot.bgColor
+                                        border.width: 2.5
                                         visible: model.online
+                                    }
+                                }
+
+                                // Name + last message
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 4
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: model.chatName
+                                        font.pixelSize: 15
+                                        font.weight: Font.DemiBold
+                                        color: chatListRoot.textColor
+                                        elide: Text.ElideRight
                                     }
 
                                     Text {
-                                        anchors.centerIn: parent
-                                        text: (model.chatName && model.chatName.length > 0) ? model.chatName.substring(0, 1).toUpperCase() : "?"
-                                        font.pixelSize: 18
-                                        font.bold: true
-                                        color: "#FFFFFF"
+                                        Layout.fillWidth: true
+                                        text: model.lastMessage
+                                        font.pixelSize: 13
+                                        color: model.unreadCount > 0 ? chatListRoot.textColor : chatListRoot.textSecondary
+                                        font.weight: model.unreadCount > 0 ? Font.Medium : Font.Normal
+                                        elide: Text.ElideRight
                                     }
                                 }
 
-                                // Chat info
-                                Item {
-                                    Layout.fillWidth: true
-                                    height: 44
-
-                                    Column {
-                                        anchors.left: parent.left
-                                        anchors.right: parent.right
-                                        anchors.top: parent.top
-                                        spacing: 4
-
-                                        Row {
-                                            anchors.left: parent.left
-                                            anchors.right: lastMsgTime.right
-                                            spacing: 8
-                                            Layout.fillWidth: true
-
-                                            Text {
-                                                text: model.chatName
-                                                font.pixelSize: 15
-                                                font.bold: true
-                                                color: chatListRoot.textColor
-                                                elide: Text.ElideRight
-                                            }
-                                        }
-
-                                        Text {
-                                            id: lastMsgTime
-                                            anchors.right: parent.right
-                                            anchors.rightMargin: 0
-                                            text: model.lastMessage
-                                            font.pixelSize: 13
-                                            color: chatListRoot.textSecondary
-                                            elide: Text.ElideRight
-                                            width: parent.width - 20
-                                        }
-                                    }
-                                }
-
-                                // Unread badge & time
-                                Column {
-                                    anchors.right: parent.right
+                                // Time + unread badge
+                                ColumnLayout {
+                                    Layout.alignment: Qt.AlignTop
                                     spacing: 8
 
+                                    Text {
+                                        Layout.alignment: Qt.AlignRight
+                                        text: model.timestamp
+                                        font.pixelSize: 11
+                                        font.weight: model.unreadCount > 0 ? Font.DemiBold : Font.Normal
+                                        color: model.unreadCount > 0 ? chatListRoot.accentColor : chatListRoot.textSecondary
+                                    }
+
                                     Rectangle {
-                                        width: 24
-                                        height: 24
-                                        radius: 12
+                                        Layout.alignment: Qt.AlignRight
+                                        Layout.preferredWidth: Math.max(20, unreadText.implicitWidth + 11)
+                                        Layout.preferredHeight: 20
+                                        radius: 10
                                         color: chatListRoot.accentColor
                                         visible: model.unreadCount > 0
 
                                         Text {
+                                            id: unreadText
                                             anchors.centerIn: parent
-                                            text: model.unreadCount > 0 ? model.unreadCount : ""
-                                            font.pixelSize: 12
-                                            font.bold: true
+                                            text: model.unreadCount > 99 ? "99+" : model.unreadCount
+                                            font.pixelSize: 11
+                                            font.weight: Font.DemiBold
                                             color: "#FFFFFF"
-                                            horizontalAlignment: Text.AlignHCenter
                                         }
-                                    }
-
-                                    Text {
-                                        text: model.timestamp
-                                        font.pixelSize: 11
-                                        color: chatListRoot.textSecondary
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                // Empty state
+                Item {
+                    width: parent.width
+                    height: chatRepeater.count === 0 ? 220 : 0
+                    visible: chatRepeater.count === 0
+
+                    ColumnLayout {
+                        anchors.centerIn: parent
+                        spacing: 14
+
+                        Rectangle {
+                            Layout.alignment: Qt.AlignHCenter
+                            width: 64
+                            height: 64
+                            radius: 32
+                            color: chatListRoot.surfaceColor
+
+                            Canvas {
+                                anchors.centerIn: parent
+                                width: 26
+                                height: 26
+                                onPaint: {
+                                    var ctx = getContext("2d")
+                                    ctx.reset()
+                                    var w = width, h = height * 0.72, r = 5
+                                    ctx.fillStyle = chatListRoot.textSecondary
+                                    ctx.beginPath()
+                                    ctx.moveTo(r, 0); ctx.lineTo(w - r, 0); ctx.arcTo(w, 0, w, r, r)
+                                    ctx.lineTo(w, h - r); ctx.arcTo(w, h, w - r, h, r)
+                                    ctx.lineTo(w * 0.32, h); ctx.lineTo(w * 0.18, h + height * 0.2); ctx.lineTo(w * 0.22, h)
+                                    ctx.lineTo(r, h); ctx.arcTo(0, h, 0, h - r, r)
+                                    ctx.lineTo(0, r); ctx.arcTo(0, 0, r, 0, r)
+                                    ctx.closePath(); ctx.fill()
+                                }
+                            }
+                        }
+
+                        Text {
+                            Layout.alignment: Qt.AlignHCenter
+                            text: searchField.text.length > 0 ? "No chats match your search" : "No conversations yet"
+                            font.pixelSize: 13
+                            font.weight: Font.Medium
+                            color: chatListRoot.textSecondary
                         }
                     }
                 }
@@ -337,21 +484,9 @@ Rectangle {
         }
     }
 
-    // State
-    property bool searchVisible: false
-
-    // Chat model
-    ListModel {
-        id: chatModel
-    }
-
-    // Online users
-    property var onlineUsers: []
-
-    // Filter function
     function filterChats(query) {
         chatModel.clear()
-        const filtered = originalChats.filter(c =>
+        const filtered = query.length === 0 ? originalChats : originalChats.filter(c =>
             c.chatName.toLowerCase().includes(query.toLowerCase())
         )
         for (let i = 0; i < filtered.length; i++) {
@@ -359,24 +494,210 @@ Rectangle {
         }
     }
 
-    // Load sample data
-    function loadSampleChats() {
-        originalChats = [
-            { chatId: "1", chatName: "Alice Johnson", lastMessage: "Hey! How are you?", timestamp: "12:30", unreadCount: 3, online: true, avatarColor: "#6C63FF" },
-            { chatId: "2", chatName: "Bob Smith", lastMessage: "See you tomorrow", timestamp: "11:45", unreadCount: 0, online: true, avatarColor: "#4CAF50" },
-            { chatId: "3", chatName: "Team Channel", lastMessage: "Meeting at 3pm", timestamp: "Yesterday", unreadCount: 12, online: false, avatarColor: "#FF9800" },
-            { chatId: "4", chatName: "Carol Williams", lastMessage: "Thanks!", timestamp: "Monday", unreadCount: 0, online: false, avatarColor: "#E91E63" },
-            { chatId: "5", chatName: "Dev Group", lastMessage: "New PR merged", timestamp: "Sunday", unreadCount: 5, online: false, avatarColor: "#9C27B0" },
-        ]
-        chatModel.clear()
-        for (let i = 0; i < originalChats.length; i++) {
-            chatModel.append(originalChats[i])
+    function chatNameFor(chatId) {
+        for (var i = 0; i < originalChats.length; i++) {
+            if (originalChats[i].chatId === chatId) return originalChats[i].chatName
+        }
+        return "New message"
+    }
+
+    // Load chats from backend API
+    function loadChatsFromAPI() {
+        if (chatsLoaded) return
+        if (chatService === undefined || chatService === null) {
+            console.log("ChatService not available")
+            populateChatModel([])
+            return
+        }
+
+        if (chatService.isLoading) {
+            console.log("Chats already loading...")
+            return
+        }
+
+        console.log("Fetching chats from backend API...")
+        chatService.fetchChats()
+    }
+
+    // Parse a chat item from the API response
+    function parseChatItem(chatData) {
+        var chatId = chatData.id || ""
+        var chatName = chatData.name || ""
+        var chatType = chatData.type || "direct"
+        var otherUser = chatData.other_user || {}
+        var lastMessageData = chatData.last_message || {}
+        var avatarColor = chatData.avatar_url !== undefined ? chatData.avatar_url : ""
+        var isOnline = chatData.is_online || false
+
+        // For direct chats, always prefer the other user's name - chat.name is
+        // just a generic "Direct Chat" placeholder set at creation time, never
+        // actually empty, so it can't be used as an "unset" signal here.
+        if (chatType === "direct" && Object.keys(otherUser).length > 0) {
+            chatName = otherUser.display_name || otherUser.username || chatName || "Unknown"
+            isOnline = otherUser.is_online || isOnline
+        }
+
+        // Generate avatar color based on name
+        if (avatarColor === "") {
+            var hash = 0
+            for (var i = 0; i < chatName.length; i++) {
+                hash = chatName.charCodeAt(i) + ((hash << 5) - hash)
+            }
+            var index = Math.abs(hash) % avatarPalette.length
+            avatarColor = avatarPalette[index]
+        }
+
+        // Parse last message
+        var lastMessage = lastMessageData.content || ""
+        var timestamp = ""
+        if (lastMessageData.created_at !== undefined) {
+            var date = new Date(lastMessageData.created_at)
+            if (!isNaN(date.getTime())) {
+                var today = new Date()
+                var yesterday = new Date(today)
+                yesterday.setDate(yesterday.getDate() - 1)
+
+                if (date.toDateString() === today.toDateString()) {
+                    timestamp = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                } else if (date.toDateString() === yesterday.toDateString()) {
+                    timestamp = "Yesterday"
+                } else {
+                    timestamp = date.toLocaleDateString([], { day: 'numeric', month: 'short' })
+                }
+            }
+        }
+
+        // Also check last_message_at as fallback
+        if (timestamp === "" && chatData.last_message_at !== undefined) {
+            var date = new Date(chatData.last_message_at)
+            if (!isNaN(date.getTime())) {
+                var today = new Date()
+                var yesterday = new Date(today)
+                yesterday.setDate(yesterday.getDate() - 1)
+
+                if (date.toDateString() === today.toDateString()) {
+                    timestamp = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                } else if (date.toDateString() === yesterday.toDateString()) {
+                    timestamp = "Yesterday"
+                } else {
+                    timestamp = date.toLocaleDateString([], { day: 'numeric', month: 'short' })
+                }
+            }
+        }
+
+        var unreadCount = chatData.unread_count || 0
+
+        return {
+            chatId: chatId,
+            chatName: chatName,
+            lastMessage: lastMessage,
+            timestamp: timestamp,
+            unreadCount: unreadCount,
+            online: isOnline,
+            avatarColor: avatarColor,
+            chatType: chatType,
+            _rawData: chatData
         }
     }
 
-    property var originalChats: []
+    // Populate the chat model from parsed data
+    function populateChatModel(chatsData) {
+        originalChats = []
+        chatModel.clear()
+
+        for (var i = 0; i < chatsData.length; i++) {
+            var parsed = parseChatItem(chatsData[i])
+            originalChats.push(parsed)
+            chatModel.append(parsed)
+        }
+
+        chatsLoaded = true
+        console.log("Loaded", chatsData.length, "chats from API")
+    }
+
+    // Handle chat service response. chatsList entries already match the
+    // backend's JSON shape (see ChatService::parseChatItem), so no
+    // reconstruction is needed here.
+    function onChatsFetched(chatsList) {
+        if (!chatsList || chatsList.length === 0) {
+            console.log("No chats yet")
+            populateChatModel([])
+            return
+        }
+
+        populateChatModel(chatsList)
+
+        // Join every known chat's WebSocket room so real-time pushes (and
+        // notifications) arrive even for conversations that aren't currently
+        // open - joining only happens on-demand otherwise (see ChatView.qml).
+        for (var i = 0; i < chatsList.length; i++) {
+            if (chatsList[i].id) websocketService.joinChat(chatsList[i].id)
+        }
+    }
+
+    // Handle chat service error
+    function onChatError(errorMsg) {
+        console.log("Error loading chats:", errorMsg)
+        populateChatModel([])
+    }
+
+    // Zero out a chat's unread badge immediately once it's been marked read,
+    // instead of waiting for the next full chat-list refetch.
+    function onChatRead(chatId) {
+        for (var i = 0; i < originalChats.length; i++) {
+            if (originalChats[i].chatId === chatId) originalChats[i].unreadCount = 0
+        }
+        for (var j = 0; j < chatModel.count; j++) {
+            if (chatModel.get(j).chatId === chatId) chatModel.setProperty(j, "unreadCount", 0)
+        }
+    }
+
+    // Live-update the badge/preview when a message arrives via WebSocket for
+    // a chat that isn't the one currently open - otherwise the list only
+    // ever reflects unread state from the last full REST refetch.
+    function onMessageReceived(chatId, message) {
+        if (authService !== undefined && message.senderId === authService.currentUserId) return
+        if (chatId === chatListRoot.activeChatId) return
+
+        var preview = chatService.decryptMessage(chatId, message.content, message.encrypted === true)
+
+        var found = false
+        for (var i = 0; i < originalChats.length; i++) {
+            if (originalChats[i].chatId === chatId) {
+                originalChats[i].unreadCount = (originalChats[i].unreadCount || 0) + 1
+                originalChats[i].lastMessage = preview
+                found = true
+                break
+            }
+        }
+
+        if (!found) {
+            // Unknown chat (e.g. a brand-new conversation) - refetch to pick it up
+            chatService.fetchChats()
+            return
+        }
+
+        for (var j = 0; j < chatModel.count; j++) {
+            if (chatModel.get(j).chatId === chatId) {
+                chatModel.setProperty(j, "unreadCount", (chatModel.get(j).unreadCount || 0) + 1)
+                chatModel.setProperty(j, "lastMessage", preview)
+                break
+            }
+        }
+    }
 
     Component.onCompleted: {
-        loadSampleChats()
+        // Connect to chat service signals
+        if (chatService !== undefined && chatService !== null) {
+            chatService.chatsFetched.connect(onChatsFetched)
+            chatService.chatError.connect(onChatError)
+            chatService.chatRead.connect(onChatRead)
+            loadChatsFromAPI()
+        } else {
+            populateChatModel([])
+        }
+        if (websocketService !== undefined && websocketService !== null) {
+            websocketService.messageReceived.connect(onMessageReceived)
+        }
     }
 }

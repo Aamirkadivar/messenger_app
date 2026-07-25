@@ -1,69 +1,124 @@
 package com.messenger.app
 
+import android.Manifest
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
-import android.util.Log
-import com.messenger.app.di.initKoin
-import com.messenger.app.notification.NotificationHelper
-import com.messenger.app.websocket.WebSocketManager
-import org.koin.android.KoinAndroid
-import org.koin.android.ext.koin.androidContext
-import org.koin.android.ext.koin.androidLogger
-import org.koin.core.logger.Level
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ProcessLifecycleOwner
+import com.messenger.app.data.remote.websocket.IncomingChatMessage
+import com.messenger.app.data.repository.ChatRepository
+import com.messenger.app.security.TokenManager
+import com.messenger.app.ui.MainActivity
+import dagger.hilt.android.HiltAndroidApp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import javax.inject.Inject
 
 /**
  * Main Application class for the Messenger app.
- * Initializes Koin DI, Notification Channels, and WebSocket connection.
+ * Hilt handles DI setup automatically via @HiltAndroidApp. This class also
+ * owns a process-lifetime notification listener: it observes real-time
+ * incoming messages (see ChatRepository/WebSocketManager) and surfaces a
+ * system notification whenever a message arrives from someone else while
+ * the app isn't in the foreground.
  */
+@HiltAndroidApp
 class MessengerApplication : Application() {
 
     companion object {
-        private const val TAG = "MessengerApplication"
         const val CHANNEL_ID_MESSAGES = "messenger_messages"
         const val CHANNEL_ID_NOTIFICATIONS = "messenger_notifications"
-        const val CHANNEL_ID_WEBSOCKET = "messenger_websocket"
-        const val NOTIFICATION_ID_WEBSOCKET = 1
     }
+
+    @Inject
+    lateinit var chatRepository: ChatRepository
+
+    @Inject
+    lateinit var tokenManager: TokenManager
+
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     override fun onCreate() {
         super.onCreate()
-        instance = this
-
-        // Initialize Koin
-        initKoin()
-
-        // Create notification channels
         createNotificationChannels()
+        observeIncomingMessagesForNotifications()
+    }
 
-        // Initialize WebSocket connection
-        try {
-            val webSocketManager = getComponent<WebSocketManager>()
-            webSocketManager.connect()
-            Log.d(TAG, "WebSocket manager initialized")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize WebSocket manager", e)
-        }
+    private fun observeIncomingMessagesForNotifications() {
+        appScope.launch {
+            chatRepository.incomingMessages.collect { message ->
+                val myId = tokenManager.getCurrentUserId().getOrNull()
+                if (myId != null && message.senderId == myId) return@collect
 
-        // Initialize notification helper
-        try {
-            NotificationHelper.initialize(this)
-            Log.d(TAG, "Notification helper initialized")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize notification helper", e)
+                val isForeground = ProcessLifecycleOwner.get().lifecycle.currentState
+                    .isAtLeast(Lifecycle.State.STARTED)
+                if (isForeground) return@collect
+
+                showMessageNotification(message)
+            }
         }
     }
 
-    /**
-     * Create notification channels for different message types
-     */
+    private suspend fun showMessageNotification(message: IncomingChatMessage) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+
+        val senderName = resolveChatName(message.chatId)
+        // Decrypt the E2EE ciphertext for the notification preview.
+        val text = chatRepository.decryptFor(message.chatId, message.content, message.encrypted)
+
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            message.chatId.hashCode(),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID_MESSAGES)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(senderName)
+            .setContentText(text)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        NotificationManagerCompat.from(this).notify(message.chatId.hashCode(), notification)
+    }
+
+    private suspend fun resolveChatName(chatId: String): String {
+        val token = tokenManager.getAccessToken().getOrNull() ?: return "New message"
+        return chatRepository.getChats(token).getOrNull()
+            ?.firstOrNull { it.id == chatId }
+            ?.let { chat ->
+                chat.otherUser?.displayName?.takeIf { it.isNotBlank() }
+                    ?: chat.otherUser?.username
+            }
+            ?: "New message"
+    }
+
     private fun createNotificationChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-            // Messages channel - for incoming messages
             val messagesChannel = NotificationChannel(
                 CHANNEL_ID_MESSAGES,
                 "Messages",
@@ -72,68 +127,18 @@ class MessengerApplication : Application() {
                 description = "Notifications for incoming messages"
                 enableVibration(true)
                 vibrationPattern = longArrayOf(0, 250, 250, 250)
-                enableLights(true)
-                lightColor = android.graphics.Color.rgb(0, 122, 255)
             }
 
-            // Notifications channel - for general notifications
             val notificationsChannel = NotificationChannel(
                 CHANNEL_ID_NOTIFICATIONS,
                 "Notifications",
                 NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
-                description = "Notifications for group events and updates"
-                enableVibration(true)
-                vibrationPattern = longArrayOf(0, 250)
-                enableLights(true)
-                lightColor = android.graphics.Color.rgb(0, 122, 255)
-            }
-
-            // WebSocket channel - for foreground service
-            val websocketChannel = NotificationChannel(
-                CHANNEL_ID_WEBSOCKET,
-                "WebSocket Connection",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Keeps the app connected to messages"
-                setShowBadge(false)
-                enableVibration(false)
-                enableLights(false)
+                description = "General app notifications"
             }
 
             notificationManager.createNotificationChannel(messagesChannel)
             notificationManager.createNotificationChannel(notificationsChannel)
-            notificationManager.createNotificationChannel(websocketChannel)
-
-            Log.d(TAG, "Notification channels created")
-        }
-    }
-
-    /**
-     * Helper function to get a component from Koin
-     */
-    @Suppress("UNCHECKED_CAST")
-    private fun <T> getComponent(cls: Class<T>): T {
-        return (koin as KoinAndroid).get(cls)
-    }
-
-    override fun onTerminate() {
-        super.onTerminate()
-        // Clean up WebSocket connection
-        try {
-            val webSocketManager = getComponent<WebSocketManager>()
-            webSocketManager.disconnect()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to disconnect WebSocket", e)
-        }
-    }
-
-    companion object {
-        @Volatile
-        private var instance: MessengerApplication? = null
-
-        fun getInstance(): MessengerApplication {
-            return instance ?: throw IllegalStateException("Application instance not initialized")
         }
     }
 }

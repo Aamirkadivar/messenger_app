@@ -1,21 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <!-- Base application theme - Telegram-inspired with Material 3 -->
+    <!-- Base application theme. Only used for the launch window before Compose
+         takes over - actual app theming (colors, typography) lives in Theme.kt
+         via Material3's MaterialTheme, not XML attributes. -->
     <style name="Theme.MessengerApp" parent="android:Theme.Material.Light.NoActionBar">
-        <!-- Primary brand color -->
-        <item name="colorPrimary">@color/primary_color</item>
-        <item name="colorPrimaryVariant">@color/primary_dark</item>
-        <item name="colorOnPrimary">@color/on_primary</item>
-        <!-- Secondary brand color -->
-        <item name="colorSecondary">@color/secondary_color</item>
-        <item name="colorSecondaryVariant">@color/secondary_dark</item>
-        <item name="colorOnSecondary">@color/on_secondary</item>
-        <!-- Status bar color -->
+        <item name="android:colorPrimary">@color/primary_color</item>
         <item name="android:statusBarColor">@color/status_bar_color</item>
-        <!-- Window background -->
         <item name="android:windowBackground">@color/window_background</item>
-        <!-- Background color -->
         <item name="android:background">@color/background_color</item>
     </style>
 

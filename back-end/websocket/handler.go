@@ -19,6 +19,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// Keepalive: without this, idle connections get silently dropped by NAT/
+// routers/mobile networks after a few minutes (observed as abnormal closure
+// code 1006), causing missed real-time messages until the client reconnects.
+const (
+	pongWait   = 60 * time.Second
+	pingPeriod = (pongWait * 9) / 10
+)
+
 // Client represents a connected WebSocket client
 type Client struct {
 	ID     string
@@ -224,6 +232,14 @@ func HandleWebSocket(hub *Hub) fiber.Handler {
 		// Update presence
 		updatePresence(userID, true)
 
+		// Keepalive: reset the read deadline on every pong so the connection
+		// stays open as long as the client keeps responding to pings.
+		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		c.Conn.SetPongHandler(func(string) error {
+			c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+			return nil
+		})
+
 		// Handle connection
 		go client.writePump(hub)
 
@@ -293,7 +309,7 @@ func leavePresence(userID uuid.UUID) {
 	result := database.DB.Where("user_id = ?", userID).First(&presence)
 	if result.Error != nil {
 		presence = models.Presence{
-			UserID:   uuid.Nil,
+			UserID:   userID,
 			IsOnline: false,
 			LastSeen: time.Now(),
 		}
@@ -308,20 +324,29 @@ func leavePresence(userID uuid.UUID) {
 
 // Client write pump
 func (c *Client) writePump(hub *Hub) {
+	ticker := time.NewTicker(pingPeriod)
 	defer func() {
+		ticker.Stop()
 		c.Conn.Close()
 	}()
 
 	for {
-		message, ok := <-c.Send
-		if !ok {
-			_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
-			return
-		}
+		select {
+		case message, ok := <-c.Send:
+			if !ok {
+				_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
 
-		c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			return
+			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				return
+			}
+		case <-ticker.C:
+			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }

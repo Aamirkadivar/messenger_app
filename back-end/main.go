@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"messenger-app/config"
-	"messenger-app/crypto"
 	"messenger-app/database"
 	"messenger-app/firebase"
 	"messenger-app/handlers"
@@ -18,9 +17,15 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	fiberlog "github.com/gofiber/fiber/v2/log"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	// Load .env file if present (ignored if missing; real env vars still take precedence)
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using existing environment variables")
+	}
+
 	// Load configuration
 	cfg := config.LoadConfig()
 
@@ -94,12 +99,10 @@ func main() {
 	userRoutes.Get("/search", userHandler.SearchUsers)
 	userRoutes.Get("/:user_id/presence", userHandler.GetUserPresence)
 
-	// Chat routes (placeholder - implement ChatHandler or use messageService)
+	// Chat routes
 	chatRoutes := protected.Group("/chats")
-	chatRoutes.Get("/", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"error": "Not implemented yet"})
-	})
-	chatRoutes.Post("/direct", messageService.GetDirectChat)
+	chatRoutes.Get("/", messageService.GetChatsByUserID)
+	chatRoutes.Post("/direct/:contact_id", messageService.GetDirectChat)
 	chatRoutes.Get("/:chat_id", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"error": "Not implemented yet"})
 	})
@@ -133,11 +136,14 @@ func main() {
 	messageRoutes.Post("/:chat_id/unread", messageService.GetUnreadCount)
 
 	// Crypto/E2EE routes
+	// E2EE: the server only ever stores/serves *public* keys. Keypair
+	// generation happens on the client and private keys never leave the
+	// device, so the old server-side /generate-keypair route (which stored
+	// private keys in the DB) is intentionally gone.
 	cryptoRoutes := protected.Group("/crypto")
 	cryptoRoutes.Post("/public-key", cryptoHandler.SavePublicKey)
 	cryptoRoutes.Get("/public-key", cryptoHandler.GetPublicKey)
 	cryptoRoutes.Get("/public-key/:user_id", cryptoHandler.GetPublicKeyByUserId)
-	cryptoRoutes.Post("/generate-keypair", cryptoHandler.GenerateKeyPairHandler)
 
 	// WebSocket route
 	app.Get("/ws", middleware.WebSocketAuth(cfg), websocket.WSHandler(hub))

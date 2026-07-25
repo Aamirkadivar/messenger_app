@@ -1,70 +1,66 @@
 package com.messenger.app.data.model
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 /**
- * Authentication request model for login
+ * These models mirror the real backend contract exactly (back-end/handlers/auth.go).
+ * Register does NOT return tokens - only /auth/login and /auth/refresh do.
  */
+
 @Serializable
 data class LoginRequest(
     val email: String,
     val password: String
 )
 
-/**
- * Authentication request model for registration
- */
 @Serializable
 data class RegisterRequest(
-    val name: String,
     val username: String,
     val email: String,
     val password: String
 )
 
-/**
- * Authentication response model
- */
-@Serializable
-data class AuthResponse(
-    val token: String,
-    val user: User,
-    val expiresIn: Long? = null,
-    val refreshToken: String? = null
-) {
-    val tokenExpiry: Long = System.currentTimeMillis() + (expiresIn ?: 3600000)
-}
-
-/**
- * Refresh token request
- */
 @Serializable
 data class RefreshTokenRequest(
-    val refreshToken: String
+    @SerialName("refresh_token") val refreshToken: String
 )
 
-/**
- * Password reset request
- */
 @Serializable
-data class ResetPasswordRequest(
-    val email: String
-)
-
-/**
- * Password change request
- */
-@Serializable
-data class ChangePasswordRequest(
-    val currentPassword: String,
-    val newPassword: String
-)
-
-/**
- * Verification request
- */
-@Serializable
-data class VerifyRequest(
+data class UserDto(
+    val id: String,
     val email: String,
-    val code: String
+    val username: String,
+    @SerialName("display_name") val displayName: String? = null,
+    @SerialName("avatar_url") val avatarUrl: String? = null,
+    @SerialName("created_at") val createdAt: String? = null
+)
+
+@Serializable
+data class TokensDto(
+    @SerialName("access_token") val accessToken: String,
+    @SerialName("refresh_token") val refreshToken: String,
+    val type: String = "Bearer",
+    @SerialName("expires_in") val expiresIn: Long = 86400
+)
+
+/** Response from POST /auth/register - no tokens included. */
+@Serializable
+data class RegisterResponse(
+    val message: String? = null,
+    val user: UserDto
+)
+
+/** Response from POST /auth/login and POST /auth/refresh. */
+@Serializable
+data class AuthResponse(
+    val message: String? = null,
+    val user: UserDto,
+    val tokens: TokensDto
+)
+
+@Serializable
+data class ApiErrorResponse(
+    val error: String? = null,
+    val message: String? = null
 )

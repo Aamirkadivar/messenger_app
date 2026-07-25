@@ -2,18 +2,20 @@ package com.messenger.app.data.repository
 
 import android.util.Log
 import com.messenger.app.data.local.dao.UserDao
+import com.messenger.app.data.local.entity.UserEntity
 import com.messenger.app.data.model.*
 import com.messenger.app.data.remote.api.AuthApiService
 import com.messenger.app.security.KeyStoreManager
 import com.messenger.app.security.TokenManager
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import okhttp3.ResponseBody
 
 /**
  * Repository for authentication operations.
- * Handles login, registration, token refresh, and user management.
+ * Handles login, registration, token refresh, and user management against the
+ * real backend's /auth endpoints.
  */
 class AuthRepository(
     private val authApiService: AuthApiService,
@@ -21,37 +23,28 @@ class AuthRepository(
     private val keyStoreManager: KeyStoreManager,
     private val userDao: UserDao
 ) {
-
     companion object {
         private const val TAG = "AuthRepository"
     }
 
+    private val json = Json { ignoreUnknownKeys = true }
+
     /**
-     * Register a new user
+     * Register a new user. The backend does not issue tokens on register -
+     * callers should follow a successful registration with [login].
      */
     suspend fun register(
         username: String,
         email: String,
         password: String
-    ): Result<AuthResponse> = withContext(Dispatchers.IO) {
+    ): Result<UserDto> = withContext(Dispatchers.IO) {
         try {
-            val request = RegisterRequest(
-                username = username,
-                email = email,
-                password = password
-            )
-
-            val response = authApiService.register(request)
-
+            val response = authApiService.register(RegisterRequest(username, email, password))
             if (response.isSuccessful && response.body() != null) {
-                val authResponse = response.body()!!
-                saveAuthData(authResponse)
                 Log.d(TAG, "Registration successful for user: $username")
-                Result.success(authResponse)
+                Result.success(response.body()!!.user)
             } else {
-                val errorBody = response.errorBody()?.string() ?: "Unknown error"
-                Log.e(TAG, "Registration failed: $errorBody")
-                Result.failure(Exception("Registration failed: $errorBody"))
+                Result.failure(Exception(extractError(response.errorBody())))
             }
         } catch (e: Exception) {
             Log.e(TAG, "Registration error", e)
@@ -60,36 +53,36 @@ class AuthRepository(
     }
 
     /**
-     * Login with email/username and password
+     * Login with email and password.
      */
-    suspend fun login(
-        username: String,
-        password: String
-    ): Result<AuthResponse> = withContext(Dispatchers.IO) {
+    suspend fun login(email: String, password: String): Result<AuthResponse> = withContext(Dispatchers.IO) {
         try {
-            val request = LoginRequest(
-                username = username,
-                password = password
-            )
-
-            val response = authApiService.login(request)
+            val response = authApiService.login(LoginRequest(email, password))
 
             if (response.isSuccessful && response.body() != null) {
                 val authResponse = response.body()!!
                 saveAuthData(authResponse)
-                
-                // Generate encryption keys after successful login
-                val keyGenResult = keyStoreManager.generateEncryptionKey()
+
+                userDao.insertUser(
+                    UserEntity(
+                        id = authResponse.user.id,
+                        name = authResponse.user.displayName ?: authResponse.user.username,
+                        username = authResponse.user.username,
+                        email = authResponse.user.email,
+                        avatarUrl = authResponse.user.avatarUrl
+                    )
+                )
+
+                // Generate a local encryption key for this device if one doesn't exist yet
+                val keyGenResult = keyStoreManager.generateEncryptionKey(KeyStoreManager.DEVICE_ENCRYPTION_KEY_ALIAS)
                 if (keyGenResult.isFailure) {
                     Log.e(TAG, "Failed to generate encryption key", keyGenResult.exceptionOrNull())
                 }
-                
-                Log.d(TAG, "Login successful for user: $username")
+
+                Log.d(TAG, "Login successful for user: ${authResponse.user.username}")
                 Result.success(authResponse)
             } else {
-                val errorBody = response.errorBody()?.string() ?: "Unknown error"
-                Log.e(TAG, "Login failed: $errorBody")
-                Result.failure(Exception("Login failed: $errorBody"))
+                Result.failure(Exception(extractError(response.errorBody())))
             }
         } catch (e: Exception) {
             Log.e(TAG, "Login error", e)
@@ -98,27 +91,25 @@ class AuthRepository(
     }
 
     /**
-     * Refresh access token using refresh token
+     * Refresh access token using the stored refresh token.
      */
     suspend fun refreshToken(): Result<AuthResponse> = withContext(Dispatchers.IO) {
         try {
-            val refreshToken = tokenManager.getRefreshToken()
-            if (refreshToken.isFailure || refreshToken.getOrNull().isNullOrEmpty()) {
+            val refreshTokenResult = tokenManager.getRefreshToken()
+            val refreshToken = refreshTokenResult.getOrNull()
+            if (refreshTokenResult.isFailure || refreshToken.isNullOrEmpty()) {
                 return@withContext Result.failure(Exception("No refresh token available"))
             }
 
-            val request = RefreshTokenRequest(refreshToken = refreshToken.getOrNull()!!)
-            val response = authApiService.refreshToken(request)
-
+            val response = authApiService.refreshToken(RefreshTokenRequest(refreshToken))
             if (response.isSuccessful && response.body() != null) {
                 val authResponse = response.body()!!
                 saveAuthData(authResponse)
                 Log.d(TAG, "Token refreshed successfully")
                 Result.success(authResponse)
             } else {
-                Log.e(TAG, "Token refresh failed")
                 clearAuthData()
-                Result.failure(Exception("Token refresh failed"))
+                Result.failure(Exception(extractError(response.errorBody())))
             }
         } catch (e: Exception) {
             Log.e(TAG, "Token refresh error", e)
@@ -128,110 +119,42 @@ class AuthRepository(
     }
 
     /**
-     * Logout and clear auth data
+     * Logout and clear local auth data. The backend has no /auth/logout endpoint,
+     * so this only clears local state.
      */
     suspend fun logout(): Result<Unit> = withContext(Dispatchers.IO) {
-        return try {
-            val token = tokenManager.getAccessToken()
-            if (token.isSuccess && !token.getOrNull().isNullOrEmpty()) {
-                try {
-                    authApiService.logout("Bearer ${token.getOrNull()}")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Logout API call failed, clearing local data anyway", e)
-                }
-            }
-            clearAuthData()
-            Result.success(Unit)
-        } catch (e: Exception) {
-            clearAuthData()
-            Result.failure(e)
-        }
+        clearAuthData()
+        Result.success(Unit)
     }
 
-    /**
-     * Get current user profile
-     */
-    suspend fun getCurrentUser(): Result<UserProfile> = withContext(Dispatchers.IO) {
-        try {
-            val token = tokenManager.getAccessToken()
-            if (token.isFailure || token.getOrNull().isNullOrEmpty()) {
-                return@withContext Result.failure(Exception("No access token available"))
-            }
-
-            val response = authApiService.getCurrentUser("Bearer ${token.getOrNull()}")
-            if (response.isSuccessful && response.body() != null) {
-                // Save to local DB
-                val user = response.body()!!
-                userDao.upsertUser(
-                    com.messenger.app.data.local.entity.UserEntity(
-                        id = user.id,
-                        username = user.username,
-                        email = user.email,
-                        avatarUrl = user.avatarUrl,
-                        lastSeen = user.lastSeen
-                    )
-                )
-                Result.success(user)
-            } else {
-                Result.failure(Exception("Failed to get user profile"))
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Get current user error", e)
-            Result.failure(e)
-        }
-    }
-
-    /**
-     * Check if user is authenticated
-     */
     fun isAuthenticated(): Boolean = tokenManager.isAuthenticated()
 
-    /**
-     * Check if access token is expired
-     */
-    suspend fun isAccessTokenExpired(): Result<Boolean> = tokenManager.isAccessTokenExpired()
+    suspend fun getAuthToken(): String? = tokenManager.getAccessToken().getOrNull()
 
-    /**
-     * Get authentication token for API calls
-     */
-    suspend fun getAuthToken(): Result<String?> = tokenManager.getAccessToken()
-
-    /**
-     * Save authentication data (tokens)
-     */
-    private suspend fun saveAuthData(authResponse: AuthResponse): Result<Unit> {
-        return withContext(Dispatchers.IO) {
-            var success = true
-
-            val tokenResult = tokenManager.saveAccessToken(authResponse.accessToken)
-            if (tokenResult.isFailure) {
-                Log.e(TAG, "Failed to save access token", tokenResult.exceptionOrNull())
-                success = false
-            }
-
-            val refreshTokenResult = tokenManager.saveRefreshToken(authResponse.refreshToken)
-            if (refreshTokenResult.isFailure) {
-                Log.e(TAG, "Failed to save refresh token", refreshTokenResult.exceptionOrNull())
-                success = false
-            }
-
-            val expiresAtResult = tokenManager.saveAccessTokenExpiresAt(
-                System.currentTimeMillis() + authResponse.expiresIn * 1000
-            )
-            if (expiresAtResult.isFailure) {
-                Log.e(TAG, "Failed to save expires at", expiresAtResult.exceptionOrNull())
-                success = false
-            }
-
-            if (success) Result.success(Unit)
-            else Result.failure(Exception("Failed to save some auth data"))
-        }
+    private suspend fun saveAuthData(authResponse: AuthResponse) {
+        tokenManager.saveAccessToken(authResponse.tokens.accessToken)
+            .onFailure { Log.e(TAG, "Failed to save access token", it) }
+        tokenManager.saveRefreshToken(authResponse.tokens.refreshToken)
+            .onFailure { Log.e(TAG, "Failed to save refresh token", it) }
+        tokenManager.saveAccessTokenExpiresAt(
+            System.currentTimeMillis() + authResponse.tokens.expiresIn * 1000
+        ).onFailure { Log.e(TAG, "Failed to save token expiry", it) }
+        tokenManager.saveCurrentUserId(authResponse.user.id)
+            .onFailure { Log.e(TAG, "Failed to save current user id", it) }
     }
 
-    /**
-     * Clear all authentication data
-     */
-    private suspend fun clearAuthData(): Result<Unit> = withContext(Dispatchers.IO) {
+    private suspend fun clearAuthData() {
         tokenManager.clearTokens()
+    }
+
+    private fun extractError(errorBody: ResponseBody?): String {
+        val raw = errorBody?.string()
+        if (raw.isNullOrBlank()) return "Something went wrong"
+        return try {
+            val parsed = json.decodeFromString<ApiErrorResponse>(raw)
+            parsed.error ?: parsed.message ?: raw
+        } catch (e: Exception) {
+            raw
+        }
     }
 }

@@ -580,7 +580,7 @@ Item {
                 }
                 onClicked: {
                     isLoading = true
-                    authService.register(usernameField.text, emailField.text, passwordField.text)
+                    authService.registerUser(usernameField.text, emailField.text, passwordField.text)
                 }
             }
 

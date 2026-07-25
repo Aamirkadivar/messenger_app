@@ -147,3 +147,6 @@ windows_app/dist/
 *.autosave
 .DS_Store
 Thumbs.db
+.archive
+old_screenshots
+application_ios_macos.zip

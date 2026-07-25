@@ -129,10 +129,14 @@ type MessageCreateRequest struct {
 	Content            string     `json:"content" binding:"required"`
 	ContentType        string     `json:"content_type"`
 	RecipientPublicKey string     `json:"recipient_public_key"`
-	FileURL            string     `json:"file_url"`
-	FileType           string     `json:"file_type"`
-	ReplyToID          *uuid.UUID `json:"reply_to_id"`
-	MentionIDs         []uuid.UUID `json:"mention_ids"`
+	// Encrypted is true when Content is client-side E2EE ciphertext
+	// (hex of nonce||crypto_box) rather than plaintext. The server treats
+	// Content as an opaque blob either way and never decrypts it.
+	Encrypted bool       `json:"encrypted"`
+	FileURL   string     `json:"file_url"`
+	FileType  string     `json:"file_type"`
+	ReplyToID *uuid.UUID `json:"reply_to_id"`
+	MentionIDs []uuid.UUID `json:"mention_ids"`
 }
 
 // CreateGroupRequest represents the request to create a group
@@ -258,8 +262,8 @@ type ChatResponse struct {
 func MigrateDB(db *gorm.DB) error {
 	return db.AutoMigrate(
 		&User{},
-		&Message{},
 		&Chat{},
+		&Message{},
 		&ChatParticipant{},
 		&GroupMember{},
 		&Presence{},

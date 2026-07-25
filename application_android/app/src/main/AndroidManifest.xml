@@ -74,37 +74,14 @@
             </intent-filter>
         </activity>
 
-        <!-- Auth Activity for login/registration redirects -->
-        <activity
-            android:name=".ui.auth.AuthRedirectActivity"
-            android:exported="false"
-            android:theme="@style/Theme.MessengerApp.Translucent" />
-
         <!-- Firebase Cloud Messaging Service -->
         <service
-            android:name=".data.local.fcm.FcmMessagingService"
+            android:name=".fcm.FcmPushNotificationService"
             android:exported="false">
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
         </service>
-
-        <!-- WebSocket Foreground Service -->
-        <service
-            android:name=".data.remote.websocket.WebSocketForegroundService"
-            android:enabled="true"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
-
-        <!-- Notification Channel Setup Service -->
-        <service
-            android:name=".data.local.notification.NotificationChannelService"
-            android:exported="false" />
-
-        <!-- Push Notification Data Receiver -->
-        <receiver
-            android:name=".data.local.notification.NotificationReceiver"
-            android:exported="false" />
 
     </application>
 

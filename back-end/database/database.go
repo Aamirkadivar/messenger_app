@@ -14,7 +14,8 @@ var DB *gorm.DB
 
 // InitDB initializes the database connection
 func InitDB(cfg *config.Config) {
-	dsn := cfg.DBUser + ":" + cfg.DBPassword + "@host=" + cfg.DBHost + " port=" + cfg.DBPort + " dbname=" + cfg.DBName + " " + "sslmode=" + cfg.DBSSLMode
+	dsn := "host=" + cfg.DBHost + " port=" + cfg.DBPort + " user=" + cfg.DBUser +
+		" password=" + cfg.DBPassword + " dbname=" + cfg.DBName + " sslmode=" + cfg.DBSSLMode
 
 	var gormLogger logger.Interface
 	if cfg.Env == "development" {

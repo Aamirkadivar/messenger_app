@@ -8,11 +8,11 @@
 class Config {
 public:
     static QString apiBaseUrl() {
-        return QStringLiteral("http://localhost:8080/api");
+        return QStringLiteral("http://192.168.1.52:3000/api/v1");
     }
 
     static QString wsUrl() {
-        return QStringLiteral("ws://localhost:8080/ws");
+        return QStringLiteral("ws://192.168.1.52:3000/ws");
     }
 
     static QString websocketUrl() {

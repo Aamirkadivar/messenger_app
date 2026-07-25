@@ -3,8 +3,7 @@ package com.messenger.app.data.local.entity
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
-import com.messenger.app.data.model.MessageType
-import com.messenger.app.data.model.MessageStatus
+import androidx.room.PrimaryKey
 
 /**
  * Room entity for storing messages locally
@@ -22,7 +21,7 @@ import com.messenger.app.data.model.MessageStatus
     indices = [Index("conversation_id"), Index("timestamp")]
 )
 data class MessageEntity(
-    val id: String,
+    @PrimaryKey val id: String,
     val conversation_id: String,
     val senderId: String,
     val content: String,
@@ -37,20 +36,4 @@ data class MessageEntity(
     val mentions: String? = null, // JSON serialized
     val attachments: String? = null, // JSON serialized
     val isEncrypted: Boolean = false
-) {
-    fun getMessageType(): MessageType {
-        return try {
-            MessageType.valueOf(type)
-        } catch (e: Exception) {
-            MessageType.TEXT
-        }
-    }
-
-    fun getMessageStatus(): MessageStatus {
-        return try {
-            MessageStatus.valueOf(status)
-        } catch (e: Exception) {
-            MessageStatus.PENDING
-        }
-    }
-}
+)

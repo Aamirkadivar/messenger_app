@@ -64,6 +64,26 @@ public:
                                 const QByteArray& signature,
                                 const QByteArray& publicKey);
 
+    // ---- Real E2EE via NaCl crypto_box (X25519 + XSalsa20-Poly1305) ----
+    // These interoperate byte-for-byte with libsodium/lazysodium crypto_box on
+    // other platforms and with Go's nacl/box. Keys are 32-byte hex strings.
+
+    // Generate an X25519 key pair for crypto_box. Returns hex-encoded keys.
+    static bool boxKeyPair(QString& publicHex, QString& privateHex);
+
+    // Encrypt for a recipient. Output wire format: hex(nonce[24] || ciphertext).
+    // Returns an empty string on failure.
+    static QString boxEncrypt(const QString& message,
+                              const QString& recipientPublicHex,
+                              const QString& senderPrivateHex);
+
+    // Decrypt a payload produced by boxEncrypt. For a direct chat the "other"
+    // key is the other participant's public key regardless of who sent it.
+    // Returns an empty string on failure.
+    static QString boxDecrypt(const QString& payloadHex,
+                              const QString& otherPublicHex,
+                              const QString& myPrivateHex);
+
     // Convert bytes to hex for display (inline for convenience)
     static QString bytesToHex(const QByteArray& bytes);
 

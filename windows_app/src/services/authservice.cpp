@@ -8,8 +8,43 @@
 #include <QDebug>
 #include <QUrl>
 
+namespace {
+// Prefer the server's own {"error": "..."} message over Qt's generic
+// "server replied: Conflict" / "Host requires authentication" strings.
+QString extractErrorMessage(QNetworkReply* reply) {
+    const QJsonObject obj = QJsonDocument::fromJson(reply->readAll()).object();
+    const QString serverError = obj.value(QStringLiteral("error")).toString();
+    return serverError.isEmpty() ? reply->errorString() : serverError;
+}
+}
+
 AuthService::AuthService(QObject* parent) : QObject(parent) {
     setupNetworkManager();
+}
+
+// Restores a previously saved login (access token + user id) so the app
+// doesn't force a fresh login - and therefore a fresh WebSocket connect -
+// every time it's relaunched, the way most messaging apps stay signed in.
+void AuthService::restoreSession() {
+    QString token = CredentialManager::instance().getToken(QStringLiteral("access_token"));
+    QString userId = CredentialManager::instance().getToken(QStringLiteral("current_user"));
+    if (token.isEmpty() || userId.isEmpty()) return;
+
+    m_accessToken = token;
+    m_refreshToken = CredentialManager::instance().getToken(QStringLiteral("refresh_token"));
+    m_currentUserId = userId;
+    m_currentUsername = CredentialManager::instance().getToken(QStringLiteral("username_%1").arg(userId));
+    m_loggedIn = true;
+
+    emit isLoggedInChanged();
+    emit currentUserIdChanged();
+    emit currentUsernameChanged();
+    emit loginSuccess(m_currentUserId, m_currentUsername);
+    emit tokenReady(m_accessToken);
+
+    // Republish our public key (and generate a keypair if this device somehow
+    // has a session but no keys yet) so contacts can always encrypt to us.
+    ensureE2EEKeysAndPublish();
 }
 
 void AuthService::setupNetworkManager() {
@@ -69,6 +104,13 @@ void AuthService::logout() {
     CredentialManager::instance().deleteToken(QStringLiteral("refresh_token"));
     CredentialManager::instance().deleteToken(QStringLiteral("current_user"));
 
+    // Notify QML bindings (isLoggedIn/currentUserId/currentUsername) so the UI
+    // actually returns to the login screen - without these the property
+    // bindings never re-evaluate and the app stays on the main page.
+    emit isLoggedInChanged();
+    emit currentUserIdChanged();
+    emit currentUsernameChanged();
+
     emit loginFailed(QStringLiteral("Logged out"));
     emit logoutSuccess();
 }
@@ -91,6 +133,58 @@ void AuthService::refreshToken() {
 
     QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(data).toJson());
     connect(reply, &QNetworkReply::finished, this, &AuthService::onRefreshReplyFinished);
+}
+
+QString AuthService::e2eePrivateKey() const {
+    if (m_currentUserId.isEmpty()) return QString();
+    return CredentialManager::instance().getToken(QStringLiteral("e2ee_priv_%1").arg(m_currentUserId));
+}
+
+QString AuthService::e2eePublicKey() const {
+    if (m_currentUserId.isEmpty()) return QString();
+    return CredentialManager::instance().getToken(QStringLiteral("e2ee_pub_%1").arg(m_currentUserId));
+}
+
+void AuthService::ensureE2EEKeysAndPublish() {
+    if (m_currentUserId.isEmpty()) return;
+
+    QString priv = e2eePrivateKey();
+    QString pub = e2eePublicKey();
+
+    // Generate a keypair the first time this user signs in on this device.
+    if (priv.isEmpty() || pub.isEmpty()) {
+        QString newPub, newPriv;
+        if (!Encryption::boxKeyPair(newPub, newPriv)) {
+            qWarning() << "[E2EE] Failed to generate keypair";
+            return;
+        }
+        CredentialManager::instance().saveToken(QStringLiteral("e2ee_priv_%1").arg(m_currentUserId), newPriv);
+        CredentialManager::instance().saveToken(QStringLiteral("e2ee_pub_%1").arg(m_currentUserId), newPub);
+        pub = newPub;
+        qDebug() << "[E2EE] Generated new keypair for" << m_currentUserId;
+    }
+
+    // Publish (upsert) the public key to the server so contacts can encrypt to us.
+    QString token = authToken();
+    if (token.isEmpty() || pub.isEmpty()) return;
+
+    QUrl url(Config::apiBaseUrl() + QStringLiteral("/crypto/public-key"));
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json").toUtf8());
+    request.setRawHeader("Authorization", ("Bearer " + token).toUtf8());
+
+    QJsonObject body;
+    body[QStringLiteral("public_key")] = pub;
+
+    QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+    connect(reply, &QNetworkReply::finished, reply, [reply]() {
+        if (reply->error() != QNetworkReply::NoError) {
+            qWarning() << "[E2EE] Failed to publish public key:" << reply->errorString();
+        } else {
+            qDebug() << "[E2EE] Public key published";
+        }
+        reply->deleteLater();
+    });
 }
 
 void AuthService::fetchOwnPublicKey() {
@@ -159,14 +253,13 @@ void AuthService::onLoginReplyFinished() {
             emit currentUsernameChanged();
             emit tokenReady(m_accessToken);
 
-            // Fetch own public key after login
-            fetchOwnPublicKey();
+            // Ensure a local E2EE keypair exists and publish our public key.
+            ensureE2EEKeysAndPublish();
         } else {
             emit loginFailed(QStringLiteral("Login succeeded but no token received"));
         }
     } else {
-        QString error = reply->errorString();
-        emit loginFailed(error);
+        emit loginFailed(extractErrorMessage(reply));
     }
     reply->deleteLater();
 }
@@ -176,57 +269,21 @@ void AuthService::onRegisterReplyFinished() {
     if (!reply) return;
 
     if (reply->error() == QNetworkReply::NoError) {
+        // Backend register response is {"message": "...", "user": {...}} - it does
+        // NOT issue tokens (only /auth/login does). The caller (Register.qml) logs
+        // in with the just-registered credentials once registerSuccess fires.
         QJsonObject obj = QJsonDocument::fromJson(reply->readAll()).object();
-
-        // Backend returns: {"tokens": {"access_token": "...", "refresh_token": "..."}, "user": {...}}
-        QJsonValue tokensVal = obj.value(QStringLiteral("tokens"));
-        QJsonObject tokensObj = tokensVal.isObject() ? tokensVal.toObject() : obj;
-        m_accessToken = tokensObj.value(QStringLiteral("access_token")).toString();
-        m_refreshToken = tokensObj.value(QStringLiteral("refresh_token")).toString();
-
         QJsonValue userVal = obj.value(QStringLiteral("user"));
         QJsonObject userObj = userVal.isObject() ? userVal.toObject() : QJsonObject();
-        m_currentUserId = userObj.value(QStringLiteral("id")).toString();
-        m_currentUsername = userObj.value(QStringLiteral("username")).toString();
-        m_loggedIn = !m_accessToken.isEmpty();
+        QString userId = userObj.value(QStringLiteral("id")).toString();
 
-        if (m_loggedIn) {
-            CredentialManager::instance().saveToken(QStringLiteral("access_token"), m_accessToken);
-            CredentialManager::instance().saveToken(QStringLiteral("refresh_token"), m_refreshToken);
-            CredentialManager::instance().saveToken(QStringLiteral("current_user"), m_currentUserId);
-
-            emit registerSuccess();
-            emit loginSuccess(m_currentUserId, m_currentUsername);
-            emit isLoggedInChanged();
-            emit currentUserIdChanged();
-            emit currentUsernameChanged();
-            emit tokenReady(m_accessToken);
-
-            // Generate keypair for new user
-            Encryption::KeyPair keyPair = Encryption::generateEd25519KeyPair();
-            if (!keyPair.publicKey.isEmpty()) {
-                QString pubKeyStr = QString::fromUtf8(keyPair.publicKey.toBase64());
-                QString privKey = QString::fromUtf8(keyPair.secretKey.toBase64());
-                CredentialManager::instance().saveUser(m_currentUserId, m_currentUsername, pubKeyStr, privKey);
-
-                // Send public key to server
-                QString url = Config::apiBaseUrl() + QStringLiteral("/crypto/public-key");
-                QUrl urlObj(url);
-                QNetworkRequest request(urlObj);
-                request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json").toUtf8());
-                request.setRawHeader("Authorization", ("Bearer " + m_accessToken).toUtf8());
-
-                QJsonObject keyData;
-                keyData[QStringLiteral("public_key")] = pubKeyStr;
-                QNetworkReply* reply2 = m_networkManager->post(request, QJsonDocument(keyData).toJson());
-                reply2->deleteLater();
-            }
+        if (!userId.isEmpty()) {
+            emit registerSuccess(userId);
         } else {
-            emit registerFailed(QStringLiteral("Registration succeeded but no token received"));
+            emit registerFailed(QStringLiteral("Registration succeeded but response was malformed"));
         }
     } else {
-        QString error = reply->errorString();
-        emit registerFailed(error);
+        emit registerFailed(extractErrorMessage(reply));
     }
     reply->deleteLater();
 }

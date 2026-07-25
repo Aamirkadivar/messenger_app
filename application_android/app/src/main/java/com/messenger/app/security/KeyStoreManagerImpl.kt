@@ -6,6 +6,7 @@ import android.security.keystore.KeyProperties
 import android.annotation.SuppressLint
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
+import javax.crypto.spec.GCMParameterSpec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -17,7 +18,6 @@ class KeyStoreManagerImpl(private val context: Context) : KeyStoreManager {
 
     companion object {
         private const val KEY_STORE_NAME = "AndroidKeyStore"
-        private const val KEY_ALIAS_ENCRYPTION = "messenger_encryption_key"
         private const val KEY_ALIAS_AUTH = "messenger_auth_key"
         private const val KEY_ALGORITHM = KeyProperties.KEY_ALGORITHM_AES
         private const val KEY_BLOCK_SIZE = 256
@@ -25,13 +25,6 @@ class KeyStoreManagerImpl(private val context: Context) : KeyStoreManager {
         private const val TAG_SIZE = 128 // GCM tag size in bits
     }
 
-    private val keyStore: javax.security.cert.KeyStore = run {
-        val ks = javax.security.cert.KeyStore.getInstance(KEY_STORE_NAME)
-        ks.load(null)
-        ks
-    }
-
-    // Use the standard Java KeyStore
     private val javaKeyStore: java.security.KeyStore by lazy {
         java.security.KeyStore.getInstance(KEY_STORE_NAME).apply {
             load(null)
@@ -39,9 +32,9 @@ class KeyStoreManagerImpl(private val context: Context) : KeyStoreManager {
     }
 
     @SuppressLint("NewApi")
-    override suspend fun generateEncryptionKey(): Result<Unit> = withContext(Dispatchers.IO) {
+    override suspend fun generateEncryptionKey(alias: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            if (javaKeyStore.containsAlias(KEY_ALIAS_ENCRYPTION)) {
+            if (javaKeyStore.containsAlias(alias)) {
                 return@withContext Result.success(Unit)
             }
 
@@ -51,11 +44,11 @@ class KeyStoreManagerImpl(private val context: Context) : KeyStoreManager {
             )
 
             val spec = KeyGenParameterSpec.Builder(
-                KEY_ALIAS_ENCRYPTION,
+                alias,
                 KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
             )
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                 .setKeySize(256)
                 .setUserAuthenticationRequired(false)
                 .setInvalidatedByBiometricEnrollment(false)
@@ -92,7 +85,7 @@ class KeyStoreManagerImpl(private val context: Context) : KeyStoreManager {
                 .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PSS)
                 .build()
 
-            keyPairGenerator.init(spec)
+            keyPairGenerator.initialize(spec)
             keyPairGenerator.generateKeyPair()
 
             Result.success(Unit)
@@ -110,7 +103,7 @@ class KeyStoreManagerImpl(private val context: Context) : KeyStoreManager {
                 val cipher = Cipher.getInstance(
                     KeyProperties.KEY_ALGORITHM_AES + "/" +
                             KeyProperties.BLOCK_MODE_GCM + "/" +
-                            KeyProperties.ENCRYPTION_PADDING_GCM
+                            KeyProperties.ENCRYPTION_PADDING_NONE
                 )
 
                 cipher.init(Cipher.ENCRYPT_MODE, key)
@@ -140,7 +133,7 @@ class KeyStoreManagerImpl(private val context: Context) : KeyStoreManager {
                 val cipher = Cipher.getInstance(
                     KeyProperties.KEY_ALGORITHM_AES + "/" +
                             KeyProperties.BLOCK_MODE_GCM + "/" +
-                            KeyProperties.ENCRYPTION_PADDING_GCM
+                            KeyProperties.ENCRYPTION_PADDING_NONE
                 )
 
                 val spec = GCMParameterSpec(TAG_SIZE, iv)
@@ -172,12 +165,7 @@ class KeyStoreManagerImpl(private val context: Context) : KeyStoreManager {
 
     override fun getPublicKey(alias: String): java.security.PublicKey? {
         return try {
-            val key = javaKeyStore.getKey(alias, null)
-            if (key is java.security.KeyPair) {
-                key.public
-            } else {
-                null
-            }
+            javaKeyStore.getCertificate(alias)?.publicKey
         } catch (e: Exception) {
             null
         }
@@ -185,12 +173,7 @@ class KeyStoreManagerImpl(private val context: Context) : KeyStoreManager {
 
     override fun getPrivateKey(alias: String): java.security.PrivateKey? {
         return try {
-            val key = javaKeyStore.getKey(alias, null)
-            if (key is java.security.KeyPair) {
-                key.private
-            } else {
-                null
-            }
+            javaKeyStore.getKey(alias, null) as? java.security.PrivateKey
         } catch (e: Exception) {
             null
         }

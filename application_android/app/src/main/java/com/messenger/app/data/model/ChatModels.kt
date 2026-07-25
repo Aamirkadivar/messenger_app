@@ -1,272 +1,136 @@
 package com.messenger.app.data.model
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 /**
- * User model representing an app user
+ * These models mirror the real backend contract (back-end/handlers/message.go,
+ * back-end/models/models.go).
  */
+
 @Serializable
-data class User(
+data class ChatParticipantDto(
     val id: String,
-    val name: String,
-    val username: String,
     val email: String,
-    val avatarUrl: String? = null,
-    val status: UserStatus = UserStatus.OFFLINE,
-    val lastSeen: Long? = null,
-    val bio: String? = null,
-    val publicKey: String? = null,
-    val createdAt: Long? = null
+    val username: String,
+    @SerialName("display_name") val displayName: String? = null
 )
 
-/**
- * User online status
- */
-enum class UserStatus {
-    ONLINE,
-    OFFLINE,
-    AWAY,
-    DO_NOT_DISTURB,
-    TYPING
-}
-
-/**
- * Message type enum
- */
-enum class MessageType {
-    TEXT,
-    IMAGE,
-    VIDEO,
-    AUDIO,
-    DOCUMENT,
-    VOICE_MESSAGE,
-    SYSTEM,
-    ENCRYPTED
-}
-
-/**
- * Message delivery status
- */
-enum class MessageStatus {
-    SENT,
-    DELIVERED,
-    READ,
-    FAILED,
-    PENDING
-}
-
-/**
- * Chat message model
- */
 @Serializable
-data class Message(
+data class DirectChatDto(
     val id: String,
-    val conversationId: String,
-    val senderId: String,
-    val content: String,
-    val type: MessageType = MessageType.TEXT,
-    val status: MessageStatus = MessageStatus.PENDING,
-    val timestamp: Long,
-    val encryptedContent: String? = null,
-    val encryptionKeyId: String? = null,
-    val encryptionNonce: String? = null,
-    val recipientId: String? = null,
-    val replyTo: String? = null,
-    val mentions: List<Mention> = emptyList(),
-    val attachments: List<Attachment> = emptyList(),
-    val isEncrypted: Boolean = false
-) {
-    val isOwnMessage: Boolean = false
-}
+    val type: String,
+    val name: String? = null,
+    @SerialName("avatar_url") val avatarUrl: String? = null,
+    val participants: List<ChatParticipantDto> = emptyList()
+)
 
-/**
- * Message request for sending
- */
+@Serializable
+data class DirectChatResponse(
+    val data: DirectChatDto
+)
+
+@Serializable
+data class MessageDto(
+    val id: String,
+    @SerialName("chat_id") val chatId: String,
+    @SerialName("sender_id") val senderId: String,
+    val sender: ChatParticipantDto? = null,
+    val content: String = "",
+    val encrypted: Boolean = true,
+    @SerialName("file_url") val fileUrl: String? = null,
+    @SerialName("file_type") val fileType: String? = null,
+    val type: String? = null,
+    @SerialName("delivered_at") val deliveredAt: String? = null,
+    @SerialName("created_at") val createdAt: String
+)
+
+@Serializable
+data class MessagesResponse(
+    val data: List<MessageDto> = emptyList(),
+    val total: Long = 0,
+    val limit: Int = 0,
+    val offset: Int = 0,
+    @SerialName("has_more") val hasMore: Boolean = false
+)
+
 @Serializable
 data class SendMessageRequest(
-    val conversationId: String,
+    @SerialName("chat_id") val chatId: String,
+    @SerialName("chat_type") val chatType: String = "direct",
     val content: String,
-    val type: MessageType = MessageType.TEXT,
-    val encryptedContent: String? = null,
-    val encryptionKeyId: String? = null,
-    val encryptionNonce: String? = null,
-    val replyTo: String? = null,
-    val mentions: List<Mention> = emptyList()
+    @SerialName("content_type") val contentType: String = "text",
+    @SerialName("recipient_public_key") val recipientPublicKey: String = "",
+    val encrypted: Boolean = false
 )
 
-/**
- * Message pagination request
- */
 @Serializable
-data class MessagePaginationRequest(
-    val conversationId: String,
-    val before: Long? = null,
-    val after: Long? = null,
-    val limit: Int = 20
-)
-
-/**
- * Message pagination response
- */
-@Serializable
-data class MessagePaginationResponse(
-    val messages: List<Message>,
-    val hasMore: Boolean,
-    val cursor: String? = null
-)
-
-/**
- * Conversation/Chat model
- */
-@Serializable
-data class Conversation(
+data class SendMessageResponseData(
     val id: String,
-    val type: ConversationType,
-    val participants: List<User> = emptyList(),
-    val name: String? = null,
-    val avatarUrl: String? = null,
-    val lastMessage: Message? = null,
-    val unreadCount: Int = 0,
-    val typingUsers: List<String> = emptyList(),
-    val lastUpdated: Long? = null,
-    val isMuted: Boolean = false,
-    val isArchived: Boolean = false
+    @SerialName("chat_id") val chatId: String,
+    @SerialName("sender_id") val senderId: String,
+    val content: String? = null,
+    val encrypted: Boolean = false,
+    @SerialName("created_at") val createdAt: String
 )
 
-/**
- * Conversation type
- */
-enum class ConversationType {
-    DIRECT,
-    GROUP,
-    SUPERGROUP
-}
-
-/**
- * Create group request
- */
 @Serializable
-data class CreateGroupRequest(
-    val name: String,
-    val description: String? = null,
-    val participantIds: List<String>
+data class SendMessageResponse(
+    val message: String? = null,
+    val data: SendMessageResponseData
 )
 
-/**
- * Group member update
- */
 @Serializable
-data class UpdateGroupRequest(
-    val participantIds: List<String>,
-    val adminIds: List<String> = emptyList()
-)
-
-/**
- * Mention in message
- */
-@Serializable
-data class Mention(
-    val userId: String,
-    val userName: String,
-    val start: Int,
-    val end: Int
-)
-
-/**
- * Message attachment
- */
-@Serializable
-data class Attachment(
+data class ChatListOtherUserDto(
     val id: String,
-    val url: String,
-    val thumbnailUrl: String? = null,
-    val type: AttachmentType,
-    val fileSize: Long? = null,
-    val mimeType: String? = null,
-    val fileName: String? = null
+    val email: String,
+    val username: String,
+    @SerialName("display_name") val displayName: String? = null,
+    @SerialName("avatar_url") val avatarUrl: String? = null,
+    @SerialName("public_key") val publicKey: String = "",
+    @SerialName("is_online") val isOnline: Boolean = false
 )
 
-/**
- * Attachment type enum
- */
-enum class AttachmentType {
-    IMAGE,
-    VIDEO,
-    AUDIO,
-    DOCUMENT,
-    VOICE_MESSAGE
-}
-
-/**
- * Typing indicator event
- */
-data class TypingIndicator(
-    val userId: String,
-    val userName: String,
-    val conversationId: String,
-    val isTyping: Boolean,
-    val timestamp: Long
-)
-
-/**
- * Online status update
- */
-data class PresenceUpdate(
-    val userId: String,
-    val status: UserStatus,
-    val lastSeen: Long? = null
-)
-
-/**
- * Notification payload from FCM
- */
 @Serializable
-data class PushNotification(
-    val type: NotificationType,
-    val title: String,
-    val body: String,
-    val data: NotificationData? = null,
-    val timestamp: Long? = null
+data class LastMessageDto(
+    val id: String,
+    @SerialName("sender_id") val senderId: String,
+    val content: String = "",
+    @SerialName("content_type") val contentType: String = "text",
+    val encrypted: Boolean = false,
+    @SerialName("created_at") val createdAt: String
 )
 
-/**
- * Notification type
- */
-enum class NotificationType {
-    MESSAGE,
-    GROUP_UPDATE,
-    TYPING,
-    PRESENCE,
-    SYSTEM
-}
-
-/**
- * Notification data payload
- */
 @Serializable
-data class NotificationData(
-    val conversationId: String? = null,
-    val senderId: String? = null,
-    val messageId: String? = null,
-    val type: String? = null
+data class ChatListItemDto(
+    val id: String,
+    val type: String,
+    val name: String = "",
+    @SerialName("avatar_url") val avatarUrl: String? = null,
+    @SerialName("other_user_id") val otherUserId: String? = null,
+    @SerialName("other_user") val otherUser: ChatListOtherUserDto? = null,
+    @SerialName("last_message") val lastMessage: LastMessageDto? = null,
+    @SerialName("last_message_at") val lastMessageAt: String? = null,
+    @SerialName("unread_count") val unreadCount: Long = 0,
+    @SerialName("is_online") val isOnline: Boolean = false,
+    @SerialName("updated_at") val updatedAt: String? = null
 )
 
-/**
- * Search result model
- */
 @Serializable
-data class SearchResults(
-    val users: List<User> = emptyList(),
-    val conversations: List<Conversation> = emptyList(),
-    val messages: List<Message> = emptyList()
+data class ChatsListResponse(
+    val data: List<ChatListItemDto> = emptyList()
 )
 
-/**
- * Profile update request
- */
 @Serializable
-data class ProfileUpdateRequest(
-    val name: String? = null,
-    val bio: String? = null,
-    val username: String? = null
+data class UserSearchResult(
+    val id: String,
+    val email: String,
+    val username: String,
+    @SerialName("display_name") val displayName: String? = null,
+    @SerialName("avatar_url") val avatarUrl: String? = null
+)
+
+@Serializable
+data class UserSearchResponse(
+    val users: List<UserSearchResult> = emptyList()
 )

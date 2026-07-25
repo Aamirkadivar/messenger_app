@@ -2,8 +2,9 @@ package com.messenger.app.ui.theme
 
 import android.app.Activity
 import android.os.Build
-import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
@@ -11,128 +12,166 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 
-// ==================== Color Palette (Telegram-inspired) ====================
+// ==================== Color Palette ====================
+// Matches the Windows desktop app's design language: purple accent on a dark navy surface.
 
-// Light Theme Colors
-val LightPrimary = Color(0xFF2AABEE)        // Telegram blue
-val LightPrimaryVariant = Color(0xFF229ED9)
-val LightSecondary = Color(0xFF7C69EF)       // Purple accent
+val AccentPurple = Color(0xFF6C63FF)
+val AccentPurpleLight = Color(0xFF8B84FF)
+val AccentPurpleDark = Color(0xFF5B52E5)
+val AccentGreen = Color(0xFF4CAF50)
+
+// Light theme
+val LightPrimary = AccentPurple
+val LightOnPrimary = Color(0xFFFFFFFF)
+val LightSecondary = AccentGreen
 val LightSurface = Color(0xFFFFFFFF)
-val LightSurfaceVariant = Color(0xFFF5F5F5)
-val LightBackground = Color(0xFFFFFFFF)
-val LightError = Color(0xFFB00020)
+val LightSurfaceVariant = Color(0xFFF5F5F7)
+val LightBackground = Color(0xFFF5F5F7)
+val LightOnBackground = Color(0xFF1A1A2E)
+val LightOnSurfaceVariant = Color(0xFF6B6B7B)
+val LightBorder = Color(0xFFE0E0E5)
+val LightError = Color(0xFFFF6B6B)
 
-// Message bubble colors (sent)
-val LightSentBubble = Color(0xFF2AABEE)      // Blue bubble
-val LightSentBubbleText = Color(0xFFFFFFFF)
+// Dark theme
+val DarkPrimary = AccentPurple
+val DarkOnPrimary = Color(0xFFFFFFFF)
+val DarkSecondary = AccentGreen
+val DarkSurface = Color(0xFF1B1B36)
+val DarkSurfaceVariant = Color(0xFF22224A)
+val DarkBackground = Color(0xFF15152B)
+val DarkOnBackground = Color(0xFFEDEDF2)
+val DarkOnSurfaceVariant = Color(0xFF9494AC)
+val DarkBorder = Color(0x14FFFFFF)
+val DarkError = Color(0xFFFF6B6B)
 
-// Message bubble colors (received)
-val LightReceivedBubble = Color(0xFFE8ECF0)
-val LightReceivedBubbleText = Color(0xFF1A1A1A)
+// Message bubbles
+val SentBubbleLight = AccentPurple
+val SentBubbleTextLight = Color(0xFFFFFFFF)
+val ReceivedBubbleLight = Color(0xFFEDEDF2)
+val ReceivedBubbleTextLight = Color(0xFF1A1A2E)
 
-// Chat background
-val LightChatBackground = Color(0xFFF0F2F5)
-val LightChatPattern = Color(0xFFE8E8E8)
+val SentBubbleDark = AccentPurple
+val SentBubbleTextDark = Color(0xFFFFFFFF)
+val ReceivedBubbleDark = Color(0xFF26264A)
+val ReceivedBubbleTextDark = Color(0xFFEDEDF2)
 
-// Dark Theme Colors
-val DarkPrimary = Color(0xFF2AABEE)
-val DarkPrimaryVariant = Color(0xFF3B8BF0)
-val DarkSecondary = Color(0xFF8B78FF)
-val DarkSurface = Color(0xFF1A1A2E)
-val DarkSurfaceVariant = Color(0xFF16213E)
-val DarkBackground = Color(0xFF0F0F1A)
-val DarkError = Color(0xFFCF6679)
-
-// Dark message bubble colors (sent)
-val DarkSentBubble = Color(0xFF1E3A5F)
-val DarkSentBubbleText = Color(0xFFE0E0E0)
-
-// Dark message bubble colors (received)
-val DarkReceivedBubble = Color(0xFF233156)
-val DarkReceivedBubbleText = Color(0xFFE0E0E0)
-
-// Dark chat background
-val DarkChatBackground = Color(0xFF0F0F1A)
+// Status colors
+val OnlineColor = AccentGreen
+val OfflineColor = Color(0xFF9E9E9E)
 
 // ==================== Color Schemes ====================
 
 private val LightColorScheme = lightColorScheme(
     primary = LightPrimary,
-    primaryContainer = LightPrimaryVariant,
+    onPrimary = LightOnPrimary,
     secondary = LightSecondary,
     surface = LightSurface,
     surfaceVariant = LightSurfaceVariant,
     background = LightBackground,
+    onBackground = LightOnBackground,
+    onSurfaceVariant = LightOnSurfaceVariant,
+    outline = LightBorder,
     error = LightError
 )
 
 private val DarkColorScheme = darkColorScheme(
     primary = DarkPrimary,
-    primaryContainer = DarkPrimaryVariant,
+    onPrimary = DarkOnPrimary,
     secondary = DarkSecondary,
     surface = DarkSurface,
     surfaceVariant = DarkSurfaceVariant,
     background = DarkBackground,
+    onBackground = DarkOnBackground,
+    onSurfaceVariant = DarkOnSurfaceVariant,
+    outline = DarkBorder,
     error = DarkError
 )
 
 // ==================== Typography ====================
 
-val Typography = androidx.compose.material3.Typography(
-    bodyLarge = androidx.compose.ui.text.font.FontFamily.SansSerif(
-        androidx.compose.ui.text.font.FontWeight.Normal
+private val AppFontFamily = FontFamily.SansSerif
+
+val Typography = Typography(
+    headlineSmall = TextStyle(
+        fontFamily = AppFontFamily,
+        fontWeight = FontWeight.Bold,
+        fontSize = 24.sp
     ),
-    bodyMedium = androidx.compose.ui.text.font.FontFamily.SansSerif(
-        androidx.compose.ui.text.font.FontWeight.Normal
+    titleLarge = TextStyle(
+        fontFamily = AppFontFamily,
+        fontWeight = FontWeight.Bold,
+        fontSize = 18.sp
     ),
-    titleLarge = androidx.compose.ui.text.font.FontFamily.SansSerif(
-        androidx.compose.ui.text.font.FontWeight.Medium
+    titleMedium = TextStyle(
+        fontFamily = AppFontFamily,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 15.sp
     ),
-    labelMedium = androidx.compose.ui.text.font.FontFamily.SansSerif(
-        androidx.compose.ui.text.font.FontWeight.Normal
+    bodyLarge = TextStyle(
+        fontFamily = AppFontFamily,
+        fontWeight = FontWeight.Normal,
+        fontSize = 15.sp
+    ),
+    bodyMedium = TextStyle(
+        fontFamily = AppFontFamily,
+        fontWeight = FontWeight.Normal,
+        fontSize = 14.sp
+    ),
+    labelMedium = TextStyle(
+        fontFamily = AppFontFamily,
+        fontWeight = FontWeight.Medium,
+        fontSize = 13.sp
+    ),
+    labelSmall = TextStyle(
+        fontFamily = AppFontFamily,
+        fontWeight = FontWeight.Normal,
+        fontSize = 11.sp
     )
 )
 
-// ==================== Chat Bubble Shapes ====================
+// ==================== Shapes ====================
 
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.ui.unit.dp
-
-val ChatBubbleShape = RoundedCornerShape(
-    topStart = 16.dp,
-    topEnd = 16.dp,
-    bottomStart = 4.dp,
-    bottomEnd = 4.dp
-)
-
-val ReceivedBubbleShape = RoundedCornerShape(
+val ChatBubbleShapeSent = RoundedCornerShape(
     topStart = 16.dp,
     topEnd = 16.dp,
     bottomStart = 16.dp,
     bottomEnd = 4.dp
 )
 
+val ChatBubbleShapeReceived = RoundedCornerShape(
+    topStart = 16.dp,
+    topEnd = 16.dp,
+    bottomStart = 4.dp,
+    bottomEnd = 16.dp
+)
+
+val CardShape = RoundedCornerShape(16.dp)
+val FieldShape = RoundedCornerShape(12.dp)
+val ButtonShape = RoundedCornerShape(13.dp)
+
 // ==================== App Theme ====================
 
 @Composable
 fun MessengerTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = true,
+    darkTheme: Boolean = true,
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
     val colorScheme = when {
         dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
             val context = LocalContext.current
-            if (darkTheme) {
-                dynamicDarkColorScheme(context)
-            } else {
-                dynamicLightColorScheme(context)
-            }
+            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         }
         darkTheme -> DarkColorScheme
         else -> LightColorScheme
@@ -142,7 +181,7 @@ fun MessengerTheme(
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as Activity).window
-            window.statusBarColor = colorScheme.primary.toArgb()
+            window.statusBarColor = colorScheme.background.toArgb()
             WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
         }
     }
@@ -154,26 +193,18 @@ fun MessengerTheme(
     )
 }
 
-// ==================== Extended Theme Utilities ====================
+/**
+ * Extended colors not covered by the Material3 ColorScheme (message bubbles, presence dots).
+ * Reads the current dark/light state so callers don't need to branch themselves.
+ */
+object MessengerExtendedColors {
+    private val isDark: Boolean
+        @Composable get() = MaterialTheme.colorScheme.background.luminance() < 0.5f
 
-object MessengerThemeColors {
-    val Primary get() = LightPrimary
-    val PrimaryVariant get() = LightPrimaryVariant
-    val Secondary get() = LightSecondary
-    val Surface get() = LightSurface
-    val Background get() = LightBackground
-    val ChatBackground get() = LightChatBackground
-
-    val SentBubble get() = LightSentBubble
-    val SentBubbleText get() = LightSentBubbleText
-    val ReceivedBubble get() = LightReceivedBubble
-    val ReceivedBubbleText get() = LightReceivedBubbleText
-
-    fun darkPrimary() = DarkPrimary
-    fun darkSurface() = DarkSurface
-    fun darkBackground() = DarkBackground
-    fun darkSentBubble() = DarkSentBubble
-    fun darkSentBubbleText() = DarkSentBubbleText
-    fun darkReceivedBubble() = DarkReceivedBubble
-    fun darkReceivedBubbleText() = DarkReceivedBubbleText
+    val sentBubble @Composable get() = if (isDark) SentBubbleDark else SentBubbleLight
+    val sentBubbleText @Composable get() = if (isDark) SentBubbleTextDark else SentBubbleTextLight
+    val receivedBubble @Composable get() = if (isDark) ReceivedBubbleDark else ReceivedBubbleLight
+    val receivedBubbleText @Composable get() = if (isDark) ReceivedBubbleTextDark else ReceivedBubbleTextLight
+    val online = OnlineColor
+    val offline = OfflineColor
 }

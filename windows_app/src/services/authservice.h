@@ -33,13 +33,23 @@ public:
     Q_INVOKABLE void fetchOwnPublicKey();
     Q_INVOKABLE QString getContactPublicKey(const QString& contactId);
 
+    // Restores a previously saved login (call once, after connecting to this
+    // service's signals, so the initial loginSuccess/tokenReady aren't missed).
+    void restoreSession();
+
+    // ---- E2EE key management (private key never leaves this device) ----
+    // The signed-in user's own X25519 private/public key (hex), generated
+    // locally on first login. Empty if not logged in / not yet generated.
+    QString e2eePrivateKey() const;
+    QString e2eePublicKey() const;
+
 signals:
     void isLoggedInChanged();
     void currentUserIdChanged();
     void currentUsernameChanged();
     void loginSuccess(const QString& userId, const QString& username);
     void loginFailed(const QString& error);
-    void registerSuccess();
+    void registerSuccess(const QString& userId);
     void registerFailed(const QString& error);
     void logoutSuccess();
     void tokenReady(const QString& token);
@@ -54,6 +64,9 @@ private slots:
 private:
     void setupNetworkManager();
     QNetworkReply* postRequest(const QString& url, const QJsonObject& data);
+    // Ensure a local E2EE keypair exists for the current user (generating one
+    // the first time) and publish the public key to the server.
+    void ensureE2EEKeysAndPublish();
     bool m_loggedIn = false;
     QString m_currentUserId;
     QString m_currentUsername;

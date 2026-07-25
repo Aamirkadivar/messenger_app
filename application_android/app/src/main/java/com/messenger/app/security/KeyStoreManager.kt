@@ -7,7 +7,11 @@ import android.content.Context
  * Used to securely store encryption keys and tokens.
  */
 interface KeyStoreManager {
-    suspend fun generateEncryptionKey(): Result<Unit>
+    companion object {
+        const val DEVICE_ENCRYPTION_KEY_ALIAS = "messenger_encryption_key"
+    }
+
+    suspend fun generateEncryptionKey(alias: String): Result<Unit>
     suspend fun generateAuthKey(): Result<Unit>
     suspend fun encryptData(plaintext: String, alias: String): Result<String>
     suspend fun decryptData(encryptedData: String, alias: String): Result<String>

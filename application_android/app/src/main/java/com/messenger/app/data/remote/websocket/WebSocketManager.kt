@@ -2,7 +2,6 @@ package com.messenger.app.data.remote.websocket
 
 import android.util.Log
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.BufferCapacity
 import kotlinx.coroutines.flow.*
 import org.java_websocket.client.WebSocketClient
 import org.java_websocket.drafts.Draft
@@ -11,153 +10,43 @@ import org.java_websocket.extensions.DefaultExtension
 import org.java_websocket.handshake.ServerHandshake
 import org.json.JSONObject
 import java.net.URI
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
-import kotlin.math.floor
 
 /**
- * WebSocket message types for real-time communication
+ * Real-time client for the backend's WebSocket hub (back-end/websocket/handler.go).
+ * Authentication happens via the ?token= query param at connect time - the server
+ * validates it before allowing the upgrade, so there is no separate auth handshake.
+ * To receive messages for a chat, the client must join its room ("join") first;
+ * the backend then pushes any message broadcast for that chat_id to the room's members.
  */
-sealed class WebSocketMessage {
-    data class TextMessage(
-        val id: String,
-        val conversationId: String,
-        val senderId: String,
-        val content: String,
-        val encryptedContent: String,
-        val timestamp: Long,
-        val type: MessageType = MessageType.TEXT,
-        val fileId: String? = null
-    ) : WebSocketMessage() {
-        enum class MessageType {
-            TEXT, IMAGE, VIDEO, AUDIO, FILE, SYSTEM
-        }
-    }
+data class IncomingChatMessage(
+    val chatId: String,
+    val messageId: String,
+    val senderId: String,
+    val content: String,
+    val encrypted: Boolean,
+    val timestamp: String
+)
 
-    data class TypingIndicator(
-        val conversationId: String,
-        val userId: String,
-        val userName: String,
-        val isTyping: Boolean
-    ) : WebSocketMessage()
+data class IncomingTyping(
+    val chatId: String,
+    val userId: String,
+    val isTyping: Boolean
+)
 
-    data class PresenceUpdate(
-        val userId: String,
-        val userName: String,
-        val status: PresenceStatus,
-        val lastSeen: Long? = null
-    ) : WebSocketMessage() {
-        enum class PresenceStatus {
-            ONLINE, OFFLINE, AWAY, BUSY
-        }
-    }
-
-    data class ReadReceipt(
-        val conversationId: String,
-        val messageId: String,
-        val userId: String,
-        val timestamp: Long
-    ) : WebSocketMessage()
-
-    data class ReactionUpdate(
-        val conversationId: String,
-        val messageId: String,
-        val userId: String,
-        val emoji: String,
-        val action: ReactionAction
-    ) : WebSocketMessage() {
-        enum class ReactionAction {
-            ADD, REMOVE
-        }
-    }
-
-    data class ConversationUpdate(
-        val conversationId: String,
-        val type: UpdateType,
-        val data: Map<String, Any>? = null
-    ) : WebSocketMessage() {
-        enum class UpdateType {
-            CREATED, UPDATED, DELETED, MEMBER_ADDED, MEMBER_REMOVED
-        }
-    }
-
-    data class Heartbeat(
-        val timestamp: Long = System.currentTimeMillis()
-    ) : WebSocketMessage()
-
-    data class Error(
-        val code: Int,
-        val message: String,
-        val details: String? = null
-    ) : WebSocketMessage()
-}
-
-/**
- * WebSocket message envelope for authenticated communication
- */
-data class MessageEnvelope(
-    val type: String,
-    val payload: Any,
-    val signature: String? = null,
-    val timestamp: Long = System.currentTimeMillis()
-) {
-    fun toJson(): String {
-        return buildString {
-            append("{\"type\":\"$type\",\"payload\":")
-            when (payload) {
-                is Map<*, *> -> {
-                    append("{")
-                    payload.entries.joinTo(this, ",") { entry ->
-                        "\"${entry.key}\":\"${entry.value}\""
-                    }
-                    append("}")
-                }
-                is String -> append("\"$payload\"")
-                else -> append("\"$payload\"")
-            }
-            append(",\"timestamp\":$timestamp")
-            if (!signature.isNullOrEmpty()) append(",\"signature\":\"$signature\"")
-            append("}")
-        }
-    }
-
-    companion object {
-        fun fromJson(json: String): MessageEnvelope {
-            val `obj` = JSONObject(json)
-            val type = `obj`.getString("type")
-            val timestamp = `obj`.getLong("timestamp")
-            val signature = if (`obj`.has("signature")) `obj`.getString("signature") else null
-            
-            val payload = `obj`.get("payload")
-            
-            return MessageEnvelope(type, payload, signature, timestamp)
-        }
-    }
-}
-
-/**
- * WebSocket connection manager for real-time messaging.
- * Handles connection lifecycle, reconnection, message serialization, and authentication.
- */
 class WebSocketManager private constructor(
     private val serverUrl: String,
     private val tokenProvider: () -> String?
-) : androidx.lifecycle.AndroidViewModel(com.messenger.app.MessengerApplication.getInstance()) {
-
+) {
     companion object {
         private const val TAG = "WebSocketManager"
-        private const val HEARTBEAT_INTERVAL = 30000L // 30 seconds
-        private const val RECONNECT_DELAY = 3000L // 3 seconds
-        private const val MAX_RECONNECT_DELAY = 30000L // 30 seconds
+        private const val RECONNECT_DELAY = 3000L
+        private const val MAX_RECONNECT_DELAY = 30000L
         private const val MAX_RECONNECT_ATTEMPTS = 10
 
         @Volatile
         private var instance: WebSocketManager? = null
 
-        fun getInstance(
-            serverUrl: String,
-            tokenProvider: () -> String?
-        ): WebSocketManager {
+        fun getInstance(serverUrl: String, tokenProvider: () -> String?): WebSocketManager {
             return instance ?: synchronized(this) {
                 instance ?: WebSocketManager(serverUrl, tokenProvider).also { instance = it }
             }
@@ -169,35 +58,24 @@ class WebSocketManager private constructor(
         }
     }
 
+    enum class ConnectionState { CONNECTED, CONNECTING, DISCONNECTED, RECONNECTING }
+
     private var webSocketClient: WebSocketClient? = null
     private var isConnected: Boolean = false
     private var isConnecting: Boolean = false
     private var reconnectAttempts: Int = 0
-    private var reconnectDelay: Long = RECONNECT_DELAY
-
-    private val _messages = MutableSharedFlow<WebSocketMessage>(replay = 0, extraBufferCapacity = 64)
-    val messages: SharedFlow<WebSocketMessage> = _messages.asSharedFlow()
+    private var shuttingDown: Boolean = false
+    private val joinedChats = mutableSetOf<String>()
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
-    private val _presenceMap = MutableStateFlow<Map<String, WebSocketMessage.PresenceUpdate>>(emptyMap())
-    val presenceMap: StateFlow<Map<String, WebSocketMessage.PresenceUpdate>> = _presenceMap.asStateFlow()
+    private val _incomingMessages = MutableSharedFlow<IncomingChatMessage>(replay = 0, extraBufferCapacity = 64)
+    val incomingMessages: SharedFlow<IncomingChatMessage> = _incomingMessages.asSharedFlow()
 
-    private var reconnectJob: Job? = null
-    private var heartbeatJob: Job? = null
+    private val _typingUpdates = MutableSharedFlow<IncomingTyping>(replay = 0, extraBufferCapacity = 16)
+    val typingUpdates: SharedFlow<IncomingTyping> = _typingUpdates.asSharedFlow()
 
-    enum class ConnectionState {
-        CONNECTED, CONNECTING, DISCONNECTED, DISCONNECTING, RECONNECTING
-    }
-
-    init {
-        Log.d(TAG, "WebSocketManager initialized with URL: $serverUrl")
-    }
-
-    /**
-     * Connect to the WebSocket server with authentication
-     */
     fun connect() {
         if (isConnected || isConnecting) {
             Log.w(TAG, "Already connected or connecting")
@@ -211,23 +89,21 @@ class WebSocketManager private constructor(
             return
         }
 
+        shuttingDown = false
         isConnecting = true
         _connectionState.value = ConnectionState.CONNECTING
 
-        val wsUrl = serverUrl.replace("http://", "ws://").replace("https://", "wss://")
-        val uri = URI("$wsUrl/ws?token=$token")
+        val uri = buildWsUri(token)
+        val draft: Draft = Draft_6455(listOf(DefaultExtension()))
 
-        val drafts: List<Draft> = listOf(Draft_6455(listOf(DefaultExtension())))
-
-        webSocketClient = object : WebSocketClient(uri, drafts) {
+        webSocketClient = object : WebSocketClient(uri, draft) {
             override fun onOpen(handshake: ServerHandshake?) {
                 Log.d(TAG, "WebSocket connected")
                 isConnected = true
                 isConnecting = false
                 reconnectAttempts = 0
-                reconnectDelay = RECONNECT_DELAY
                 _connectionState.value = ConnectionState.CONNECTED
-                startHeartbeat()
+                rejoinChats()
             }
 
             override fun onMessage(text: String?) {
@@ -235,30 +111,22 @@ class WebSocketManager private constructor(
             }
 
             override fun onMessage(bytes: java.nio.ByteBuffer?) {
-                bytes?.let {
-                    val text = String(it.array())
-                    handleMessage(text)
-                }
+                bytes?.let { handleMessage(String(it.array())) }
             }
 
             override fun onClose(code: Int, reason: String?, remote: Boolean) {
                 Log.w(TAG, "WebSocket closed: code=$code, reason=$reason")
                 isConnected = false
-                stopHeartbeat()
                 _connectionState.value = ConnectionState.DISCONNECTED
-
-                if (remote) {
-                    scheduleReconnect()
-                }
+                if (remote && !shuttingDown) scheduleReconnect()
             }
 
             override fun onError(ex: Exception?) {
                 Log.e(TAG, "WebSocket error: ${ex?.message}")
                 isConnected = false
                 isConnecting = false
-                stopHeartbeat()
                 _connectionState.value = ConnectionState.DISCONNECTED
-                scheduleReconnect()
+                if (!shuttingDown) scheduleReconnect()
             }
         }
 
@@ -272,264 +140,112 @@ class WebSocketManager private constructor(
         }
     }
 
-    /**
-     * Disconnect from the WebSocket server
-     */
     fun disconnect() {
-        isConnecting = false
-        _connectionState.value = ConnectionState.DISCONNECTING
-        stopHeartbeat()
-        reconnectJob?.cancel()
-
+        shuttingDown = true
         webSocketClient?.close()
         webSocketClient = null
         isConnected = false
+        joinedChats.clear()
         _connectionState.value = ConnectionState.DISCONNECTED
         Log.d(TAG, "WebSocket disconnected")
     }
 
-    /**
-     * Send a message through the WebSocket connection
-     */
-    fun sendMessage(message: Any): Boolean {
-        if (!isConnected) {
-            Log.w(TAG, "Cannot send message: not connected")
-            return false
-        }
-
-        val json = when (message) {
-            is MessageEnvelope -> message.toJson()
-            is WebSocketMessage.TextMessage -> buildTextMessageEnvelope(message).toJson()
-            is WebSocketMessage.TypingIndicator -> buildTypingEnvelope(message).toJson()
-            else -> return false
-        }
-
-        try {
-            webSocketClient?.send(json)
-            return true
-        } catch (e: Exception) {
-            Log.e(TAG, "Error sending message: ${e.message}")
-            return false
-        }
+    fun joinChat(chatId: String) {
+        joinedChats.add(chatId)
+        sendEnvelope("join", mapOf("chat_id" to chatId))
     }
 
-    /**
-     * Send typing indicator
-     */
-    fun sendTypingIndicator(conversationId: String, isTyping: Boolean): Boolean {
-        val typingMessage = WebSocketMessage.TypingIndicator(
-            conversationId = conversationId,
-            userId = "", // Will be filled from token
-            userName = "",
-            isTyping = isTyping
-        )
-        return sendMessage(typingMessage)
+    fun leaveChat(chatId: String) {
+        joinedChats.remove(chatId)
+        sendEnvelope("leave", mapOf("chat_id" to chatId))
     }
 
-    /**
-     * Ping the server to keep connection alive
-     */
-    fun ping(): Boolean {
-        if (!isConnected) return false
-        return try {
-            webSocketClient?.ping()
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Ping failed: ${e.message}")
-            false
-        }
+    fun sendTypingIndicator(chatId: String, userId: String, isTyping: Boolean) {
+        sendEnvelope("typing", mapOf("chat_id" to chatId, "user_id" to userId, "typing" to isTyping))
     }
 
-    /**
-     * Check if the connection is healthy
-     */
     fun isHealthy(): Boolean = isConnected
 
     /**
-     * Handle incoming messages
+     * Build the WS URL from the origin only - API_BASE_URL includes the /api/v1
+     * REST path, but the backend's WebSocket route is just /ws (see main.go).
      */
+    private fun buildWsUri(token: String): URI {
+        val httpUri = URI(serverUrl)
+        val scheme = if (httpUri.scheme == "https") "wss" else "ws"
+        val port = if (httpUri.port != -1) ":${httpUri.port}" else ""
+        return URI("$scheme://${httpUri.host}$port/ws?token=$token")
+    }
+
+    private fun rejoinChats() {
+        joinedChats.forEach { chatId -> sendEnvelope("join", mapOf("chat_id" to chatId)) }
+    }
+
+    private fun sendEnvelope(type: String, data: Map<String, Any>) {
+        if (!isConnected) {
+            Log.w(TAG, "Cannot send '$type': not connected")
+            return
+        }
+        val obj = JSONObject()
+        obj.put("type", type)
+        obj.put("data", JSONObject(data))
+        try {
+            webSocketClient?.send(obj.toString())
+        } catch (e: Exception) {
+            Log.e(TAG, "Error sending '$type': ${e.message}")
+        }
+    }
+
     private fun handleMessage(json: String) {
         try {
-            val `obj` = JSONObject(json)
-            val type = `obj`.getString("type")
-
-            val message = when (type) {
+            val obj = JSONObject(json)
+            when (obj.optString("type")) {
                 "message" -> {
-                    val payload = `obj`.getJSONObject("payload")
-                    WebSocketMessage.TextMessage(
-                        id = payload.getString("id"),
-                        conversationId = payload.getString("conversationId"),
-                        senderId = payload.getString("senderId"),
-                        content = payload.optString("content", ""),
-                        encryptedContent = payload.optString("encryptedContent", ""),
-                        timestamp = payload.optLong("timestamp", System.currentTimeMillis()),
-                        type = WebSocketMessage.TextMessage.MessageType.valueOf(
-                            payload.optString("type", "TEXT")
-                        ),
-                        fileId = payload.optString("fileId", null)
+                    val data = obj.optJSONObject("data") ?: return
+                    val message = IncomingChatMessage(
+                        chatId = data.optString("chat_id"),
+                        messageId = data.optString("message_id"),
+                        senderId = data.optString("sender_id"),
+                        content = data.optString("content"),
+                        encrypted = data.optBoolean("encrypted", false),
+                        timestamp = data.optString("timestamp")
                     )
+                    CoroutineScope(Dispatchers.Main).launch { _incomingMessages.emit(message) }
                 }
                 "typing" -> {
-                    val payload = `obj`.getJSONObject("payload")
-                    WebSocketMessage.TypingIndicator(
-                        conversationId = payload.getString("conversationId"),
-                        userId = payload.getString("userId"),
-                        userName = payload.optString("userName", ""),
-                        isTyping = payload.optBoolean("isTyping", true)
+                    val data = obj.optJSONObject("data") ?: return
+                    val typing = IncomingTyping(
+                        chatId = data.optString("chat_id"),
+                        userId = data.optString("user_id"),
+                        isTyping = data.optBoolean("typing", false)
                     )
+                    CoroutineScope(Dispatchers.Main).launch { _typingUpdates.emit(typing) }
                 }
-                "presence" -> {
-                    val payload = `obj`.getJSONObject("payload")
-                    val update = WebSocketMessage.PresenceUpdate(
-                        userId = payload.getString("userId"),
-                        userName = payload.optString("userName", ""),
-                        status = WebSocketMessage.PresenceUpdate.PresenceStatus.valueOf(
-                            payload.optString("status", "OFFLINE")
-                        ),
-                        lastSeen = payload.optLong("lastSeen", -1).takeIf { it >= 0 }
-                    )
-                    // Update presence map
-                    val currentPresence = _presenceMap.value.toMutableMap()
-                    currentPresence[update.userId] = update
-                    _presenceMap.value = currentPresence
-                    return // Don't emit to messages flow
-                }
-                "read_receipt" -> {
-                    val payload = `obj`.getJSONObject("payload")
-                    WebSocketMessage.ReadReceipt(
-                        conversationId = payload.getString("conversationId"),
-                        messageId = payload.getString("messageId"),
-                        userId = payload.getString("userId"),
-                        timestamp = payload.optLong("timestamp", System.currentTimeMillis())
-                    )
-                }
-                "reaction" -> {
-                    val payload = `obj`.getJSONObject("payload")
-                    WebSocketMessage.ReactionUpdate(
-                        conversationId = payload.getString("conversationId"),
-                        messageId = payload.getString("messageId"),
-                        userId = payload.getString("userId"),
-                        emoji = payload.getString("emoji"),
-                        action = WebSocketMessage.ReactionUpdate.ReactionAction.valueOf(
-                            payload.optString("action", "ADD")
-                        )
-                    )
-                }
-                "conversation" -> {
-                    val payload = `obj`.getJSONObject("payload")
-                    WebSocketMessage.ConversationUpdate(
-                        conversationId = payload.getString("conversationId"),
-                        type = WebSocketMessage.ConversationUpdate.UpdateType.valueOf(
-                            payload.optString("type", "UPDATED")
-                        ),
-                        data = null
-                    )
-                }
-                "heartbeat" -> WebSocketMessage.Heartbeat(
-                    timestamp = `obj`.optLong("timestamp", System.currentTimeMillis())
-                )
                 "error" -> {
-                    val code = `obj`.getInt("code")
-                    val errorMsg = `obj`.getString("message")
-                    WebSocketMessage.Error(
-                        code = code,
-                        message = errorMsg,
-                        details = `obj`.optString("details")
-                    )
+                    val data = obj.optJSONObject("data")
+                    Log.e(TAG, "Server error: ${data?.optString("error")}")
                 }
-                else -> return // Unknown message type
-            }
-
-            CoroutineScope(Dispatchers.Main).launch {
-                _messages.emit(message)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error handling message: ${e.message}")
         }
     }
 
-    /**
-     * Build envelope for text message
-     */
-    private fun buildTextMessageEnvelope(message: WebSocketMessage.TextMessage): MessageEnvelope {
-        val payload = mapOf(
-            "id" to message.id,
-            "conversationId" to message.conversationId,
-            "senderId" to message.senderId,
-            "content" to message.content,
-            "encryptedContent" to message.encryptedContent,
-            "type" to message.type.name,
-            "timestamp" to message.timestamp
-        )
-        return MessageEnvelope("message", payload, null, message.timestamp)
-    }
-
-    /**
-     * Build envelope for typing indicator
-     */
-    private fun buildTypingEnvelope(message: WebSocketMessage.TypingIndicator): MessageEnvelope {
-        val payload = mapOf(
-            "conversationId" to message.conversationId,
-            "isTyping" to message.isTyping.toString()
-        )
-        return MessageEnvelope("typing", payload, null, message.timestamp)
-    }
-
-    /**
-     * Start heartbeat to keep connection alive
-     */
-    private fun startHeartbeat() {
-        heartbeatJob = CoroutineScope(Dispatchers.IO).launch {
-            while (isConnected) {
-                delay(HEARTBEAT_INTERVAL)
-                if (isConnected) {
-                    ping()
-                    // Send heartbeat message
-                    val heartbeat = WebSocketMessage.Heartbeat()
-                    val envelope = MessageEnvelope("heartbeat", mapOf("timestamp" to heartbeat.timestamp))
-                    sendMessage(envelope)
-                }
-            }
-        }
-    }
-
-    /**
-     * Stop heartbeat
-     */
-    private fun stopHeartbeat() {
-        heartbeatJob?.cancel()
-        heartbeatJob = null
-    }
-
-    /**
-     * Schedule reconnection with exponential backoff
-     */
     private fun scheduleReconnect() {
-        reconnectJob?.cancel()
         reconnectAttempts++
-        _connectionState.value = ConnectionState.RECONNECTING
-
         if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
             Log.w(TAG, "Max reconnect attempts reached")
             _connectionState.value = ConnectionState.DISCONNECTED
             return
         }
 
-        // Exponential backoff with jitter
-        reconnectDelay = minOf(
-            MAX_RECONNECT_DELAY,
-            RECONNECT_DELAY * (1L shl (reconnectAttempts - 1))
-        )
-        val jitter = (Math.random() * 0.25 * reconnectDelay).toLong()
-        val delayWithJitter = reconnectDelay + jitter
-
-        Log.d(TAG, "Reconnecting in ${delayWithJitter}ms (attempt $reconnectAttempts)")
+        _connectionState.value = ConnectionState.RECONNECTING
+        val delay = minOf(MAX_RECONNECT_DELAY, RECONNECT_DELAY * (1L shl (reconnectAttempts - 1)))
+        val jitter = (Math.random() * 0.25 * delay).toLong()
 
         CoroutineScope(Dispatchers.IO).launch {
-            delay(delayWithJitter)
-            if (isConnected.not()) {
-                connect()
-            }
+            delay(delay + jitter)
+            if (!isConnected) connect()
         }
     }
 }

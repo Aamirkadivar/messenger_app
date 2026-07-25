@@ -33,10 +33,7 @@ abstract class AuthDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: AuthDatabase? = null
 
-        fun getDatabase(
-            context: Context,
-            tokenManager: com.messenger.app.security.TokenManager
-        ): AuthDatabase {
+        fun getDatabase(context: Context): AuthDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
                     context.applicationContext,

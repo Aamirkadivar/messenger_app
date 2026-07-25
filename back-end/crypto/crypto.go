@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -16,7 +17,7 @@ type KeyPair struct {
 
 // GenerateKeyPair generates a new public/private key pair using NaCl box (Curve25519)
 func GenerateKeyPair() (*KeyPair, error) {
-	publicKey, privateKey, err := box.GenerateKey(nil)
+	publicKey, privateKey, err := box.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate key pair: %w", err)
 	}
@@ -41,14 +42,12 @@ func EncryptMessage(message string, recipientPublicKey string, senderPrivateKey 
 		return "", fmt.Errorf("failed to decode sender private key: %w", err)
 	}
 
-	// Encrypt the message
+	// Encrypt the message with a fresh random nonce (required: NaCl box
+	// is broken if a nonce is ever reused across messages for the same key pair)
 	var nonce [24]byte
-	nonceSlice := make([]byte, 24)
-	// In production, use a cryptographically secure random nonce
-	for i := range nonceSlice {
-		nonceSlice[i] = byte(i)
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("failed to generate nonce: %w", err)
 	}
-	copy(nonce[:], nonceSlice)
 
 	encrypted := box.Seal(nonce[:], []byte(message), &nonce, &recipientPub, &senderPriv)
 

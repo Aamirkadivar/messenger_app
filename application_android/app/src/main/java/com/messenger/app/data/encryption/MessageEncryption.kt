@@ -52,7 +52,9 @@ class MessageEncryption {
             // Step 2: Derive encryption key from shared secret using PBKDF2
             val salt = generateSalt()
             val encryptionKey = deriveKeyFromPassword(sharedSecret.getOrNull()!!, salt)
-            if (encryptionKey.isFailure) return encryptionKey
+            if (encryptionKey.isFailure) {
+                return Result.failure(encryptionKey.exceptionOrNull() ?: SecurityException("Key derivation failed"))
+            }
 
             // Step 3: Generate IV
             val iv = generateIV()
@@ -100,12 +102,16 @@ class MessageEncryption {
 
             // Step 1: Derive shared secret (using sender's public key instead of private)
             val sharedSecret = deriveSharedSecret(recipientPrivateKey, senderPublicKey)
-            if (sharedSecret.isFailure) return sharedSecret
+            if (sharedSecret.isFailure) {
+                return Result.failure(sharedSecret.exceptionOrNull() ?: SecurityException("Key derivation failed"))
+            }
 
             // Step 2: Derive encryption key
             val salt = Base64.getDecoder().decode(payload.salt)
             val encryptionKey = deriveKeyFromPassword(sharedSecret.getOrNull()!!, salt)
-            if (encryptionKey.isFailure) return encryptionKey
+            if (encryptionKey.isFailure) {
+                return Result.failure(encryptionKey.exceptionOrNull() ?: SecurityException("Key derivation failed"))
+            }
 
             // Step 3: Verify MAC first
             val ciphertext = Base64.getDecoder().decode(payload.data)
@@ -155,27 +161,20 @@ class MessageEncryption {
      */
     private fun deriveKeyFromPassword(password: String, salt: ByteArray): Result<ByteArray> {
         return try {
-            val pbkdf2 = javax.crypto.Mac.getInstance(HMAC_ALGORITHM)
-            val initVector = javax.crypto.spec.IvParameterSpec(salt)
-            
-            // Use proper PBKDF2 implementation
-            val keyGenerator = javax.crypto.KeyGenerator.getInstance(ALGORITHM)
-            keyGenerator.init(KEY_SIZE, SecureRandom(salt))
-            
-            // Simulate PBKDF2 with iterative HMAC
+            // Simulate PBKDF2 with iterative HMAC, seeded with salt
             var result = ByteArray(32)
-            var previous = ByteArray(0)
-            
+            var previous = salt
+
             for (i in 0 until ITERATION_COUNT) {
                 val mac = javax.crypto.Mac.getInstance(HMAC_ALGORITHM)
                 mac.init(javax.crypto.spec.SecretKeySpec(password.toByteArray(Charsets.UTF_8), HMAC_ALGORITHM))
-                previous = mac.doFinal((previous + i.toByte()).toByteArray())
-                
+                previous = mac.doFinal(previous + i.toByte())
+
                 for (j in previous.indices) {
-                    result[j] = result[j].xor(previous[j])
+                    result[j] = (result[j].toInt() xor previous[j].toInt()).toByte()
                 }
             }
-            
+
             Result.success(result)
         } catch (e: Exception) {
             Log.e(TAG, "Error deriving key", e)

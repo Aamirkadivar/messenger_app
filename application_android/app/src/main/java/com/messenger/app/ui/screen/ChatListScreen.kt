@@ -1,532 +1,251 @@
 package com.messenger.app.ui.screen
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.messenger.app.ui.theme.*
-import kotlinx.coroutines.delay
+import com.messenger.app.ui.theme.AccentPurple
+import com.messenger.app.ui.theme.OnlineColor
+import com.messenger.app.ui.viewmodel.ChatListItemUi
+import com.messenger.app.ui.viewmodel.ChatViewModel
 
-/**
- * Chat list screen showing all conversations
- */
-@Composable
-fun ChatListScreen(
-    onNavigateToChat: (String) -> Unit,
-    onNavigateToProfile: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val viewModel: ChatViewModel = hiltViewModel()
-    val uiState by viewModel.chatListState.collectAsStateWithLifecycle()
+private val avatarPalette = listOf(
+    Color(0xFF6C63FF), Color(0xFF4CAF50), Color(0xFFFF9800),
+    Color(0xFFE91E63), Color(0xFF9C27B0), Color(0xFF00BCD4)
+)
 
-    LaunchedEffect(Unit) {
-        viewModel.loadConversations()
-    }
-
-    ChatListContent(
-        conversations = uiState.conversations,
-        currentUser = uiState.currentUser,
-        isLoading = uiState.isLoading,
-        error = uiState.error,
-        onlineUsers = uiState.onlineUsers,
-        onConversationClick = { conversationId ->
-            onNavigateToChat(conversationId)
-        },
-        onRefresh = { viewModel.loadConversations() },
-        onProfileClick = onNavigateToProfile,
-        modifier = modifier
-    )
+private fun avatarColorFor(name: String): Color {
+    if (name.isEmpty()) return avatarPalette[0]
+    return avatarPalette[(name.hashCode().and(Int.MAX_VALUE)) % avatarPalette.size]
 }
 
-/**
- * Chat list UI content
- */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ChatListContent(
-    conversations: List<com.messenger.app.data.model.Conversation>,
-    currentUser: com.messenger.app.data.model.User?,
-    isLoading: Boolean,
-    error: String?,
-    onlineUsers: Set<String>,
-    onConversationClick: (String) -> Unit,
-    onRefresh: () -> Unit,
-    onProfileClick: () -> Unit,
-    modifier: Modifier = Modifier
+fun ChatListScreen(
+    chatViewModel: ChatViewModel,
+    onChatClick: (chatId: String, chatName: String) -> Unit,
+    onLogout: () -> Unit
 ) {
-    var showSearch by remember { mutableStateOf(false) }
-    var searchQuery by remember { mutableStateOf("") }
+    var showNewChat by remember { mutableStateOf(false) }
+    val listState by chatViewModel.chatListState.collectAsStateWithLifecycle()
+
+    LaunchedEffect(Unit) {
+        chatViewModel.loadChats()
+    }
+
+    // Refresh unread badges whenever this screen comes back into view
+    // (e.g. returning from a chat that just got marked read).
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        chatViewModel.loadChats()
+    }
 
     Scaffold(
         topBar = {
-            ChatListTopBar(
-                showSearch = showSearch,
-                searchQuery = searchQuery,
-                onToggleSearch = { showSearch = !showSearch },
-                onSearchQueryChange = { searchQuery = it },
-                onProfileClick = onProfileClick,
-                onRefresh = onRefresh
+            TopAppBar(
+                title = { Text("Chats", fontWeight = FontWeight.Bold) },
+                actions = {
+                    IconButton(onClick = onLogout) {
+                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Logout")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
             )
-        }
-    ) { paddingValues ->
-        Box(
-            modifier = modifier
-                .fillMaxSize()
-                .padding(paddingValues)
-                .background(MessengerThemeColors.ChatBackground)
-        ) {
+        },
+        floatingActionButton = {
+            FloatingActionButton(onClick = { showNewChat = true }, containerColor = AccentPurple) {
+                Icon(Icons.Default.Add, contentDescription = "New chat", tint = Color.White)
+            }
+        },
+        containerColor = MaterialTheme.colorScheme.background
+    ) { padding ->
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
             when {
-                isLoading && conversations.isEmpty() -> {
-                    LoadingIndicator()
+                listState.isLoading && listState.chats.isEmpty() -> {
+                    CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
                 }
-                error != null -> {
-                    ErrorScreen(
-                        message = error,
-                        onRetry = onRefresh
+                listState.chats.isEmpty() -> {
+                    Text(
+                        listState.error ?: "No conversations yet",
+                        modifier = Modifier.align(Alignment.Center),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                }
-                conversations.isEmpty() && searchQuery.isEmpty() -> {
-                    EmptyState()
-                }
-                conversations.isEmpty() && searchQuery.isNotEmpty() -> {
-                    NoSearchResults()
                 }
                 else -> {
-                    val filteredConversations = if (searchQuery.isBlank()) {
-                        conversations
-                    } else {
-                        conversations.filter {
-                            it.name.contains(searchQuery, ignoreCase = true) ||
-                            it.lastMessage?.contains(searchQuery, ignoreCase = true) == true
-                        }
-                    }
-
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(horizontal = 0.dp, vertical = 8.dp)
-                    ) {
-                        items(filteredConversations, key = { it.id }) { conversation ->
-                            ConversationItem(
-                                conversation = conversation,
-                                isOnline = onlineUsers.contains(conversation.otherUserId),
-                                onClick = { onConversationClick(conversation.id) },
-                                modifier = Modifier.animateItem(
-                                    fadeInSpec = null,
-                                    shrinkSpec = null,
-                                    expandSpec = null
-                                )
-                            )
+                    LazyColumn(modifier = Modifier.fillMaxSize()) {
+                        items(listState.chats, key = { it.id }) { chat ->
+                            ChatRow(chat, onClick = { onChatClick(chat.id, chat.name) })
                         }
                     }
                 }
             }
         }
     }
-}
 
-/**
- * Top bar for chat list
- */
-@Composable
-private fun ChatListTopBar(
-    showSearch: Boolean,
-    searchQuery: String,
-    onToggleSearch: () -> Unit,
-    onSearchQueryChange: (String) -> Unit,
-    onProfileClick: () -> Unit,
-    onRefresh: () -> Unit
-) {
-    TopAppBar(
-        title = {
-            Text(
-                text = "Chats",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold
-            )
-        },
-        navigationIcon = {
-            IconButton(onClick = onProfileClick) {
-                Surface(
-                    modifier = Modifier.size(40.dp),
-                    shape = CircleShape,
-                    color = MessengerThemeColors.Primary
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Default.Person,
-                            contentDescription = "Profile",
-                            tint = Color.White,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
-                }
+    if (showNewChat) {
+        NewChatSheet(
+            chatViewModel = chatViewModel,
+            onDismiss = { showNewChat = false },
+            onChatStarted = { chatId, name ->
+                showNewChat = false
+                onChatClick(chatId, name)
             }
-        },
-        actions = {
-            if (showSearch) {
-                IconButton(onClick = { onSearchQueryChange("") }) {
-                    Icon(
-                        Icons.Default.Close,
-                        contentDescription = "Close search",
-                        tint = Color.White
-                    )
-                }
-            } else {
-                IconButton(onClick = onToggleSearch) {
-                    Icon(
-                        imageVector = Icons.Default.Search,
-                        contentDescription = "Search",
-                        tint = Color.White
-                    )
-                }
-            }
-            IconButton(onClick = onToggleSearch) {
-                Icon(
-                    imageVector = Icons.Default.MoreVert,
-                    contentDescription = "More",
-                    tint = Color.White
-                )
-            }
-        },
-        colors = TopAppBarDefaults.topAppBarColors(
-            containerColor = MessengerThemeColors.Primary,
-            titleContentColor = Color.White,
-            navigationIconContentColor = Color.White,
-            actionIconContentColor = Color.White
-        ),
-        windowInsets = WindowInsets(0)
-    )
-
-    // Search bar
-    AnimatedVisibility(
-        visible = showSearch,
-        enter = fadeIn() + scaleIn(),
-        exit = fadeOut() + scaleOut()
-    ) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            color = Color.White
-        ) {
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = onSearchQueryChange,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                placeholder = { Text("Search conversations...") },
-                leadingIcon = {
-                    Icon(Icons.Default.Search, contentDescription = null, tint = Color.Gray)
-                },
-                trailingIcon = {
-                    if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { onSearchQueryChange("") }) {
-                            Icon(Icons.Default.Close, contentDescription = "Clear", tint = Color.Gray)
-                        }
-                    }
-                },
-                shape = RoundedCornerShape(12.dp),
-                colors = OutlinedTextFieldDefaults.colors(
-                    borderColor = Color.Transparent,
-                    focusedBorderColor = Color.Transparent
-                )
-            )
-        }
+        )
     }
 }
 
-/**
- * Individual conversation item
- */
 @Composable
-private fun ConversationItem(
-    conversation: com.messenger.app.data.model.Conversation,
-    isOnline: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Card(
-        modifier = modifier
+private fun ChatRow(chat: ChatListItemUi, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 4.dp),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = Color.White
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // Avatar
+        Box(modifier = Modifier.size(48.dp), contentAlignment = Alignment.BottomEnd) {
             Box(
                 modifier = Modifier
-                    .size(56.dp)
-                    .clip(CircleShape)
-                    .background(
-                        brush = Brush.linearGradient(
-                            colors = listOf(
-                                MessengerThemeColors.Primary,
-                                Color(0xFF1E88C5)
-                            )
-                        )
-                    )
+                    .fillMaxSize()
+                    .background(avatarColorFor(chat.name), CircleShape),
+                contentAlignment = Alignment.Center
             ) {
-                // Online indicator
-                if (isOnline) {
-                    Box(
-                        modifier = Modifier
-                            .size(14.dp)
-                            .align(Alignment.BottomEnd)
-                            .clip(CircleShape)
-                            .background(Color(0xFF4CAF50))
-                    )
-                }
+                Text(
+                    chat.name.take(1).uppercase(),
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+            if (chat.isOnline) {
+                Box(
+                    modifier = Modifier
+                        .size(14.dp)
+                        .background(MaterialTheme.colorScheme.background, CircleShape)
+                        .padding(2.dp)
+                        .background(OnlineColor, CircleShape)
+                )
+            }
+        }
 
-                Box(contentAlignment = Alignment.Center) {
+        Spacer(Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(chat.name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(2.dp))
+            Text(
+                chat.lastMessage,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (chat.unreadCount > 0) MaterialTheme.colorScheme.onBackground else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        Spacer(Modifier.width(8.dp))
+
+        Column(horizontalAlignment = Alignment.End) {
+            Text(
+                chat.timestamp,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (chat.unreadCount > 0) AccentPurple else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (chat.unreadCount > 0) {
+                Spacer(Modifier.height(6.dp))
+                Box(
+                    modifier = Modifier
+                        .background(AccentPurple, CircleShape)
+                        .defaultMinSize(minWidth = 20.dp, minHeight = 20.dp),
+                    contentAlignment = Alignment.Center
+                ) {
                     Text(
-                        text = conversation.name.firstOrNull()?.uppercase() ?: "?",
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
+                        if (chat.unreadCount > 99) "99+" else chat.unreadCount.toString(),
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
                 }
             }
+        }
+    }
+}
 
-            Spacer(modifier = Modifier.width(12.dp))
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun NewChatSheet(
+    chatViewModel: ChatViewModel,
+    onDismiss: () -> Unit,
+    onChatStarted: (chatId: String, name: String) -> Unit
+) {
+    val searchState by chatViewModel.userSearchState.collectAsState()
 
-            // Conversation info
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight(),
-                verticalArrangement = Arrangement.Center
-            ) {
-                Text(
-                    text = conversation.name,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF1A1A2E),
-                    maxLines = 1
-                )
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(modifier = Modifier.fillMaxWidth().imePadding().padding(16.dp)) {
+            Text("New Chat", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = searchState.query,
+                onValueChange = { chatViewModel.searchUsers(it) },
+                label = { Text("Search by username or email") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(12.dp))
 
-                Spacer(modifier = Modifier.height(4.dp))
-
-                Text(
-                    text = conversation.lastMessage ?: "No messages yet",
-                    fontSize = 14.sp,
-                    color = if (isOnline) Color(0xFF4CAF50) else Color.Gray,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            // Metadata
-            Column(
-                horizontalAlignment = Alignment.End,
-                verticalArrangement = Arrangement.SpaceBetween,
-                modifier = Modifier.fillMaxHeight()
-            ) {
-                Text(
-                    text = conversation.lastMessageTime ?: "",
-                    fontSize = 12.sp,
-                    color = Color.Gray
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                // Unread count badge
-                if (conversation.unreadCount > 0) {
-                    Surface(
-                        modifier = Modifier.size(22.dp),
-                        shape = CircleShape,
-                        color = MessengerThemeColors.Primary
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Text(
-                                text = conversation.unreadCount.toString(),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
+            if (searchState.isSearching) {
+                Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else {
+                LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+                    items(searchState.results) { user ->
+                        val displayName = user.displayName ?: user.username
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    chatViewModel.startDirectChat(user.id, displayName) { chatId ->
+                                        onChatStarted(chatId, displayName)
+                                    }
+                                }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier.size(40.dp).background(AccentPurple, CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(displayName.take(1).uppercase(), color = Color.White, fontWeight = FontWeight.Bold)
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text(displayName, fontWeight = FontWeight.Bold)
+                                Text(
+                                    user.email,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     }
                 }
             }
-        }
-    }
-}
-
-/**
- * Loading indicator
- */
-@Composable
-private fun LoadingIndicator() {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            CircularProgressIndicator(
-                color = MessengerThemeColors.Primary,
-                modifier = Modifier.size(48.dp)
-            )
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(
-                text = "Loading conversations...",
-                fontSize = 14.sp,
-                color = Color.Gray
-            )
-        }
-    }
-}
-
-/**
- * Empty state when no conversations exist
- */
-@Composable
-private fun EmptyState() {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-            modifier = Modifier.padding(32.dp)
-        ) {
-            Surface(
-                modifier = Modifier.size(100.dp),
-                shape = RoundedCornerShape(50%),
-                color = MessengerThemeColors.Primary.copy(alpha = 0.1f)
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Default.Chat,
-                        contentDescription = null,
-                        tint = MessengerThemeColors.Primary,
-                        modifier = Modifier.size(50.dp)
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            Text(
-                text = "No conversations yet",
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF1A1A2E)
-            )
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Text(
-                text = "Start a new conversation to get started!",
-                fontSize = 14.sp,
-                color = Color.Gray,
-                textAlign = TextAlign.Center
-            )
-        }
-    }
-}
-
-/**
- * Error display screen
- */
-@Composable
-private fun ErrorScreen(
-    message: String,
-    onRetry: () -> Unit
-) {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-            modifier = Modifier.padding(32.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Default.Error,
-                contentDescription = null,
-                tint = Color(0xFFD32F2F),
-                modifier = Modifier.size(64.dp)
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = message,
-                fontSize = 16.sp,
-                color = Color(0xFFD32F2F),
-                textAlign = TextAlign.Center
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Button(onClick = onRetry) {
-                Text("Retry")
-            }
-        }
-    }
-}
-
-/**
- * No search results state
- */
-@Composable
-private fun NoSearchResults() {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Icon(
-                imageVector = Icons.Default.Search,
-                contentDescription = null,
-                tint = Color.Gray,
-                modifier = Modifier.size(48.dp)
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Text(
-                text = "No results found",
-                fontSize = 16.sp,
-                color = Color.Gray
-            )
+            Spacer(Modifier.height(16.dp))
         }
     }
 }

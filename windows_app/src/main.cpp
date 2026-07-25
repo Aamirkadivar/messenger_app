@@ -1,7 +1,8 @@
-#include <QGuiApplication>
+#include <QApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#include <QQuickWindow>
 #include <QIcon>
 #include <QDir>
 #include <QStandardPaths>
@@ -14,8 +15,10 @@
 
 #include "utils/config.h"
 #include "utils/credentialmanager.h"
+#include "utils/traynotifier.h"
 #include "services/authservice.h"
 #include "services/websocketservice.h"
+#include "services/chatservice.h"
 
 int main(int argc, char* argv[]) {
     // Use the Basic style so custom background/indicator/contentItem overrides
@@ -24,7 +27,7 @@ int main(int argc, char* argv[]) {
     // not rendering).
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
-    QGuiApplication app(argc, argv);
+    QApplication app(argc, argv);
     app.setOrganizationName(QStringLiteral("MessengerApp"));
     app.setApplicationName(QStringLiteral("Messenger"));
     app.setApplicationVersion(QStringLiteral("1.0.0"));
@@ -32,6 +35,7 @@ int main(int argc, char* argv[]) {
     // Enable high DPI scaling
     app.setAttribute(Qt::AA_EnableHighDpiScaling, true);
     app.setAttribute(Qt::AA_UseHighDpiPixmaps, true);
+    app.setQuitOnLastWindowClosed(false);
 
     // Initialize credential manager
     CredentialManager::instance();
@@ -39,12 +43,8 @@ int main(int argc, char* argv[]) {
     // Create services
     AuthService authService;
     WebSocketService websocketService;
+    ChatService chatService(&authService);
 
-    // Check for auto-login
-    QString savedToken = CredentialManager::instance().getToken(QStringLiteral("access_token"));
-    QString savedUserId = CredentialManager::instance().getToken(QStringLiteral("current_user"));
-
-    // Setup network access manager for auth service
     // Connect auth to websocket
     QObject::connect(&authService, &AuthService::loginSuccess,
                      &websocketService, [&websocketService](const QString& userId, const QString& username) {
@@ -61,18 +61,31 @@ int main(int argc, char* argv[]) {
         websocketService.disconnectFromServer();
     });
 
-    QObject::connect(&websocketService, &WebSocketService::connected,
-                     &authService, [&authService](const QString& userId) {
-        Q_UNUSED(userId);
-        // WebSocket connected, auth service can use it
+    // Fetch chats whenever a token becomes available (fresh login or restored session)
+    QObject::connect(&authService, &AuthService::tokenReady,
+                     &chatService, [&chatService]() {
+        chatService.fetchChats();
     });
+
+    // Connect chat service signals
+    QObject::connect(&chatService, &ChatService::chatError,
+                     [](const QString& error) {
+                         qWarning() << "[ChatService] Error:" << error;
+                     });
+
+    // Restore a previously saved login, if any, now that everything above is wired up
+    authService.restoreSession();
+
+    TrayNotifier trayNotifier;
 
     QQmlApplicationEngine engine;
 
     // Register types
     engine.rootContext()->setContextProperty(QStringLiteral("authService"), &authService);
     engine.rootContext()->setContextProperty(QStringLiteral("websocketService"), &websocketService);
+    engine.rootContext()->setContextProperty(QStringLiteral("chatService"), &chatService);
     engine.rootContext()->setContextProperty(QStringLiteral("credentialManager"), &CredentialManager::instance());
+    engine.rootContext()->setContextProperty(QStringLiteral("trayNotifier"), &trayNotifier);
 
     // Load QML
     const QString qmlFile = QStringLiteral("qrc:/qml/main.qml");
@@ -83,6 +96,18 @@ int main(int argc, char* argv[]) {
         []() { QCoreApplication::exit(-1); },
         Qt::QueuedConnection);
     engine.load(qmlFile);
+
+    // Clicking the tray icon (or its "Open Messenger" menu item) should
+    // bring the main window back to the front.
+    if (!engine.rootObjects().isEmpty()) {
+        if (auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first())) {
+            QObject::connect(&trayNotifier, &TrayNotifier::openRequested, window, [window]() {
+                window->show();
+                window->raise();
+                window->requestActivate();
+            });
+        }
+    }
 
     return app.exec();
 }
