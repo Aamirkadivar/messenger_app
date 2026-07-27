@@ -1,9 +1,15 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Window 2.15
 
 Rectangle {
     id: chatViewRoot
+
+    // The Window attached type only attaches to Item-derived elements, so it
+    // can't be referenced directly from inside a Behavior - resolve it once
+    // here instead and have the Behaviors below read this plain property.
+    property bool instantThemeActive: Window.window ? Window.window.instantTheme : false
 
     // External properties from parent
     property bool darkMode: true
@@ -18,7 +24,8 @@ Rectangle {
     property color onlineColor: "#4CAF50"
     property string currentChatId: ""
     property string currentChatName: ""
-    property bool isOnline: true
+    property string otherUserId: ""
+    property bool isOnline: false
     property bool typingIndicator: false
     property string typingUser: ""
 
@@ -30,23 +37,20 @@ Rectangle {
 
     property bool typingVisible: false
     property bool isLoadingMore: false
-    property string joinedChatId: ""
 
     color: bgColor
 
     onCurrentChatIdChanged: {
-        if (joinedChatId && joinedChatId.length > 0 && joinedChatId !== currentChatId) {
-            websocketService.leaveChat(joinedChatId)
-        }
+        // Deliberately not leaving the previous chat's room here: ChatList.qml
+        // joins every known chat's room up front precisely so notifications and
+        // live badge/preview updates keep arriving for chats that aren't the
+        // one currently open. Leaving on switch would undo that the moment you
+        // navigate away from a chat.
         messagesModel.clear()
         if (currentChatId && currentChatId.length > 0) {
             isLoadingMore = true
             chatService.fetchMessages(currentChatId)
-            chatService.markAsRead(currentChatId)
             websocketService.joinChat(currentChatId)
-            joinedChatId = currentChatId
-        } else {
-            joinedChatId = ""
         }
     }
 
@@ -56,12 +60,22 @@ Rectangle {
         function onMessagesFetched(chatId, messages) {
             if (chatId !== chatViewRoot.currentChatId) return
             messagesModel.clear()
+            // Read this off the fetched data *before* markAsRead below flips it -
+            // it's the last point where we can tell which messages were actually
+            // still unread when the chat was opened.
+            var firstUnreadIndex = -1
             for (var i = 0; i < messages.length; i++) {
                 var m = messages[i]
                 var isMine = m.senderId === authService.currentUserId
-                chatViewRoot.addMessage(m.senderId, m.senderName, m.content, chatViewRoot.formatTime(m.createdAt), isMine)
+                var isRead = isMine && m.readAt && m.readAt.length > 0
+                chatViewRoot.addMessage(m.senderId, m.senderName, m.content, chatViewRoot.formatTime(m.createdAt), isMine, isRead)
+                if (firstUnreadIndex === -1 && !isMine && (!m.readAt || m.readAt.length === 0)) {
+                    firstUnreadIndex = i
+                }
             }
             chatViewRoot.isLoadingMore = false
+            chatViewRoot.scrollToUnreadOrEnd(firstUnreadIndex)
+            chatService.markAsRead(chatId)
         }
 
         function onMessageError(error) {
@@ -79,12 +93,38 @@ Rectangle {
             if (message.senderId === authService.currentUserId) return
             var text = chatService.decryptMessage(chatId, message.content, message.encrypted === true)
             chatViewRoot.addMessage(message.senderId, chatViewRoot.currentChatName, text,
-                                     chatViewRoot.formatTime(message.createdAt), false)
+                                     chatViewRoot.formatTime(message.createdAt), false, false)
+            // This chat is already open and visible, so the message that just
+            // arrived counts as read immediately - onCurrentChatIdChanged only
+            // fires when switching chats, not for new messages in one already open.
+            chatService.markAsRead(chatId)
+        }
+
+        function onMessageRead(chatId, readerId, readAt) {
+            if (chatId !== chatViewRoot.currentChatId) return
+            // The other participant just read our messages in this chat -
+            // flip every one of our bubbles over to "seen".
+            if (readerId === authService.currentUserId) return
+            for (var i = 0; i < messagesModel.count; i++) {
+                if (messagesModel.get(i).isMine) {
+                    messagesModel.setProperty(i, "isRead", true)
+                }
+            }
         }
 
         function onConnected() {
             if (chatViewRoot.currentChatId && chatViewRoot.currentChatId.length > 0) {
                 websocketService.joinChat(chatViewRoot.currentChatId)
+                // Catch up on anything sent while we were disconnected -
+                // otherwise only new messages from this point on would show,
+                // silently skipping whatever arrived during the outage.
+                chatService.fetchMessages(chatViewRoot.currentChatId)
+            }
+        }
+
+        function onPresenceChanged(userId, online) {
+            if (userId === chatViewRoot.otherUserId) {
+                chatViewRoot.isOnline = online
             }
         }
     }
@@ -115,7 +155,10 @@ Rectangle {
                     Layout.preferredHeight: 36
                     radius: 9
                     color: backMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (backMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
-                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Behavior on color {
+                        enabled: !chatViewRoot.instantThemeActive
+                        ColorAnimation { duration: 100 }
+                    }
 
                     Canvas {
                         anchors.centerIn: parent
@@ -203,7 +246,10 @@ Rectangle {
                     Layout.preferredHeight: 36
                     radius: 9
                     color: moreMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (moreMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
-                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Behavior on color {
+                        enabled: !chatViewRoot.instantThemeActive
+                        ColorAnimation { duration: 100 }
+                    }
 
                     Canvas {
                         anchors.centerIn: parent
@@ -238,54 +284,75 @@ Rectangle {
         }
 
         // Messages area
-        ScrollView {
-            id: messagesScroll
+        Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
+
+            ChatBackground {
+                anchors.fill: parent
+                baseColor: chatViewRoot.bgColor
+                patternColor: chatViewRoot.accentColor
+                // The same alpha reads much fainter against a pale background
+                // than a near-black one, so light mode needs a bit more to
+                // land at the same visual weight (same lesson as the hover
+                // highlights and input pills earlier).
+                patternOpacity: chatViewRoot.darkMode ? 0.05 : 0.09
+            }
+
+        ListView {
+            id: messagesListView
+            anchors.fill: parent
             clip: true
-            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            spacing: 2
+            model: messagesModel
+            ScrollBar.vertical: ScrollBar {}
 
-            ColumnLayout {
-                width: messagesScroll.width
-                spacing: 2
-
-                Item { Layout.fillHeight: true }
+            header: Item {
+                width: messagesListView.width
+                height: chatViewRoot.isLoadingMore ? 40 : 0
+                visible: chatViewRoot.isLoadingMore
 
                 BusyIndicator {
-                    Layout.alignment: Qt.AlignHCenter
+                    anchors.centerIn: parent
                     running: chatViewRoot.isLoadingMore
-                    visible: chatViewRoot.isLoadingMore
                     width: 24
                     height: 24
                 }
+            }
 
-                Repeater {
-                    id: messageRepeater
-                    model: messagesModel
+            delegate: Item {
+                width: messagesListView.width
+                height: bubbleItem.height + (model.showSender ? 10 : 2)
 
-                    MessageBubble {
-                        Layout.fillWidth: true
-                        Layout.leftMargin: 16
-                        Layout.rightMargin: 16
-                        Layout.topMargin: model.showSender ? 10 : 2
-                        darkMode: chatViewRoot.darkMode
-                        messageText: model.messageText
-                        messageTime: model.messageTime
-                        isMine: model.isMine
-                        senderName: model.senderName
-                        showSender: model.showSender
-                        myMessageBg: chatViewRoot.myMessageBg
-                        theirMessageBg: chatViewRoot.theirMessageBg
-                        isEncrypted: true
-                    }
+                MessageBubble {
+                    id: bubbleItem
+                    x: 16
+                    y: model.showSender ? 10 : 2
+                    width: parent.width - 32
+                    darkMode: chatViewRoot.darkMode
+                    messageText: model.messageText
+                    messageTime: model.messageTime
+                    isMine: model.isMine
+                    isRead: model.isRead
+                    senderName: model.senderName
+                    showSender: model.showSender
+                    myMessageBg: chatViewRoot.myMessageBg
+                    theirMessageBg: chatViewRoot.theirMessageBg
+                    isEncrypted: true
                 }
+            }
 
-                // Typing indicator
+            // Typing indicator
+            footer: Item {
+                width: messagesListView.width
+                height: chatViewRoot.typingVisible ? 36 : 0
+                visible: chatViewRoot.typingVisible
+
                 RowLayout {
-                    Layout.leftMargin: 16
-                    Layout.topMargin: 4
-                    Layout.bottomMargin: 8
-                    visible: chatViewRoot.typingVisible
+                    anchors.left: parent.left
+                    anchors.leftMargin: 16
+                    anchors.top: parent.top
+                    anchors.topMargin: 4
                     spacing: 4
 
                     Repeater {
@@ -304,6 +371,7 @@ Rectangle {
                     }
                 }
             }
+        }
         }
 
         Rectangle {
@@ -329,7 +397,10 @@ Rectangle {
                     Layout.preferredHeight: 40
                     radius: 10
                     color: attMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (attMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
-                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Behavior on color {
+                        enabled: !chatViewRoot.instantThemeActive
+                        ColorAnimation { duration: 100 }
+                    }
 
                     Canvas {
                         anchors.centerIn: parent
@@ -364,7 +435,11 @@ Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 42
                     radius: 21
-                    color: darkMode ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.03)"
+                    // Was a "rgba(r,g,b,a)" string literal - that syntax silently
+                    // drops the alpha channel in this Qt build (always resolves
+                    // fully opaque), which is why this rendered solid black in
+                    // light mode instead of a subtle tint. Qt.rgba() is reliable.
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
                     border.color: messageInput.activeFocus ? chatViewRoot.accentColor : "transparent"
                     border.width: 1.5
                     Behavior on border.color { ColorAnimation { duration: 100 } }
@@ -395,12 +470,15 @@ Rectangle {
                     property bool canSend: messageInput.text.trim().length > 0
                     color: !canSend ? (darkMode ? "#2A2A4A" : "#E0E0E5")
                            : sendMouse.pressed ? Qt.darker(chatViewRoot.myMessageBg, 1.15) : (sendMouse.containsMouse ? Qt.lighter(chatViewRoot.myMessageBg, 1.08) : chatViewRoot.myMessageBg)
-                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Behavior on color {
+                        enabled: !chatViewRoot.instantThemeActive
+                        ColorAnimation { duration: 100 }
+                    }
 
                     function trigger() {
                         if (!canSend) return
                         var text = messageInput.text.trim()
-                        chatViewRoot.addMessage(authService.currentUserId, "Me", text, chatViewRoot.formatTime(new Date().toISOString()), true)
+                        chatViewRoot.addMessage(authService.currentUserId, "Me", text, chatViewRoot.formatTime(new Date().toISOString()), true, false)
                         chatService.sendMessage(chatViewRoot.currentChatId, text)
                         chatViewRoot.sendMessage(text)
                         messageInput.text = ""
@@ -436,7 +514,7 @@ Rectangle {
         }
     }
 
-    function addMessage(senderId, senderName, text, time, isMine) {
+    function addMessage(senderId, senderName, text, time, isMine, isRead) {
         const prev = messagesModel.count > 0 ? messagesModel.get(messagesModel.count - 1) : null
         const showSender = !isMine && (!prev || prev.senderId !== senderId)
         messagesModel.append({
@@ -445,7 +523,20 @@ Rectangle {
             messageText: text,
             messageTime: time,
             isMine: isMine,
+            isRead: isRead === true,
             showSender: showSender
+        })
+    }
+
+    function scrollToUnreadOrEnd(unreadIndex) {
+        // Deferred one tick so the ListView has laid out the freshly-populated
+        // model before we ask it to position on an index.
+        Qt.callLater(function() {
+            if (unreadIndex >= 0) {
+                messagesListView.positionViewAtIndex(unreadIndex, ListView.Beginning)
+            } else if (messagesListView.count > 0) {
+                messagesListView.positionViewAtEnd()
+            }
         })
     }
 
@@ -460,7 +551,6 @@ Rectangle {
         if (currentChatId && currentChatId.length > 0) {
             isLoadingMore = true
             chatService.fetchMessages(currentChatId)
-            chatService.markAsRead(currentChatId)
         }
     }
 }

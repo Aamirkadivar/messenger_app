@@ -9,6 +9,7 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include "../utils/config.h"
+#include "../utils/messagecache.h"
 #include "authservice.h"
 
 class ChatService : public QObject {
@@ -51,7 +52,7 @@ signals:
     void chatRead(const QString& chatId);
 
 private slots:
-    void onChatsReplyFinished();
+    void onChatsReplyFinished(QNetworkReply* reply);
 
 private:
     void setupNetworkManager();
@@ -61,6 +62,7 @@ private:
     QNetworkAccessManager* m_networkManager = nullptr;
     QNetworkReply* m_currentReply = nullptr;
     bool m_isLoading = false;
+    MessageCache* m_messageCache = nullptr;
 
     // chatId -> the other participant's public key (hex), learned from the
     // chat list. For a direct chat this key both encrypts our outgoing

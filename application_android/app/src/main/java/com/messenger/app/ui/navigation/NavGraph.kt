@@ -10,8 +10,10 @@ import androidx.navigation.compose.composable
 import androidx.navigation.navArgument
 import com.messenger.app.ui.screen.ChatListScreen
 import com.messenger.app.ui.screen.ChatScreen
+import com.messenger.app.ui.screen.CreateGroupScreen
 import com.messenger.app.ui.screen.LoginScreen
 import com.messenger.app.ui.screen.RegisterScreen
+import com.messenger.app.ui.screen.SettingsScreen
 import com.messenger.app.ui.viewmodel.AuthViewModel
 import com.messenger.app.ui.viewmodel.ChatViewModel
 import java.net.URLDecoder
@@ -25,6 +27,8 @@ object Routes {
     const val REGISTER = "register"
     const val CHAT_LIST = "chat_list"
     const val CHAT = "chat/{chatId}/{chatName}"
+    const val SETTINGS = "settings"
+    const val CREATE_GROUP = "create_group"
 
     fun chat(chatId: String, chatName: String): String {
         val encodedName = URLEncoder.encode(chatName, "UTF-8")
@@ -81,10 +85,39 @@ fun MainNavGraph(
                 onChatClick = { chatId, chatName ->
                     navController.navigate(Routes.chat(chatId, chatName))
                 },
+                onOpenSettings = { navController.navigate(Routes.SETTINGS) },
+                onCreateGroup = { navController.navigate(Routes.CREATE_GROUP) },
+                onSessionExpired = {
+                    // Same teardown as an explicit logout: the stored token is
+                    // dead, so clear it rather than leaving it to fail again.
+                    authViewModel.logout()
+                    navController.navigate(Routes.LOGIN) {
+                        // popUpTo(0) clears the whole back stack - pressing back
+                        // from login must not return to a signed-out chat list.
+                        popUpTo(0) { inclusive = true }
+                    }
+                },
                 onLogout = {
                     authViewModel.logout()
                     navController.navigate(Routes.LOGIN) {
                         popUpTo(Routes.CHAT_LIST) { inclusive = true }
+                    }
+                }
+            )
+        }
+
+        composable(Routes.SETTINGS) {
+            SettingsScreen(onNavigateBack = { navController.popBackStack() })
+        }
+
+        composable(Routes.CREATE_GROUP) {
+            CreateGroupScreen(
+                onNavigateBack = { navController.popBackStack() },
+                onGroupCreated = { chatId, chatName ->
+                    // Replace this screen in the stack: backing out of the new
+                    // group should land on the chat list, not the create form.
+                    navController.navigate(Routes.chat(chatId, chatName)) {
+                        popUpTo(Routes.CREATE_GROUP) { inclusive = true }
                     }
                 }
             )

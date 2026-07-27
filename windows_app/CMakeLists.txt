@@ -81,6 +81,8 @@ set(PROJECT_SOURCES
     src/utils/credentialmanager.h
     src/utils/traynotifier.cpp
     src/utils/traynotifier.h
+    src/utils/messagecache.cpp
+    src/utils/messagecache.h
 )
 
 # ---- QML Resources ----
@@ -90,6 +92,7 @@ set(PROJECT_QML
     qml/Register.qml
     qml/ChatList.qml
     qml/ChatView.qml
+    qml/ChatBackground.qml
     qml/NewChatDialog.qml
     qml/MessageBubble.qml
     qml/Settings.qml
@@ -185,7 +188,7 @@ endif()
 
 # ---- Windows-specific linking ----
 if(WIN32)
-    target_link_libraries(${PROJECT_NAME} PRIVATE Advapi32 Crypt32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Advapi32 Crypt32 Dwmapi)
 endif()
 
 # ---- Compiler flags ----

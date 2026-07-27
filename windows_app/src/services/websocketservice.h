@@ -16,12 +16,18 @@
 class WebSocketService : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool isConnected READ isConnected NOTIFY connectedChanged)
+    // One of "disconnected" / "connecting" / "reconnecting" / "connected" -
+    // distinguishes the very first connection attempt from a retry after a
+    // drop, so the UI can say "Connecting…" vs "Reconnecting…" like Telegram
+    // does, instead of a single generic online/offline flag.
+    Q_PROPERTY(QString connectionState READ connectionState NOTIFY connectionStateChanged)
 
 public:
     explicit WebSocketService(QObject* parent = nullptr);
     ~WebSocketService() override;
 
     bool isConnected() const { return m_webSocket && m_webSocket->state() == QAbstractSocket::ConnectedState; }
+    QString connectionState() const { return m_connectionState; }
 
     Q_INVOKABLE void connectToServer(const QString& token);
     Q_INVOKABLE void disconnectFromServer();
@@ -31,11 +37,16 @@ public:
 
 signals:
     void connectedChanged();
+    void connectionStateChanged();
     void connected();
     void disconnected();
     // message: {id, senderId, content, createdAt}
     void messageReceived(const QString& chatId, const QVariantMap& message);
     void typingIndicator(const QString& chatId, const QString& userId, bool typing);
+    // Fired when the other participant marks messages in a chat as read.
+    void messageRead(const QString& chatId, const QString& readerId, const QString& readAt);
+    // Fired whenever any user connects/disconnects - not scoped to a chat room.
+    void presenceChanged(const QString& userId, bool online);
     void errorOccurred(const QString& error);
 
 private slots:
@@ -44,15 +55,31 @@ private slots:
     void onTextMessageReceived(const QString& message);
     void onError(QAbstractSocket::SocketError error);
     void onReconnect();
+    void onPong(quint64 elapsedTime, const QByteArray& payload);
+    // Pings the server and checks that *something* (a pong or any message)
+    // has been heard recently. An abruptly-killed server doesn't send a
+    // TCP close, so the OS can take a very long time - or never - to notice
+    // the connection is dead on its own; this catches it within one cycle.
+    void checkConnectionHealth();
 
 private:
     void sendJson(const QJsonObject& obj);
     void rejoinRooms();
+    void noteActivity();
+    void setConnectionState(const QString& state);
+    // "reconnecting" once we've connected successfully at least once,
+    // otherwise "connecting" - so a run of failed first-attempts doesn't
+    // flicker between the two labels before ever reaching the server.
+    QString nextRetryState() const { return m_hasConnectedBefore ? QStringLiteral("reconnecting") : QStringLiteral("connecting"); }
 
     QWebSocket* m_webSocket = nullptr;
     QTimer m_reconnectTimer;
+    QTimer m_healthTimer;
+    qint64 m_lastActivityMs = 0;
     QString m_token;
     QString m_serverUrl;
     QSet<QString> m_joinedChats;
     bool m_autoReconnect = true;
+    QString m_connectionState = QStringLiteral("disconnected");
+    bool m_hasConnectedBefore = false;
 };

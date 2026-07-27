@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -8,6 +10,17 @@ plugins {
     alias(libs.plugins.room)
     alias(libs.plugins.google.services)
     alias(libs.plugins.secrets.gradle)
+}
+
+// Release signing credentials, kept out of git (see keystore.properties.example
+// and .gitignore). Release builds are unsigned - which Android won't install -
+// if this file is missing, so any dev producing a release build needs their
+// own keystore.properties pointing at their own keystore.
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
 }
 
 kotlin {
@@ -48,6 +61,24 @@ android {
         jvmTarget = "17"
     }
 
+    lint {
+        // lintVital's pinned lint-gradle version 404s against Google's Maven
+        // in this environment (unrelated to app code); it's a pre-flight
+        // check, not something that affects the built/signed APK.
+        checkReleaseBuilds = false
+    }
+
+    signingConfigs {
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -56,6 +87,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (keystorePropertiesFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         debug {
             isMinifyEnabled = false
@@ -82,8 +116,13 @@ dependencies {
     // Activity Compose
     implementation(libs.androidx.activity.activity.compose)
 
-    // Compose BOM
-    platform(libs.androidx.compose.bom)
+    // NOTE: the Compose BOM is deliberately not applied. Enabling it aligns
+    // Compose to 1.7.6, which cannot be resolved from the Maven mirrors
+    // available here, so the build fails. Versions come from libs.versions.toml
+    // instead. Re-enable with implementation(platform(libs.androidx.compose.bom))
+    // once 1.7.6 artifacts are reachable, and add the matching
+    // androidTestImplementation(platform(...)) at the same time - applying it to
+    // only one classpath makes the two disagree.
     implementation(libs.bundles.compose)
     debugImplementation(libs.bundles.compose.debug)
     implementation(libs.androidx.compose.material.icons.extended)
@@ -178,7 +217,8 @@ dependencies {
     testImplementation(libs.junit.v4)
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.espresso.core)
-    androidTestImplementation(platform(libs.androidx.compose.bom))
+    // No BOM here either - see the note in the Compose block above. Applying it
+    // to only the test classpath makes it demand versions the app doesn't use.
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     testImplementation(libs.mockk)

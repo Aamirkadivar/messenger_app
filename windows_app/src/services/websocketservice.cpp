@@ -5,6 +5,12 @@
 #include <QJsonObject>
 #include <QDebug>
 #include <QUrlQuery>
+#include <QDateTime>
+
+namespace {
+constexpr int kHealthCheckIntervalMs = 12000;
+constexpr qint64 kStaleConnectionMs = 26000; // ~2 missed health checks
+}
 
 WebSocketService::WebSocketService(QObject* parent)
     : QObject(parent)
@@ -14,6 +20,10 @@ WebSocketService::WebSocketService(QObject* parent)
     m_reconnectTimer.setSingleShot(false);
     m_reconnectTimer.setInterval(Config::reconnectDelayMs());
     connect(&m_reconnectTimer, &QTimer::timeout, this, &WebSocketService::onReconnect);
+
+    m_healthTimer.setSingleShot(false);
+    m_healthTimer.setInterval(kHealthCheckIntervalMs);
+    connect(&m_healthTimer, &QTimer::timeout, this, &WebSocketService::checkConnectionHealth);
 }
 
 WebSocketService::~WebSocketService() {
@@ -23,6 +33,7 @@ WebSocketService::~WebSocketService() {
 void WebSocketService::connectToServer(const QString& token) {
     m_token = token;
     m_autoReconnect = true;
+    setConnectionState(nextRetryState());
 
     if (m_webSocket) {
         delete m_webSocket;
@@ -35,6 +46,7 @@ void WebSocketService::connectToServer(const QString& token) {
     connect(m_webSocket, QOverload<QAbstractSocket::SocketError>::of(&QWebSocket::error),
             this, &WebSocketService::onError);
     connect(m_webSocket, &QWebSocket::textMessageReceived, this, &WebSocketService::onTextMessageReceived);
+    connect(m_webSocket, &QWebSocket::pong, this, &WebSocketService::onPong);
 
     QUrl url(m_serverUrl);
     QUrlQuery query;
@@ -47,7 +59,10 @@ void WebSocketService::connectToServer(const QString& token) {
 void WebSocketService::disconnectFromServer() {
     m_autoReconnect = false;
     m_reconnectTimer.stop();
+    m_healthTimer.stop();
     m_joinedChats.clear();
+    m_hasConnectedBefore = false;
+    setConnectionState(QStringLiteral("disconnected"));
 
     if (m_webSocket) {
         m_webSocket->close();
@@ -109,6 +124,10 @@ void WebSocketService::rejoinRooms() {
 
 void WebSocketService::onConnected() {
     qDebug() << "[WebSocketService] Connected";
+    m_hasConnectedBefore = true;
+    noteActivity();
+    m_healthTimer.start();
+    setConnectionState(QStringLiteral("connected"));
     emit connectedChanged();
     emit connected();
     rejoinRooms();
@@ -116,6 +135,8 @@ void WebSocketService::onConnected() {
 
 void WebSocketService::onDisconnected() {
     qDebug() << "[WebSocketService] Disconnected";
+    m_healthTimer.stop();
+    setConnectionState(m_autoReconnect ? nextRetryState() : QStringLiteral("disconnected"));
     emit disconnected();
     emit connectedChanged();
     if (m_autoReconnect) {
@@ -124,6 +145,8 @@ void WebSocketService::onDisconnected() {
 }
 
 void WebSocketService::onTextMessageReceived(const QString& message) {
+    noteActivity();
+
     QJsonDocument doc = QJsonDocument::fromJson(message.toUtf8());
     if (!doc.isObject()) return;
 
@@ -147,6 +170,15 @@ void WebSocketService::onTextMessageReceived(const QString& message) {
         QString userId = data[QStringLiteral("user_id")].toString();
         bool typing = data[QStringLiteral("typing")].toBool();
         emit typingIndicator(chatId, userId, typing);
+    } else if (type == QStringLiteral("read")) {
+        QString chatId = data[QStringLiteral("chat_id")].toString();
+        QString readerId = data[QStringLiteral("reader_id")].toString();
+        QString readAt = data[QStringLiteral("read_at")].toString();
+        emit messageRead(chatId, readerId, readAt);
+    } else if (type == QStringLiteral("presence")) {
+        QString userId = data[QStringLiteral("user_id")].toString();
+        bool online = data[QStringLiteral("is_online")].toBool(false);
+        emit presenceChanged(userId, online);
     } else if (type == QStringLiteral("error")) {
         emit errorOccurred(data[QStringLiteral("error")].toString());
     }
@@ -156,6 +188,13 @@ void WebSocketService::onError(QAbstractSocket::SocketError /*error*/) {
     if (m_webSocket) {
         qDebug() << "[WebSocketService] Error:" << m_webSocket->errorString();
     }
+    // A failed connection attempt (e.g. "connection refused" because the
+    // server is down) never reaches Connected, so disconnected() never
+    // fires for it - re-check here too so the UI doesn't miss the update.
+    if (m_connectionState != QStringLiteral("connected")) {
+        setConnectionState(m_autoReconnect ? nextRetryState() : QStringLiteral("disconnected"));
+    }
+    emit connectedChanged();
 }
 
 void WebSocketService::onReconnect() {
@@ -163,4 +202,38 @@ void WebSocketService::onReconnect() {
         return;
     }
     connectToServer(m_token);
+}
+
+void WebSocketService::onPong(quint64 /*elapsedTime*/, const QByteArray& /*payload*/) {
+    noteActivity();
+}
+
+void WebSocketService::checkConnectionHealth() {
+    if (!m_webSocket || m_webSocket->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+
+    qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - m_lastActivityMs > kStaleConnectionMs) {
+        // Nothing heard from the server in too long - the connection is
+        // almost certainly dead even though the OS hasn't noticed yet.
+        // Force it closed so onDisconnected() fires and reconnect kicks in.
+        qDebug() << "[WebSocketService] No activity for" << (now - m_lastActivityMs)
+                  << "ms, treating connection as dead";
+        m_webSocket->abort();
+        return;
+    }
+
+    m_webSocket->ping();
+}
+
+void WebSocketService::noteActivity() {
+    m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+}
+
+void WebSocketService::setConnectionState(const QString& state) {
+    if (m_connectionState == state) return;
+    qDebug() << "[WebSocketService] connectionState:" << m_connectionState << "->" << state;
+    m_connectionState = state;
+    emit connectionStateChanged();
 }

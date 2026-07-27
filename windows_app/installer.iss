@@ -16,6 +16,10 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequiredOverridesAllowed=dialog
+; Explicit rather than relying on the (already "shown") default - always
+; prompt for install location instead of silently using DefaultDirName.
+DisableDirPage=no
+AllowNoIcons=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -25,7 +29,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "autostart"; Description: "Start Messenger App on Windows login"; GroupDescription: "Startup settings:"
 
 [Files]
-Source: "dist\messenger_app\*"; DestDir: "{app}"; Flags: recursesubdirs
+Source: "dist\messenger_app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autodesktop}\MessengerApp"; Filename: "{app}\messenger_app.exe"; WorkingDir: "{app}"

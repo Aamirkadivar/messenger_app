@@ -4,6 +4,7 @@ import android.content.Context
 import com.messenger.app.BuildConfig
 import com.messenger.app.data.encryption.MessageEncryption
 import com.messenger.app.data.local.AuthDatabase
+import com.messenger.app.data.local.dao.CachedChatDao
 import com.messenger.app.data.local.dao.ConversationDao
 import com.messenger.app.data.local.dao.MessageDao
 import com.messenger.app.data.local.dao.UserDao
@@ -12,6 +13,9 @@ import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.data.remote.websocket.WebSocketManager
 import com.messenger.app.data.repository.AuthRepository
 import com.messenger.app.data.repository.ChatRepository
+import com.messenger.app.data.repository.GroupRepository
+import com.messenger.app.data.settings.SettingsRepository
+import com.messenger.app.data.storage.StorageAnalyzer
 import com.messenger.app.security.KeyStoreManager
 import com.messenger.app.security.KeyStoreManagerImpl
 import com.messenger.app.security.TokenManager
@@ -21,6 +25,9 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -107,6 +114,9 @@ object AppModule {
     fun provideUserDao(db: AuthDatabase): UserDao = db.userDao()
 
     @Provides
+    fun provideCachedChatDao(db: AuthDatabase): CachedChatDao = db.cachedChatDao()
+
+    @Provides
     @Singleton
     fun provideWebSocketManager(tokenManager: TokenManager): WebSocketManager =
         WebSocketManager.getInstance(
@@ -125,13 +135,46 @@ object AppModule {
         userDao: UserDao
     ): AuthRepository = AuthRepository(authApiService, tokenManager, keyStoreManager, userDao)
 
+    /**
+     * Scope for work that must outlive any one screen - notably the storage
+     * scan, which the user is allowed to walk away from mid-flight.
+     * SupervisorJob so one failed task doesn't cancel the others.
+     */
+    @Provides
+    @Singleton
+    @ApplicationScope
+    fun provideApplicationScope(): CoroutineScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    @Provides
+    @Singleton
+    fun provideSettingsRepository(@ApplicationContext context: Context): SettingsRepository =
+        SettingsRepository(context)
+
+    @Provides
+    @Singleton
+    fun provideGroupRepository(chatApiService: ChatApiService): GroupRepository =
+        GroupRepository(chatApiService)
+
+    @Provides
+    @Singleton
+    fun provideStorageAnalyzer(
+        @ApplicationContext context: Context,
+        chatRepository: ChatRepository,
+        @ApplicationScope appScope: CoroutineScope
+    ): StorageAnalyzer = StorageAnalyzer(context, chatRepository, appScope)
+
     @Provides
     @Singleton
     fun provideChatRepository(
         chatApiService: ChatApiService,
         messageDao: MessageDao,
         conversationDao: ConversationDao,
+        cachedChatDao: CachedChatDao,
         webSocketManager: WebSocketManager,
-        tokenManager: TokenManager
-    ): ChatRepository = ChatRepository(chatApiService, messageDao, conversationDao, webSocketManager, tokenManager)
+        tokenManager: TokenManager,
+        json: Json
+    ): ChatRepository = ChatRepository(
+        chatApiService, messageDao, conversationDao, cachedChatDao, webSocketManager, tokenManager, json
+    )
 }

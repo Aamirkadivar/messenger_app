@@ -9,19 +9,26 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.DarkMode
+import androidx.compose.material.icons.filled.LightMode
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.GroupAdd
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.messenger.app.ui.theme.AccentPurple
 import com.messenger.app.ui.theme.OnlineColor
+import com.messenger.app.ui.theme.ThemeState
 import com.messenger.app.ui.viewmodel.ChatListItemUi
 import com.messenger.app.ui.viewmodel.ChatViewModel
 
@@ -40,10 +47,21 @@ private fun avatarColorFor(name: String): Color {
 fun ChatListScreen(
     chatViewModel: ChatViewModel,
     onChatClick: (chatId: String, chatName: String) -> Unit,
+    onOpenSettings: () -> Unit,
+    onCreateGroup: () -> Unit,
+    onSessionExpired: () -> Unit,
     onLogout: () -> Unit
 ) {
     var showNewChat by remember { mutableStateOf(false) }
     val listState by chatViewModel.chatListState.collectAsStateWithLifecycle()
+    val sessionExpired by chatViewModel.sessionExpired.collectAsStateWithLifecycle()
+    val keyTakeover by chatViewModel.keyTakeover.collectAsStateWithLifecycle()
+
+    // The server no longer accepts our token - hand off to login instead of
+    // leaving the user on a list that can never refresh.
+    LaunchedEffect(sessionExpired) {
+        if (sessionExpired) onSessionExpired()
+    }
 
     LaunchedEffect(Unit) {
         chatViewModel.loadChats()
@@ -60,6 +78,18 @@ fun ChatListScreen(
             TopAppBar(
                 title = { Text("Chats", fontWeight = FontWeight.Bold) },
                 actions = {
+                    IconButton(onClick = { ThemeState.isDarkMode = !ThemeState.isDarkMode }) {
+                        Icon(
+                            if (ThemeState.isDarkMode) Icons.Default.LightMode else Icons.Default.DarkMode,
+                            contentDescription = if (ThemeState.isDarkMode) "Switch to light mode" else "Switch to dark mode"
+                        )
+                    }
+                    IconButton(onClick = onCreateGroup) {
+                        Icon(Icons.Outlined.GroupAdd, contentDescription = "New group")
+                    }
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Outlined.Settings, contentDescription = "Settings")
+                    }
                     IconButton(onClick = onLogout) {
                         Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Logout")
                     }
@@ -68,13 +98,17 @@ fun ChatListScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { showNewChat = true }, containerColor = AccentPurple) {
+            FloatingActionButton(onClick = { showNewChat = true }, containerColor = MaterialTheme.colorScheme.primary) {
                 Icon(Icons.Default.Add, contentDescription = "New chat", tint = Color.White)
             }
         },
         containerColor = MaterialTheme.colorScheme.background
     ) { padding ->
-        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+        if (keyTakeover) {
+            KeyTakeoverBanner(onDismiss = chatViewModel::dismissKeyTakeover)
+        }
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when {
                 listState.isLoading && listState.chats.isEmpty() -> {
                     CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
@@ -95,6 +129,7 @@ fun ChatListScreen(
                 }
             }
         }
+        }
     }
 
     if (showNewChat) {
@@ -106,6 +141,57 @@ fun ChatListScreen(
                 onChatClick(chatId, name)
             }
         )
+    }
+}
+
+/**
+ * Explains why older messages read "Encrypted message" on this device.
+ *
+ * Shown once, when signing in here replaced the account's E2EE identity key
+ * that another device had registered. Without it the user just sees every
+ * conversation turn into placeholders with no reason given.
+ */
+@Composable
+private fun KeyTakeoverBanner(onDismiss: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .semantics(mergeDescendants = true) { },
+        verticalAlignment = Alignment.Top
+    ) {
+        Icon(
+            Icons.Outlined.Info,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                "Encryption keys were reset on this device",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "This account's keys were previously set up on another device, so " +
+                    "messages sent before you signed in here can't be read. New " +
+                    "messages work normally.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+            Icon(
+                Icons.Outlined.Close,
+                contentDescription = "Dismiss",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp)
+            )
+        }
     }
 }
 
@@ -163,13 +249,13 @@ private fun ChatRow(chat: ChatListItemUi, onClick: () -> Unit) {
             Text(
                 chat.timestamp,
                 style = MaterialTheme.typography.labelSmall,
-                color = if (chat.unreadCount > 0) AccentPurple else MaterialTheme.colorScheme.onSurfaceVariant
+                color = if (chat.unreadCount > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
             )
             if (chat.unreadCount > 0) {
                 Spacer(Modifier.height(6.dp))
                 Box(
                     modifier = Modifier
-                        .background(AccentPurple, CircleShape)
+                        .background(MaterialTheme.colorScheme.primary, CircleShape)
                         .defaultMinSize(minWidth = 20.dp, minHeight = 20.dp),
                     contentAlignment = Alignment.Center
                 ) {
@@ -227,7 +313,7 @@ private fun NewChatSheet(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Box(
-                                modifier = Modifier.size(40.dp).background(AccentPurple, CircleShape),
+                                modifier = Modifier.size(40.dp).background(MaterialTheme.colorScheme.primary, CircleShape),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(displayName.take(1).uppercase(), color = Color.White, fontWeight = FontWeight.Bold)

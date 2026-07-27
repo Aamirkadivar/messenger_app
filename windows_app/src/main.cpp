@@ -20,6 +20,27 @@
 #include "services/websocketservice.h"
 #include "services/chatservice.h"
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <dwmapi.h>
+
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWCP_ROUND
+#define DWMWCP_ROUND 2
+#endif
+
+// Rounded window corners like Windows 11's native chrome (the Telegram/
+// Windows Terminal look) - a frameless window doesn't get this from DWM
+// automatically, it has to be requested explicitly per-HWND.
+static void applyRoundedCorners(QQuickWindow* window) {
+    auto hwnd = reinterpret_cast<HWND>(window->winId());
+    DWORD preference = DWMWCP_ROUND;
+    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference, sizeof(preference));
+}
+#endif
+
 int main(int argc, char* argv[]) {
     // Use the Basic style so custom background/indicator/contentItem overrides
     // throughout the QML actually apply - the native platform style silently
@@ -73,9 +94,6 @@ int main(int argc, char* argv[]) {
                          qWarning() << "[ChatService] Error:" << error;
                      });
 
-    // Restore a previously saved login, if any, now that everything above is wired up
-    authService.restoreSession();
-
     TrayNotifier trayNotifier;
 
     QQmlApplicationEngine engine;
@@ -97,6 +115,16 @@ int main(int argc, char* argv[]) {
         Qt::QueuedConnection);
     engine.load(qmlFile);
 
+    // Restore a previously saved login, if any, now that the QML UI actually
+    // exists and has connected its listeners - restoreSession() emits
+    // tokenReady synchronously, which chains into chatService.fetchChats(),
+    // which emits its cache-based chatsFetched signal immediately too. Doing
+    // this any earlier meant that emission fired before ChatList.qml's
+    // Component.onCompleted had run, so nothing was listening yet and the
+    // cached chat list was silently lost - Qt signals aren't replayed for
+    // listeners that connect after the fact.
+    authService.restoreSession();
+
     // Clicking the tray icon (or its "Open Messenger" menu item) should
     // bring the main window back to the front.
     if (!engine.rootObjects().isEmpty()) {
@@ -106,6 +134,9 @@ int main(int argc, char* argv[]) {
                 window->raise();
                 window->requestActivate();
             });
+#ifdef Q_OS_WIN
+            applyRoundedCorners(window);
+#endif
         }
     }
 

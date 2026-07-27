@@ -26,7 +26,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.messenger.app.ui.theme.AccentGreen
-import com.messenger.app.ui.theme.AccentPurple
 import com.messenger.app.ui.theme.CardShape
 import com.messenger.app.ui.viewmodel.AuthViewModel
 
@@ -118,7 +117,7 @@ fun LoginScreen(
                 modifier = Modifier.padding(28.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                AuthIcon(Icons.AutoMirrored.Filled.Chat, AccentPurple)
+                AuthIcon(Icons.AutoMirrored.Filled.Chat, MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.height(16.dp))
                 Text("Welcome Back", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(4.dp))
@@ -134,10 +133,10 @@ fun LoginScreen(
                     onValueChange = viewModel::setLoginEmail,
                     label = { Text("Email") },
                     singleLine = true,
-                    leadingIcon = { Icon(Icons.Default.Email, contentDescription = null, tint = AccentPurple) },
+                    leadingIcon = { Icon(Icons.Default.Email, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next),
                     shape = CardShape,
-                    colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = AccentPurple, focusedLabelColor = AccentPurple),
+                    colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = MaterialTheme.colorScheme.primary, focusedLabelColor = MaterialTheme.colorScheme.primary),
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(12.dp))
@@ -145,7 +144,7 @@ fun LoginScreen(
                     value = state.password,
                     onValueChange = viewModel::setLoginPassword,
                     label = "Password",
-                    accent = AccentPurple,
+                    accent = MaterialTheme.colorScheme.primary,
                     keyboardActions = KeyboardActions(onDone = {
                         keyboard?.hide()
                         viewModel.login()
@@ -166,7 +165,7 @@ fun LoginScreen(
                     onClick = { keyboard?.hide(); viewModel.login() },
                     enabled = !state.isLoading && state.email.isNotBlank() && state.password.isNotBlank(),
                     shape = CardShape,
-                    colors = ButtonDefaults.buttonColors(containerColor = AccentPurple),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                     modifier = Modifier.fillMaxWidth().height(48.dp)
                 ) {
                     if (state.isLoading) {
@@ -187,7 +186,7 @@ fun LoginScreen(
                 Row(horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
                     Text("Don't have an account? ", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     TextButton(onClick = onNavigateToRegister) {
-                        Text("Sign Up", fontWeight = FontWeight.Bold, color = AccentPurple)
+                        Text("Sign Up", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
                     }
                 }
             }

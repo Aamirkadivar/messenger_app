@@ -293,6 +293,7 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 		FileType    *string    `json:"file_type,omitempty"`
 		Type        string     `json:"type"`
 		DeliveredAt *time.Time `json:"delivered_at"`
+		ReadAt      *time.Time `json:"read_at"`
 		CreatedAt   time.Time  `json:"created_at"`
 		UpdatedAt   time.Time  `json:"updated_at"`
 	}
@@ -336,6 +337,7 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 			FileType:    &m.ContentType,
 			Type:        m.ChatType,
 			DeliveredAt: m.DeliveredAt,
+			ReadAt:      m.ReadAt,
 			CreatedAt:   m.CreatedAt,
 			UpdatedAt:   m.UpdatedAt,
 		}
@@ -415,10 +417,11 @@ func (s *MessageService) MarkAsRead(c *fiber.Ctx) error {
 	// anywhere in this codebase - delivery tracking isn't implemented - so
 	// requiring it here as a earlier version of this handler did meant this
 	// UPDATE could never match any row.)
+	readAt := time.Now()
 	result := database.DB.Model(&models.Message{}).
 		Where("chat_id = ? AND sender_id != ? AND read_at IS NULL",
 			chatIDParsed.String(), userID).
-		Update("read_at", time.Now())
+		Update("read_at", readAt)
 
 	if result.Error != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
@@ -430,7 +433,28 @@ func (s *MessageService) MarkAsRead(c *fiber.Ctx) error {
 	// Update last read timestamp for the chat-participant relationship
 	database.DB.Model(&models.ChatParticipant{}).
 		Where("chat_id = ? AND user_id = ?", chatIDParsed.String(), userID).
-		Update("last_read_at", time.Now())
+		Update("last_read_at", readAt)
+
+	// Notify whoever's messages just got read, in real time, so their "seen"
+	// indicator updates without waiting for them to reopen the chat.
+	if result.RowsAffected > 0 && s.hub != nil {
+		var chat models.Chat
+		database.DB.First(&chat, chatIDParsed)
+
+		wsMsg := models.WebSocketMessage{
+			Type: "read",
+			Data: map[string]interface{}{
+				"chat_id":   chatIDParsed.String(),
+				"chat_type": chat.Type,
+				"reader_id": userID.String(),
+				"read_at":   readAt,
+			},
+			Timestamp: time.Now(),
+		}
+		if wsData, err := json.Marshal(wsMsg); err == nil {
+			s.hub.Broadcast <- wsData
+		}
+	}
 
 	return c.JSON(fiber.Map{
 		"message": "Messages marked as read",
@@ -533,20 +557,6 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 		participantsByChat[p.ChatID] = append(participantsByChat[p.ChatID], p)
 	}
 
-	// Fetch user presence info
-	var presences []models.Presence
-	userIDs := make([]uuid.UUID, 0)
-	for _, p := range allParticipants {
-		userIDs = append(userIDs, p.UserID)
-	}
-	if len(userIDs) > 0 {
-		database.DB.Find(&presences, "user_id IN ?", userIDs)
-	}
-	presenceMap := make(map[uuid.UUID]bool)
-	for _, pr := range presences {
-		presenceMap[pr.UserID] = pr.IsOnline
-	}
-
 	// Fetch last messages for each chat
 	var messages []models.Message
 	database.DB.Where("chat_id IN ? AND deleted_at IS NULL", chatIDs).
@@ -606,7 +616,7 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 			var user models.User
 			if err := database.DB.First(&user, uid).Error; err == nil {
 				item.OtherUser = &user
-				item.IsOnline = presenceMap[uid]
+				item.IsOnline = user.IsOnline
 				if ch.Type == "direct" {
 					break
 				}

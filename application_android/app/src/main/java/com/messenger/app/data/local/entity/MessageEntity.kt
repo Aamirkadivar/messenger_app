@@ -35,5 +35,6 @@ data class MessageEntity(
     val replyTo: String? = null,
     val mentions: String? = null, // JSON serialized
     val attachments: String? = null, // JSON serialized
-    val isEncrypted: Boolean = false
+    val isEncrypted: Boolean = false,
+    val readAt: String? = null
 )

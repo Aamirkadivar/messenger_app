@@ -11,6 +11,9 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
@@ -24,49 +27,55 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 
 // ==================== Color Palette ====================
-// Matches the Windows desktop app's design language: purple accent on a dark navy surface.
+// Matches the Windows desktop app's luxury design language: warm ivory/cream
+// in light mode, near-black in dark mode, and a champagne-gold accent
+// (deepened to bronze-gold in light mode for contrast on a pale background)
+// in place of the old flat purple.
 
-val AccentPurple = Color(0xFF6C63FF)
-val AccentPurpleLight = Color(0xFF8B84FF)
-val AccentPurpleDark = Color(0xFF5B52E5)
+val AccentGoldDark = Color(0xFFC9A961)
+val AccentGoldLight = Color(0xFFA6803A)
+val AccentGoldDarkPressed = Color(0xFFA6863F)
+val AccentGoldLightPressed = Color(0xFF8A6A2E)
 val AccentGreen = Color(0xFF4CAF50)
 
 // Light theme
-val LightPrimary = AccentPurple
+val LightPrimary = AccentGoldLight
 val LightOnPrimary = Color(0xFFFFFFFF)
 val LightSecondary = AccentGreen
 val LightSurface = Color(0xFFFFFFFF)
-val LightSurfaceVariant = Color(0xFFF5F5F7)
-val LightBackground = Color(0xFFF5F5F7)
-val LightOnBackground = Color(0xFF1A1A2E)
-val LightOnSurfaceVariant = Color(0xFF6B6B7B)
-val LightBorder = Color(0xFFE0E0E5)
+val LightSurfaceVariant = Color(0xFFF1EBDD)
+val LightBackground = Color(0xFFFAF6EE)
+val LightOnBackground = Color(0xFF2B2418)
+val LightOnSurfaceVariant = Color(0xFF7A6F5C)
+val LightBorder = Color(0xFFE6DFD0)
 val LightError = Color(0xFFFF6B6B)
 
 // Dark theme
-val DarkPrimary = AccentPurple
+val DarkPrimary = AccentGoldDark
 val DarkOnPrimary = Color(0xFFFFFFFF)
 val DarkSecondary = AccentGreen
-val DarkSurface = Color(0xFF1B1B36)
-val DarkSurfaceVariant = Color(0xFF22224A)
-val DarkBackground = Color(0xFF15152B)
-val DarkOnBackground = Color(0xFFEDEDF2)
-val DarkOnSurfaceVariant = Color(0xFF9494AC)
+val DarkSurface = Color(0xFF14141F)
+val DarkSurfaceVariant = Color(0xFF1E1E2C)
+val DarkBackground = Color(0xFF0A0A0F)
+val DarkOnBackground = Color(0xFFF0EAD6)
+val DarkOnSurfaceVariant = Color(0xFFA39A8A)
 val DarkBorder = Color(0x14FFFFFF)
 val DarkError = Color(0xFFFF6B6B)
 
-// Message bubbles
-val SentBubbleLight = AccentPurple
+// Message bubbles - deep bronze-gold, deliberately darker than the accent
+// above so white bubble text stays readable on top of it.
+val SentBubbleLight = AccentGoldLight
 val SentBubbleTextLight = Color(0xFFFFFFFF)
-val ReceivedBubbleLight = Color(0xFFEDEDF2)
-val ReceivedBubbleTextLight = Color(0xFF1A1A2E)
+val ReceivedBubbleLight = Color(0xFFF1EBDD)
+val ReceivedBubbleTextLight = Color(0xFF2B2418)
 
-val SentBubbleDark = AccentPurple
+val SentBubbleDark = Color(0xFF7A5C22)
 val SentBubbleTextDark = Color(0xFFFFFFFF)
-val ReceivedBubbleDark = Color(0xFF26264A)
-val ReceivedBubbleTextDark = Color(0xFFEDEDF2)
+val ReceivedBubbleDark = Color(0xFF1C1C2A)
+val ReceivedBubbleTextDark = Color(0xFFF0EAD6)
 
-// Status colors
+// Status colors - left alone: online/offline is a functional signal, not a
+// decorative one, so it stays legible rather than following the brand accent.
 val OnlineColor = AccentGreen
 val OfflineColor = Color(0xFF9E9E9E)
 
@@ -162,9 +171,17 @@ val ButtonShape = RoundedCornerShape(13.dp)
 
 // ==================== App Theme ====================
 
+/**
+ * Session-only theme toggle (matches the Windows app's own toggle, which
+ * also doesn't persist across restarts - both default to dark).
+ */
+object ThemeState {
+    var isDarkMode by mutableStateOf(true)
+}
+
 @Composable
 fun MessengerTheme(
-    darkTheme: Boolean = true,
+    darkTheme: Boolean = ThemeState.isDarkMode,
     dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
@@ -198,7 +215,7 @@ fun MessengerTheme(
  * Reads the current dark/light state so callers don't need to branch themselves.
  */
 object MessengerExtendedColors {
-    private val isDark: Boolean
+    val isDark: Boolean
         @Composable get() = MaterialTheme.colorScheme.background.luminance() < 0.5f
 
     val sentBubble @Composable get() = if (isDark) SentBubbleDark else SentBubbleLight

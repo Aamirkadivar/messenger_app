@@ -33,6 +33,21 @@ data class IncomingTyping(
     val isTyping: Boolean
 )
 
+// Pushed when the other participant marks a chat's messages as read - lets us
+// flip our sent messages' checkmarks to "seen" in real time.
+data class IncomingReadReceipt(
+    val chatId: String,
+    val readerId: String,
+    val readAt: String
+)
+
+// Pushed whenever any user connects/disconnects - not scoped to a chat room,
+// since the user could appear in several of our conversations at once.
+data class IncomingPresence(
+    val userId: String,
+    val isOnline: Boolean
+)
+
 class WebSocketManager private constructor(
     private val serverUrl: String,
     private val tokenProvider: () -> String?
@@ -75,6 +90,12 @@ class WebSocketManager private constructor(
 
     private val _typingUpdates = MutableSharedFlow<IncomingTyping>(replay = 0, extraBufferCapacity = 16)
     val typingUpdates: SharedFlow<IncomingTyping> = _typingUpdates.asSharedFlow()
+
+    private val _readReceipts = MutableSharedFlow<IncomingReadReceipt>(replay = 0, extraBufferCapacity = 16)
+    val readReceipts: SharedFlow<IncomingReadReceipt> = _readReceipts.asSharedFlow()
+
+    private val _presenceUpdates = MutableSharedFlow<IncomingPresence>(replay = 0, extraBufferCapacity = 16)
+    val presenceUpdates: SharedFlow<IncomingPresence> = _presenceUpdates.asSharedFlow()
 
     fun connect() {
         if (isConnected || isConnecting) {
@@ -220,6 +241,23 @@ class WebSocketManager private constructor(
                         isTyping = data.optBoolean("typing", false)
                     )
                     CoroutineScope(Dispatchers.Main).launch { _typingUpdates.emit(typing) }
+                }
+                "read" -> {
+                    val data = obj.optJSONObject("data") ?: return
+                    val receipt = IncomingReadReceipt(
+                        chatId = data.optString("chat_id"),
+                        readerId = data.optString("reader_id"),
+                        readAt = data.optString("read_at")
+                    )
+                    CoroutineScope(Dispatchers.Main).launch { _readReceipts.emit(receipt) }
+                }
+                "presence" -> {
+                    val data = obj.optJSONObject("data") ?: return
+                    val presence = IncomingPresence(
+                        userId = data.optString("user_id"),
+                        isOnline = data.optBoolean("is_online", false)
+                    )
+                    CoroutineScope(Dispatchers.Main).launch { _presenceUpdates.emit(presence) }
                 }
                 "error" -> {
                     val data = obj.optJSONObject("data")

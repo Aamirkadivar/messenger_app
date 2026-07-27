@@ -4,8 +4,10 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.messenger.app.data.model.ChatListItemDto
+import com.messenger.app.data.model.MessageDto
 import com.messenger.app.data.model.UserSearchResult
 import com.messenger.app.data.repository.ChatRepository
+import com.messenger.app.data.repository.SessionExpiredException
 import com.messenger.app.security.TokenManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,7 +31,8 @@ data class ChatMessageUi(
     val senderName: String,
     val content: String,
     val timestamp: Long,
-    val isMine: Boolean
+    val isMine: Boolean,
+    val isRead: Boolean = false
 )
 
 data class ChatUiState(
@@ -49,10 +52,12 @@ data class UserSearchUiState(
 data class ChatListItemUi(
     val id: String,
     val name: String,
+    val otherUserId: String,
     val lastMessage: String,
     val timestamp: String,
     val unreadCount: Long,
-    val isOnline: Boolean
+    val isOnline: Boolean,
+    val isGroup: Boolean = false
 )
 
 data class ChatListUiState(
@@ -91,9 +96,46 @@ class ChatViewModel @Inject constructor(
     private val _chatListState = MutableStateFlow(ChatListUiState())
     val chatListState: StateFlow<ChatListUiState> = _chatListState.asStateFlow()
 
+    /**
+     * Set when the server rejects our token. The chat list observes this and
+     * sends the user to login rather than sitting on a list that can never
+     * refresh - previously an expired session just showed stale cached chats
+     * forever with no way back to the login screen.
+     */
+    private val _sessionExpired = MutableStateFlow(false)
+    val sessionExpired: StateFlow<Boolean> = _sessionExpired.asStateFlow()
+
+    /**
+     * True when this device took over the account's E2EE identity key from
+     * another device, so messages predating this sign-in can't be decrypted
+     * here. Surfaced so the user gets an explanation rather than a list of
+     * "Encrypted message" placeholders.
+     */
+    private val _keyTakeover = MutableStateFlow(false)
+    val keyTakeover: StateFlow<Boolean> = _keyTakeover.asStateFlow()
+
+    fun dismissKeyTakeover() { _keyTakeover.value = false }
+
     fun loadChats() {
         viewModelScope.launch {
             _chatListState.update { it.copy(isLoading = true, error = null) }
+
+            // Show cached chats immediately (works offline too), then refresh
+            // from the network below - mirrors the windows_app cache-first
+            // pattern so a cold start with no connectivity still shows something.
+            val cached = chatRepository.loadCachedChats()
+            if (cached.isNotEmpty()) {
+                val cachedUiChats = cached.map { dto ->
+                    val preview = chatRepository.decryptFor(
+                        dto.id,
+                        dto.lastMessage?.content ?: "",
+                        dto.lastMessage?.encrypted ?: false
+                    )
+                    toChatListItemUi(dto, preview)
+                }
+                _chatListState.update { it.copy(chats = cachedUiChats) }
+            }
+
             val token = tokenManager.getAccessToken().getOrNull()
             if (token.isNullOrEmpty()) {
                 _chatListState.update { it.copy(isLoading = false, error = "Not signed in") }
@@ -101,7 +143,11 @@ class ChatViewModel @Inject constructor(
             }
             // Make sure our public key is published and our private key cached
             // before we try to decrypt any message previews.
-            chatRepository.ensureKeysPublished(token)
+            chatRepository.ensureKeysPublished(token).onSuccess { status ->
+                if (status is ChatRepository.KeyStatus.ReplacedAnotherDevicesKey) {
+                    _keyTakeover.value = true
+                }
+            }
             chatRepository.getChats(token)
                 .onSuccess { chats ->
                     val uiChats = chats.map { dto ->
@@ -121,23 +167,39 @@ class ChatViewModel @Inject constructor(
                 }
                 .onFailure { e ->
                     Log.e(TAG, "getChats failed", e)
+                    if (e is SessionExpiredException) {
+                        _sessionExpired.value = true
+                    }
                     _chatListState.update { it.copy(isLoading = false, error = e.message ?: "Failed to load chats") }
                 }
         }
     }
 
     private fun toChatListItemUi(dto: ChatListItemDto, lastMessage: String): ChatListItemUi {
-        val name = dto.otherUser?.displayName?.takeIf { it.isNotBlank() }
-            ?: dto.otherUser?.username
-            ?: dto.name.takeIf { it.isNotBlank() }
-            ?: "Unknown"
+        // A group is named by the group, not by whichever member the server
+        // happened to put in other_user - for group chats the backend fills that
+        // field with an arbitrary participant, so preferring it here labelled
+        // groups with a random member's name.
+        val isGroup = dto.type.equals("group", ignoreCase = true)
+        val name = if (isGroup) {
+            dto.name.takeIf { it.isNotBlank() } ?: "Group"
+        } else {
+            dto.otherUser?.displayName?.takeIf { it.isNotBlank() }
+                ?: dto.otherUser?.username
+                ?: dto.name.takeIf { it.isNotBlank() }
+                ?: "Unknown"
+        }
         return ChatListItemUi(
             id = dto.id,
             name = name,
+            otherUserId = dto.otherUser?.id ?: dto.otherUserId ?: "",
             lastMessage = lastMessage,
             timestamp = formatChatTimestamp(dto.lastMessageAt ?: dto.updatedAt),
             unreadCount = dto.unreadCount,
-            isOnline = dto.otherUser?.isOnline ?: dto.isOnline
+            // A group has no presence of its own; showing other_user's dot would
+            // report one arbitrary member as "the group being online".
+            isOnline = if (isGroup) false else (dto.otherUser?.isOnline ?: dto.isOnline),
+            isGroup = isGroup
         )
     }
 
@@ -198,39 +260,74 @@ class ChatViewModel @Inject constructor(
                 }
             }
             .launchIn(viewModelScope)
+
+        // Live "seen" updates: when the other participant reads this chat while
+        // we have it open, flip every message we sent over to the seen state.
+        chatRepository.readReceipts
+            .onEach { receipt ->
+                val myId = resolveCurrentUserId()
+                if (receipt.readerId == myId) return@onEach
+                val state = _chatState.value
+                if (receipt.chatId != state.chatId) return@onEach
+                _chatState.update {
+                    it.copy(messages = it.messages.map { m -> if (m.isMine) m.copy(isRead = true) else m })
+                }
+            }
+            .launchIn(viewModelScope)
+
+        // Live online/offline dot - without this it only ever reflected reality
+        // after the next full chat-list reload.
+        chatRepository.presenceUpdates
+            .onEach { presence ->
+                _chatListState.update { listState ->
+                    val idx = listState.chats.indexOfFirst { it.otherUserId == presence.userId }
+                    if (idx == -1) return@update listState
+                    val updated = listState.chats.toMutableList()
+                    updated[idx] = updated[idx].copy(isOnline = presence.isOnline)
+                    listState.copy(chats = updated)
+                }
+            }
+            .launchIn(viewModelScope)
     }
 
     fun openChat(chatId: String, chatName: String) {
-        val previousChatId = _chatState.value.chatId
-        if (!previousChatId.isNullOrEmpty() && previousChatId != chatId) {
-            chatRepository.leaveChatRoom(previousChatId)
-        }
+        // Deliberately not leaving the previous chat's room here: loadChats()
+        // joins every known chat's room up front precisely so notifications and
+        // live badge/preview updates keep arriving for chats that aren't the
+        // one currently open. Leaving on switch would undo that the moment you
+        // navigate away from a chat.
         _chatState.update { ChatUiState(chatId = chatId, chatName = chatName) }
         chatRepository.joinChatRoom(chatId)
 
         viewModelScope.launch {
+            val myId = resolveCurrentUserId()
+
+            // Show cached history immediately (works offline too), then refresh
+            // from the network below - mirrors the windows_app cache-first
+            // pattern for message history.
+            val cachedMessages = chatRepository.loadCachedMessages(chatId)
+            if (cachedMessages.isNotEmpty()) {
+                val cachedHistory = cachedMessages.asReversed().map { dto ->
+                    toChatMessageUi(chatId, dto, myId)
+                }
+                if (_chatState.value.chatId == chatId) {
+                    _chatState.update { it.copy(messages = cachedHistory) }
+                }
+            }
+
             val token = tokenManager.getAccessToken().getOrNull()
             if (token.isNullOrEmpty()) {
                 _chatState.update { it.copy(error = "Not signed in") }
                 return@launch
             }
-            val myId = resolveCurrentUserId()
 
             chatRepository.getMessages(token, chatId)
                 .onSuccess { response ->
                     // Server returns newest-first; reverse so oldest is first for display
-                    val history = response.data.asReversed().map { dto ->
-                        ChatMessageUi(
-                            id = dto.id,
-                            senderId = dto.senderId,
-                            senderName = dto.sender?.displayName?.takeIf { it.isNotBlank() }
-                                ?: dto.sender?.username ?: "",
-                            content = chatRepository.decryptFor(chatId, dto.content, dto.encrypted),
-                            timestamp = System.currentTimeMillis(),
-                            isMine = dto.senderId == myId
-                        )
+                    val history = response.data.asReversed().map { dto -> toChatMessageUi(chatId, dto, myId) }
+                    if (_chatState.value.chatId == chatId) {
+                        _chatState.update { it.copy(messages = history) }
                     }
-                    _chatState.update { it.copy(messages = history) }
                 }
                 .onFailure { e ->
                     Log.e(TAG, "getMessages failed", e)
@@ -240,6 +337,28 @@ class ChatViewModel @Inject constructor(
             chatRepository.markAsRead(token, chatId)
         }
     }
+
+    private suspend fun toChatMessageUi(chatId: String, dto: MessageDto, myId: String): ChatMessageUi {
+        val isMine = dto.senderId == myId
+        return ChatMessageUi(
+            id = dto.id,
+            senderId = dto.senderId,
+            senderName = dto.sender?.displayName?.takeIf { it.isNotBlank() }
+                ?: dto.sender?.username ?: "",
+            content = chatRepository.decryptFor(chatId, dto.content, dto.encrypted),
+            timestamp = parseMessageTimestamp(dto.createdAt),
+            isMine = isMine,
+            isRead = isMine && !dto.readAt.isNullOrEmpty()
+        )
+    }
+
+    private fun parseMessageTimestamp(iso: String?): Long =
+        try {
+            if (iso.isNullOrBlank()) System.currentTimeMillis()
+            else OffsetDateTime.parse(iso).toInstant().toEpochMilli()
+        } catch (e: Exception) {
+            System.currentTimeMillis()
+        }
 
     /**
      * Start (or resume) a direct chat with another user.

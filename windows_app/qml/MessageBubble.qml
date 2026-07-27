@@ -7,6 +7,7 @@ Item {
     property string messageText: ""
     property string messageTime: ""
     property bool isMine: true
+    property bool isRead: false
     property string senderName: ""
     property bool isEncrypted: true
     property bool showSender: false
@@ -69,19 +70,24 @@ Item {
                 topPadding: 2
 
                 Text {
+                    anchors.verticalCenter: parent.verticalCenter
                     text: bubbleRoot.messageTime
                     font.pixelSize: 11
-                    color: isMine ? "rgba(255,255,255,0.65)" : (darkMode ? "#8B8B9E" : "#6B6B7B")
+                    color: isMine ? Qt.rgba(1, 1, 1, 0.65) : (darkMode ? "#8B8B9E" : "#6B6B7B")
                 }
 
                 Canvas {
+                    id: checkmarkCanvas
+                    anchors.verticalCenter: parent.verticalCenter
                     width: 14
                     height: 10
                     visible: bubbleRoot.isMine
                     onPaint: {
                         var ctx = getContext("2d")
                         ctx.reset()
-                        ctx.strokeStyle = "rgba(255,255,255,0.75)"
+                        // Grey = sent but not yet seen; gold = the other
+                        // person has read it (matches the accent in both themes).
+                        ctx.strokeStyle = bubbleRoot.isRead ? (darkMode ? "#C9A961" : "#A6803A") : "rgba(255,255,255,0.75)"
                         ctx.lineWidth = 1.4
                         ctx.lineCap = "round"
                         ctx.lineJoin = "round"
@@ -91,6 +97,11 @@ Item {
                         ctx.beginPath()
                         ctx.moveTo(5, 5); ctx.lineTo(8, 8); ctx.lineTo(14, 1)
                         ctx.stroke()
+                    }
+
+                    Connections {
+                        target: bubbleRoot
+                        function onIsReadChanged() { checkmarkCanvas.requestPaint() }
                     }
                 }
             }

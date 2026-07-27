@@ -11,6 +11,8 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Done
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -20,9 +22,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.messenger.app.ui.theme.AccentPurple
+import com.messenger.app.ui.components.ChatBackground
 import com.messenger.app.ui.theme.ChatBubbleShapeReceived
 import com.messenger.app.ui.theme.ChatBubbleShapeSent
+import com.messenger.app.ui.theme.MessengerExtendedColors
 import com.messenger.app.ui.viewmodel.ChatMessageUi
 import com.messenger.app.ui.viewmodel.ChatViewModel
 import java.text.SimpleDateFormat
@@ -60,7 +63,7 @@ fun ChatScreen(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
-                            modifier = Modifier.size(36.dp).background(AccentPurple, CircleShape),
+                            modifier = Modifier.size(36.dp).background(MaterialTheme.colorScheme.primary, CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
                             Text(chatName.take(1).uppercase(), color = Color.White, fontWeight = FontWeight.Bold)
@@ -86,14 +89,17 @@ fun ChatScreen(
             )
         }
     ) { padding ->
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize().padding(padding),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            items(state.messages, key = { it.id }) { message ->
-                MessageBubble(message)
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+            ChatBackground(modifier = Modifier.fillMaxSize())
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items(state.messages, key = { it.id }) { message ->
+                    MessageBubble(message)
+                }
             }
         }
     }
@@ -110,20 +116,31 @@ private fun MessageBubble(message: ChatMessageUi) {
             modifier = Modifier
                 .widthIn(max = 280.dp)
                 .clip(if (message.isMine) ChatBubbleShapeSent else ChatBubbleShapeReceived)
-                .background(if (message.isMine) AccentPurple else MaterialTheme.colorScheme.surfaceVariant)
+                .background(if (message.isMine) MessengerExtendedColors.sentBubble else MessengerExtendedColors.receivedBubble)
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             Text(
                 message.content,
-                color = if (message.isMine) Color.White else MaterialTheme.colorScheme.onSurface,
+                color = if (message.isMine) Color.White else MessengerExtendedColors.receivedBubbleText,
                 style = MaterialTheme.typography.bodyLarge
             )
             Spacer(Modifier.height(2.dp))
-            Text(
-                timeFormat.format(message.timestamp),
-                style = MaterialTheme.typography.labelSmall,
-                color = if (message.isMine) Color.White.copy(alpha = 0.7f) else MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    timeFormat.format(message.timestamp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (message.isMine) Color.White.copy(alpha = 0.7f) else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (message.isMine) {
+                    Spacer(Modifier.width(4.dp))
+                    Icon(
+                        imageVector = if (message.isRead) Icons.Filled.DoneAll else Icons.Filled.Done,
+                        contentDescription = if (message.isRead) "Seen" else "Sent",
+                        tint = if (message.isRead) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.7f),
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
         }
     }
 }
@@ -151,7 +168,7 @@ private fun MessageInputBar(
             FilledIconButton(
                 onClick = onSend,
                 enabled = value.isNotBlank(),
-                colors = IconButtonDefaults.filledIconButtonColors(containerColor = AccentPurple),
+                colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.primary),
                 modifier = Modifier.size(48.dp)
             ) {
                 Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", tint = Color.White)

@@ -44,6 +44,12 @@ logs/
 firebase-debug.log
 firebase-debug.%.log
 
+# Android release signing (never commit - losing this keystore means you can
+# never publish an update under the same app identity)
+*.jks
+*.keystore
+keystore.properties
+
 # Crypto keys and sensitive data
 *.pem
 *.key

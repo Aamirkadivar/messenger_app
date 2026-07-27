@@ -14,6 +14,7 @@ ChatService::ChatService(AuthService* authService, QObject* parent)
     , m_authService(authService)
 {
     setupNetworkManager();
+    m_messageCache = new MessageCache(this);
 }
 
 ChatService::~ChatService() {
@@ -41,6 +42,18 @@ QString ChatService::buildAuthHeader() const {
 void ChatService::fetchChats() {
     if (m_isLoading) return;
 
+    // Show the cached chat list immediately - without this, an unreachable
+    // backend at launch wiped the sidebar to empty before the user could
+    // ever get into a chat to see ITS cached messages either.
+    const QList<QJsonObject> cachedChats = m_messageCache->loadChats();
+    if (!cachedChats.isEmpty()) {
+        QVariantList cachedResult;
+        for (const QJsonObject& obj : cachedChats) {
+            cachedResult.append(parseChatItem(obj));
+        }
+        emit chatsFetched(cachedResult);
+    }
+
     m_isLoading = true;
     emit isLoadingChanged();
 
@@ -63,10 +76,17 @@ void ChatService::fetchChats() {
     m_currentReply = m_networkManager->get(request);
 }
 
-void ChatService::onChatsReplyFinished() {
-    if (m_currentReply == nullptr) return;
+void ChatService::onChatsReplyFinished(QNetworkReply* reply) {
+    // QNetworkAccessManager::finished fires for *every* request made through
+    // m_networkManager (fetchMessages, sendMessage, markAsRead, etc. all
+    // share it) - not just fetchChats. Without this check, an unrelated
+    // request completing mid-flight would get read here as if it were the
+    // chats response (and the real chats reply, when it later finishes,
+    // would find m_currentReply already cleared). Each of those other
+    // requests already manages its own reply's deleteLater() independently,
+    // so simply ignoring anything that isn't ours is enough.
+    if (reply != m_currentReply) return;
 
-    auto reply = m_currentReply;
     m_currentReply = nullptr;
     m_isLoading = false;
     emit isLoadingChanged();
@@ -108,10 +128,15 @@ void ChatService::onChatsReplyFinished() {
     QJsonArray chatsArray = dataVal.toArray();
 
     QVariantList result;
+    QList<QJsonObject> toCache;
     for (const QJsonValue& val : chatsArray) {
         if (!val.isObject()) continue;
-        result.append(parseChatItem(val.toObject()));
+        QJsonObject obj = val.toObject();
+        result.append(parseChatItem(obj));
+        toCache.append(obj);
     }
+
+    m_messageCache->saveChats(toCache);
 
     qDebug() << "[ChatService] Fetched" << result.size() << "chats";
     emit chatsFetched(result);
@@ -222,6 +247,24 @@ void ChatService::startDirectChat(const QString& userId, const QString& userName
 }
 
 void ChatService::fetchMessages(const QString& chatId) {
+    // Show cached history immediately - works offline, and avoids a blank
+    // chat while waiting on the network even when we're online.
+    const QList<MessageCache::Entry> cached = m_messageCache->loadMessages(chatId);
+    if (!cached.isEmpty()) {
+        QVariantList cachedResult;
+        for (const auto& e : cached) {
+            QVariantMap item;
+            item["id"] = e.id;
+            item["senderId"] = e.senderId;
+            item["senderName"] = e.senderName;
+            item["content"] = decryptMessage(chatId, e.content, e.encrypted);
+            item["createdAt"] = e.createdAt;
+            item["readAt"] = e.readAt;
+            cachedResult.append(item);
+        }
+        emit messagesFetched(chatId, cachedResult);
+    }
+
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit messageError("Not authenticated. Please login first.");
@@ -257,21 +300,41 @@ void ChatService::fetchMessages(const QString& chatId) {
         // Server returns newest-first; reverse so oldest is first for display
         QJsonArray messagesArray = root["data"].toArray();
         QVariantList result;
+        QList<MessageCache::Entry> toCache;
         for (int i = messagesArray.size() - 1; i >= 0; --i) {
             if (!messagesArray[i].isObject()) continue;
             QJsonObject m = messagesArray[i].toObject();
             QJsonObject sender = m["sender"].toObject();
 
+            QString senderName = sender["display_name"].toString().isEmpty()
+                                      ? sender["username"].toString()
+                                      : sender["display_name"].toString();
+            QString rawContent = m["content"].toString();
+            bool encrypted = m["encrypted"].toBool(false);
+            QString readAt = m["read_at"].isString() ? m["read_at"].toString() : QString();
+            QString createdAt = m["created_at"].toString();
+
             QVariantMap item;
             item["id"] = m["id"].toString();
             item["senderId"] = m["sender_id"].toString();
-            item["senderName"] = sender["display_name"].toString().isEmpty()
-                                      ? sender["username"].toString()
-                                      : sender["display_name"].toString();
-            item["content"] = decryptMessage(chatId, m["content"].toString(), m["encrypted"].toBool(false));
-            item["createdAt"] = m["created_at"].toString();
+            item["senderName"] = senderName;
+            item["content"] = decryptMessage(chatId, rawContent, encrypted);
+            item["createdAt"] = createdAt;
+            item["readAt"] = readAt;
             result.append(item);
+
+            MessageCache::Entry cacheEntry;
+            cacheEntry.id = m["id"].toString();
+            cacheEntry.senderId = m["sender_id"].toString();
+            cacheEntry.senderName = senderName;
+            cacheEntry.content = rawContent;
+            cacheEntry.encrypted = encrypted;
+            cacheEntry.readAt = readAt;
+            cacheEntry.createdAt = createdAt;
+            toCache.append(cacheEntry);
         }
+
+        m_messageCache->saveMessages(chatId, toCache);
 
         emit messagesFetched(chatId, result);
     });

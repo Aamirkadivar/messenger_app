@@ -14,20 +14,37 @@ ApplicationWindow {
     visibility: "Maximized"
 
     property bool darkMode: true
-    property string accentColor: "#6C63FF"
+    // Briefly true right when the theme flips, so every hover Behavior on
+    // color across the app can skip its transition for that one change -
+    // otherwise a hovered element animates through the full dark<->light
+    // jump instead of just snapping, which reads as a jarring flash.
+    property bool instantTheme: false
+    // Both themes share one luxury palette now: warm ivory/cream in light
+    // mode, near-black in dark mode, and the same champagne-gold family as
+    // the accent (deepened to a bronze-gold in light mode for contrast on a
+    // pale background) instead of the old flat purple.
+    property string accentColor: darkMode ? "#C9A961" : "#A6803A"
     property bool isLoggedIn: authService.isLoggedIn
 
     // Colors
-    property color bgColor: darkMode ? "#15152B" : "#F5F5F7"
-    property color surfaceColor: darkMode ? "#1B1B36" : "#FFFFFF"
-    property color surfaceColorHover: darkMode ? "#22224A" : "#F0F0F2"
-    property color primaryColor: "#6C63FF"
-    property color primaryColorDark: "#5A52D5"
-    property color textColor: darkMode ? "#EDEDF2" : "#1A1A2E"
-    property color textSecondary: darkMode ? "#9494AC" : "#6B6B7B"
-    property color borderColor: darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E0E0E5"
+    property color bgColor: darkMode ? "#0A0A0F" : "#FAF6EE"
+    property color surfaceColor: darkMode ? "#14141F" : "#FFFFFF"
+    // A translucent tint rather than a flat hex: a fixed light hex like
+    // #F0F0F2 sits only a few RGB units from bgColor/surfaceColor, so the
+    // hover highlight was nearly invisible. A tint reliably darkens whatever
+    // it's layered over instead - warm-toned to match the rest of the palette.
+    property color surfaceColorHover: darkMode ? "#1E1E2C" : Qt.rgba(43/255, 36/255, 24/255, 0.06)
+    property color primaryColor: darkMode ? "#C9A961" : "#A6803A"
+    property color primaryColorDark: darkMode ? "#A6863F" : "#8A6A2E"
+    property color textColor: darkMode ? "#F0EAD6" : "#2B2418"
+    property color textSecondary: darkMode ? "#A39A8A" : "#7A6F5C"
+    property color borderColor: darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0"
     property color onlineColor: "#4CAF50"
     property color offlineColor: "#9E9E9E"
+    // Deep bronze-gold bubbles in both themes - dark enough to keep white
+    // bubble text readable, unlike the brighter champagne accent above.
+    property color myMessageBg: darkMode ? "#7A5C22" : "#A6803A"
+    property color theirMessageBg: darkMode ? "#1C1C2A" : "#F1EBDD"
 
     flags: Qt.FramelessWindowHint | Qt.Window
 
@@ -106,7 +123,10 @@ ApplicationWindow {
                         radius: 8
                         visible: appRoot.isLoggedIn
                         color: logoutMouse.containsPress ? appRoot.borderColor : (logoutMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
-                        Behavior on color { ColorAnimation { duration: 100 } }
+                        Behavior on color {
+                            enabled: !appRoot.instantTheme
+                            ColorAnimation { duration: 100 }
+                        }
 
                         Canvas {
                             anchors.centerIn: parent
@@ -150,7 +170,10 @@ ApplicationWindow {
                         Layout.preferredHeight: 36
                         radius: 8
                         color: themeMouse.containsPress ? appRoot.borderColor : (themeMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
-                        Behavior on color { ColorAnimation { duration: 100 } }
+                        Behavior on color {
+                            enabled: !appRoot.instantTheme
+                            ColorAnimation { duration: 100 }
+                        }
 
                         Canvas {
                             anchors.centerIn: parent
@@ -188,7 +211,11 @@ ApplicationWindow {
                             anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: appRoot.darkMode = !appRoot.darkMode
+                            onClicked: {
+                                appRoot.instantTheme = true
+                                appRoot.darkMode = !appRoot.darkMode
+                                Qt.callLater(function() { appRoot.instantTheme = false })
+                            }
                         }
                     }
 
@@ -198,7 +225,10 @@ ApplicationWindow {
                         Layout.preferredHeight: 36
                         radius: 8
                         color: minMouse.containsPress ? appRoot.borderColor : (minMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
-                        Behavior on color { ColorAnimation { duration: 100 } }
+                        Behavior on color {
+                            enabled: !appRoot.instantTheme
+                            ColorAnimation { duration: 100 }
+                        }
 
                         Rectangle {
                             anchors.centerIn: parent
@@ -215,13 +245,56 @@ ApplicationWindow {
                         }
                     }
 
+                    // Maximize / restore
+                    Rectangle {
+                        Layout.preferredWidth: 36
+                        Layout.preferredHeight: 36
+                        radius: 8
+                        color: maxMouse.containsPress ? appRoot.borderColor : (maxMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
+                        Behavior on color {
+                            enabled: !appRoot.instantTheme
+                            ColorAnimation { duration: 100 }
+                        }
+
+                        Canvas {
+                            id: maxIcon
+                            anchors.centerIn: parent
+                            width: 12
+                            height: 12
+                            property bool maximized: appRoot.visibility === Window.Maximized
+                            onMaximizedChanged: requestPaint()
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.reset()
+                                ctx.strokeStyle = appRoot.textSecondary
+                                ctx.lineWidth = 1.3
+                                if (maximized) {
+                                    ctx.strokeRect(0.5, 2.5, 8, 8)
+                                    ctx.strokeRect(3.5, 0.5, 8, 8)
+                                } else {
+                                    ctx.strokeRect(0.5, 0.5, 11, 11)
+                                }
+                            }
+                        }
+                        MouseArea {
+                            id: maxMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: appRoot.toggleMaximize()
+                        }
+                    }
+
                     // Close
                     Rectangle {
                         Layout.preferredWidth: 36
                         Layout.preferredHeight: 36
                         radius: 8
                         color: closeMouse.containsMouse ? "#E74C3C" : "transparent"
-                        Behavior on color { ColorAnimation { duration: 100 } }
+                        Behavior on color {
+                            enabled: !appRoot.instantTheme
+                            ColorAnimation { duration: 100 }
+                        }
 
                         Canvas {
                             anchors.centerIn: parent
@@ -252,8 +325,9 @@ ApplicationWindow {
                     anchors.left: parent.left
                     anchors.top: parent.top
                     anchors.bottom: parent.bottom
-                    width: parent.width - 150
-                    onPressed: appRoot.startNativeDrag()
+                    width: parent.width - 186
+                    onPressed: appRoot.startSystemMove()
+                    onDoubleClicked: appRoot.toggleMaximize()
                 }
             }
 
@@ -285,18 +359,15 @@ ApplicationWindow {
                     offlineColor: appRoot.offlineColor
                     activeChatId: chatViewLoader.item ? chatViewLoader.item.currentChatId : ""
 
-                    onChatSelected: {
+                    onChatSelected: (chatId, chatName, otherUserId, online) => {
                         chatViewLoader.source = "qrc:/qml/ChatView.qml"
-                        chatViewLoader.item.darkMode = appRoot.darkMode
-                        chatViewLoader.item.bgColor = appRoot.bgColor
-                        chatViewLoader.item.surfaceColor = appRoot.surfaceColor
-                        chatViewLoader.item.textColor = appRoot.textColor
-                        chatViewLoader.item.textSecondary = appRoot.textSecondary
-                        chatViewLoader.item.borderColor = appRoot.borderColor
-                        chatViewLoader.item.accentColor = appRoot.accentColor
-                        chatViewLoader.item.onlineColor = appRoot.onlineColor
+                        // Theme/color properties are kept live via the Binding
+                        // elements on chatViewLoader below - only this chat's
+                        // own identity needs setting here.
                         chatViewLoader.item.currentChatId = chatId
                         chatViewLoader.item.currentChatName = chatName
+                        chatViewLoader.item.otherUserId = otherUserId
+                        chatViewLoader.item.isOnline = online
                     }
 
                     onNewChatClicked: {
@@ -316,6 +387,23 @@ ApplicationWindow {
                     id: chatViewLoader
                     Layout.fillWidth: true
                     Layout.fillHeight: true
+
+                    // Keep the loaded ChatView's theme/colors live instead of a
+                    // one-time push at chat-selection time - otherwise toggling
+                    // the theme while a chat is already open leaves it frozen
+                    // on the old colors (and message-bubble backgrounds stuck
+                    // on defaults meant for the other theme, making text
+                    // unreadable once darkMode itself did catch up).
+                    Binding { target: chatViewLoader.item; property: "darkMode"; value: appRoot.darkMode; when: chatViewLoader.status === Loader.Ready }
+                    Binding { target: chatViewLoader.item; property: "bgColor"; value: appRoot.bgColor; when: chatViewLoader.status === Loader.Ready }
+                    Binding { target: chatViewLoader.item; property: "surfaceColor"; value: appRoot.surfaceColor; when: chatViewLoader.status === Loader.Ready }
+                    Binding { target: chatViewLoader.item; property: "textColor"; value: appRoot.textColor; when: chatViewLoader.status === Loader.Ready }
+                    Binding { target: chatViewLoader.item; property: "textSecondary"; value: appRoot.textSecondary; when: chatViewLoader.status === Loader.Ready }
+                    Binding { target: chatViewLoader.item; property: "borderColor"; value: appRoot.borderColor; when: chatViewLoader.status === Loader.Ready }
+                    Binding { target: chatViewLoader.item; property: "accentColor"; value: appRoot.accentColor; when: chatViewLoader.status === Loader.Ready }
+                    Binding { target: chatViewLoader.item; property: "onlineColor"; value: appRoot.onlineColor; when: chatViewLoader.status === Loader.Ready }
+                    Binding { target: chatViewLoader.item; property: "myMessageBg"; value: appRoot.myMessageBg; when: chatViewLoader.status === Loader.Ready }
+                    Binding { target: chatViewLoader.item; property: "theirMessageBg"; value: appRoot.theirMessageBg; when: chatViewLoader.status === Loader.Ready }
 
                     Rectangle {
                         anchors.fill: parent
@@ -476,7 +564,10 @@ ApplicationWindow {
                                : (cancelMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
                         border.color: appRoot.borderColor
                         border.width: 1
-                        Behavior on color { ColorAnimation { duration: 120 } }
+                        Behavior on color {
+                            enabled: !appRoot.instantTheme
+                            ColorAnimation { duration: 120 }
+                        }
 
                         Text {
                             anchors.centerIn: parent
@@ -500,7 +591,10 @@ ApplicationWindow {
                         radius: 11
                         color: confirmLogoutMouse.pressed ? Qt.darker("#E74C3C", 1.15)
                                : (confirmLogoutMouse.containsMouse ? Qt.lighter("#E74C3C", 1.08) : "#E74C3C")
-                        Behavior on color { ColorAnimation { duration: 120 } }
+                        Behavior on color {
+                            enabled: !appRoot.instantTheme
+                            ColorAnimation { duration: 120 }
+                        }
 
                         Text {
                             anchors.centerIn: parent
@@ -526,7 +620,77 @@ ApplicationWindow {
         }
     }
 
-    function startNativeDrag() {
-        // Handle window dragging for frameless window
+    // Resize handles - a frameless window has no native resize border, so we
+    // provide thin edge/corner hit-regions that hand off to the OS's own
+    // system resize (gets the right cursor and live edge-snapping for free).
+    Item {
+        anchors.fill: parent
+        z: 1000
+        visible: appRoot.visibility !== Window.Maximized
+        enabled: visible
+
+        property int edgeSize: 6
+        property int cornerSize: 12
+
+        MouseArea {
+            anchors.top: parent.top; anchors.left: parent.left; anchors.right: parent.right
+            height: parent.edgeSize
+            hoverEnabled: true
+            cursorShape: Qt.SizeVerCursor
+            onPressed: appRoot.startSystemResize(Qt.TopEdge)
+        }
+        MouseArea {
+            anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right
+            height: parent.edgeSize
+            hoverEnabled: true
+            cursorShape: Qt.SizeVerCursor
+            onPressed: appRoot.startSystemResize(Qt.BottomEdge)
+        }
+        MouseArea {
+            anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
+            width: parent.edgeSize
+            hoverEnabled: true
+            cursorShape: Qt.SizeHorCursor
+            onPressed: appRoot.startSystemResize(Qt.LeftEdge)
+        }
+        MouseArea {
+            anchors.right: parent.right; anchors.top: parent.top; anchors.bottom: parent.bottom
+            width: parent.edgeSize
+            hoverEnabled: true
+            cursorShape: Qt.SizeHorCursor
+            onPressed: appRoot.startSystemResize(Qt.RightEdge)
+        }
+        MouseArea {
+            anchors.top: parent.top; anchors.left: parent.left
+            width: parent.cornerSize; height: parent.cornerSize
+            hoverEnabled: true
+            cursorShape: Qt.SizeFDiagCursor
+            onPressed: appRoot.startSystemResize(Qt.TopEdge | Qt.LeftEdge)
+        }
+        MouseArea {
+            anchors.top: parent.top; anchors.right: parent.right
+            width: parent.cornerSize; height: parent.cornerSize
+            hoverEnabled: true
+            cursorShape: Qt.SizeBDiagCursor
+            onPressed: appRoot.startSystemResize(Qt.TopEdge | Qt.RightEdge)
+        }
+        MouseArea {
+            anchors.bottom: parent.bottom; anchors.left: parent.left
+            width: parent.cornerSize; height: parent.cornerSize
+            hoverEnabled: true
+            cursorShape: Qt.SizeBDiagCursor
+            onPressed: appRoot.startSystemResize(Qt.BottomEdge | Qt.LeftEdge)
+        }
+        MouseArea {
+            anchors.bottom: parent.bottom; anchors.right: parent.right
+            width: parent.cornerSize; height: parent.cornerSize
+            hoverEnabled: true
+            cursorShape: Qt.SizeFDiagCursor
+            onPressed: appRoot.startSystemResize(Qt.BottomEdge | Qt.RightEdge)
+        }
+    }
+
+    function toggleMaximize() {
+        appRoot.visibility = (appRoot.visibility === Window.Maximized) ? Window.Windowed : Window.Maximized
     }
 }

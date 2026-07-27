@@ -1,0 +1,149 @@
+#include "messagecache.h"
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QStandardPaths>
+#include <QDir>
+#include <QDebug>
+#include <QJsonDocument>
+#include <QDateTime>
+
+MessageCache::MessageCache(QObject* parent)
+    : QObject(parent)
+{
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(dir);
+
+    // A named (non-default) connection, since QSqlDatabase's default
+    // connection is process-global and other code may open its own handles.
+    m_db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("message_cache"));
+    m_db.setDatabaseName(dir + QStringLiteral("/message_cache.db"));
+
+    if (!m_db.open()) {
+        qWarning() << "[MessageCache] Failed to open cache database:" << m_db.lastError().text();
+        return;
+    }
+    ensureSchema();
+}
+
+void MessageCache::ensureSchema() {
+    QSqlQuery query(m_db);
+    query.exec(QStringLiteral(
+        "CREATE TABLE IF NOT EXISTS messages ("
+        "  id TEXT PRIMARY KEY,"
+        "  chat_id TEXT NOT NULL,"
+        "  sender_id TEXT NOT NULL,"
+        "  sender_name TEXT,"
+        "  content TEXT NOT NULL,"
+        "  encrypted INTEGER NOT NULL,"
+        "  read_at TEXT,"
+        "  created_at TEXT NOT NULL"
+        ")"
+    ));
+    query.exec(QStringLiteral(
+        "CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, created_at)"
+    ));
+    query.exec(QStringLiteral(
+        "CREATE TABLE IF NOT EXISTS chats ("
+        "  id TEXT PRIMARY KEY,"
+        "  raw_json TEXT NOT NULL,"
+        "  cached_at TEXT NOT NULL"
+        ")"
+    ));
+}
+
+void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entries) {
+    if (!m_db.isOpen() || entries.isEmpty()) return;
+
+    QSqlQuery query(m_db);
+    query.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO messages "
+        "(id, chat_id, sender_id, sender_name, content, encrypted, read_at, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ));
+
+    m_db.transaction();
+    for (const Entry& e : entries) {
+        query.addBindValue(e.id);
+        query.addBindValue(chatId);
+        query.addBindValue(e.senderId);
+        query.addBindValue(e.senderName);
+        query.addBindValue(e.content);
+        query.addBindValue(e.encrypted ? 1 : 0);
+        query.addBindValue(e.readAt);
+        query.addBindValue(e.createdAt);
+        if (!query.exec()) {
+            qWarning() << "[MessageCache] Failed to save message:" << query.lastError().text();
+        }
+    }
+    m_db.commit();
+}
+
+QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int limit) const {
+    QList<Entry> result;
+    if (!m_db.isOpen()) return result;
+
+    QSqlQuery query(m_db);
+    query.prepare(QStringLiteral(
+        "SELECT id, sender_id, sender_name, content, encrypted, read_at, created_at "
+        "FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?"
+    ));
+    query.addBindValue(chatId);
+    query.addBindValue(limit);
+
+    if (!query.exec()) {
+        qWarning() << "[MessageCache] Failed to load messages:" << query.lastError().text();
+        return result;
+    }
+
+    while (query.next()) {
+        Entry e;
+        e.id = query.value(0).toString();
+        e.senderId = query.value(1).toString();
+        e.senderName = query.value(2).toString();
+        e.content = query.value(3).toString();
+        e.encrypted = query.value(4).toInt() != 0;
+        e.readAt = query.value(5).toString();
+        e.createdAt = query.value(6).toString();
+        result.prepend(e); // rows came back newest-first; flip to oldest-first
+    }
+    return result;
+}
+
+void MessageCache::saveChats(const QList<QJsonObject>& chats) {
+    if (!m_db.isOpen() || chats.isEmpty()) return;
+
+    QSqlQuery query(m_db);
+    query.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO chats (id, raw_json, cached_at) VALUES (?, ?, ?)"
+    ));
+
+    m_db.transaction();
+    for (const QJsonObject& obj : chats) {
+        QString id = obj[QStringLiteral("id")].toString();
+        if (id.isEmpty()) continue;
+        query.addBindValue(id);
+        query.addBindValue(QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact)));
+        query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+        if (!query.exec()) {
+            qWarning() << "[MessageCache] Failed to save chat:" << query.lastError().text();
+        }
+    }
+    m_db.commit();
+}
+
+QList<QJsonObject> MessageCache::loadChats() const {
+    QList<QJsonObject> result;
+    if (!m_db.isOpen()) return result;
+
+    QSqlQuery query(m_db);
+    if (!query.exec(QStringLiteral("SELECT raw_json FROM chats ORDER BY cached_at DESC"))) {
+        qWarning() << "[MessageCache] Failed to load chats:" << query.lastError().text();
+        return result;
+    }
+
+    while (query.next()) {
+        QJsonDocument doc = QJsonDocument::fromJson(query.value(0).toString().toUtf8());
+        if (doc.isObject()) result.append(doc.object());
+    }
+    return result;
+}

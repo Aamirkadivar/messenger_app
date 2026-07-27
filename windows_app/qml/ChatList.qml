@@ -1,9 +1,15 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Window 2.15
 
 Rectangle {
     id: chatListRoot
+
+    // The Window attached type only attaches to Item-derived elements, so it
+    // can't be referenced directly from inside a Behavior - resolve it once
+    // here instead and have the Behaviors below read this plain property.
+    property bool instantThemeActive: Window.window ? Window.window.instantTheme : false
 
     // External properties from parent
     property bool darkMode: true
@@ -20,7 +26,7 @@ Rectangle {
     color: bgColor
 
     // Signals
-    signal chatSelected(string chatId, string chatName)
+    signal chatSelected(string chatId, string chatName, string otherUserId, bool online)
     signal newChatClicked()
 
     property bool searchVisible: false
@@ -52,12 +58,24 @@ Rectangle {
             spacing: 8
 
             Text {
+                id: chatsTitle
+                // Telegram-style: while not connected, the header itself
+                // becomes the status ("Connecting…"/"Reconnecting…") instead
+                // of a separate banner - reverts to "Chats" once connected.
+                property string connState: websocketService !== undefined ? websocketService.connectionState : "connected"
+
                 Layout.fillWidth: true
-                text: "Chats"
+                text: connState === "connecting" ? "Connecting…"
+                      : connState === "reconnecting" ? "Reconnecting…"
+                      : "Chats"
                 font.pixelSize: 24
                 font.weight: Font.Bold
                 font.letterSpacing: -0.3
-                color: chatListRoot.textColor
+                color: connState === "connecting" || connState === "reconnecting" ? chatListRoot.accentColor : chatListRoot.textColor
+                Behavior on color {
+                    enabled: !chatListRoot.instantThemeActive
+                    ColorAnimation { duration: 200 }
+                }
             }
 
             Rectangle {
@@ -67,7 +85,10 @@ Rectangle {
                 scale: searchMouse.pressed ? 0.94 : 1.0
                 color: searchMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.22)
                        : (searchVisible || searchMouse.containsMouse) ? Qt.rgba(108/255, 99/255, 255/255, 0.12) : "transparent"
-                Behavior on color { ColorAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                Behavior on color {
+                    enabled: !chatListRoot.instantThemeActive
+                    ColorAnimation { duration: 150; easing.type: Easing.OutCubic }
+                }
                 Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
 
                 Canvas {
@@ -108,7 +129,11 @@ Rectangle {
             Layout.bottomMargin: searchVisible ? 16 : 0
             Layout.preferredHeight: searchVisible ? 42 : 0
             radius: 12
-            color: darkMode ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.03)"
+            // Was a "rgba(r,g,b,a)" string literal - that syntax silently
+            // drops the alpha channel in this Qt build (always resolves
+            // fully opaque), which is why this rendered solid black in light
+            // mode instead of a subtle tint. Qt.rgba() is the reliable form.
+            color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
             border.color: searchField.activeFocus ? chatListRoot.accentColor : Qt.rgba(1, 1, 1, 0.08)
             border.width: searchField.activeFocus ? 1.5 : 1
             clip: true
@@ -168,7 +193,10 @@ Rectangle {
             scale: newChatMouse.pressed ? 0.98 : 1.0
             color: newChatMouse.pressed ? Qt.darker(chatListRoot.accentColor, 1.15)
                    : (newChatMouse.containsMouse ? Qt.lighter(chatListRoot.accentColor, 1.08) : chatListRoot.accentColor)
-            Behavior on color { ColorAnimation { duration: 150; easing.type: Easing.OutCubic } }
+            Behavior on color {
+                enabled: !chatListRoot.instantThemeActive
+                ColorAnimation { duration: 150; easing.type: Easing.OutCubic }
+            }
             Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
 
             // Soft accent glow behind the primary action
@@ -326,14 +354,17 @@ Rectangle {
                             radius: 14
                             color: itemMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.16)
                                    : (itemMouse.containsMouse ? chatListRoot.surfaceColorHover : "transparent")
-                            Behavior on color { ColorAnimation { duration: 130; easing.type: Easing.OutCubic } }
+                            Behavior on color {
+                                enabled: !chatListRoot.instantThemeActive
+                                ColorAnimation { duration: 130; easing.type: Easing.OutCubic }
+                            }
 
                             MouseArea {
                                 id: itemMouse
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: chatListRoot.chatSelected(model.chatId, model.chatName)
+                                onClicked: chatListRoot.chatSelected(model.chatId, model.chatName, model.otherUserId, model.online)
                             }
 
                             RowLayout {
@@ -401,6 +432,7 @@ Rectangle {
                                 // Time + unread badge
                                 ColumnLayout {
                                     Layout.alignment: Qt.AlignTop
+                                    Layout.topMargin: 12
                                     spacing: 8
 
                                     Text {
@@ -525,6 +557,7 @@ Rectangle {
         var chatName = chatData.name || ""
         var chatType = chatData.type || "direct"
         var otherUser = chatData.other_user || {}
+        var otherUserId = otherUser.id || ""
         var lastMessageData = chatData.last_message || {}
         var avatarColor = chatData.avatar_url !== undefined ? chatData.avatar_url : ""
         var isOnline = chatData.is_online || false
@@ -590,6 +623,7 @@ Rectangle {
         return {
             chatId: chatId,
             chatName: chatName,
+            otherUserId: otherUserId,
             lastMessage: lastMessage,
             timestamp: timestamp,
             unreadCount: unreadCount,
@@ -638,7 +672,12 @@ Rectangle {
     // Handle chat service error
     function onChatError(errorMsg) {
         console.log("Error loading chats:", errorMsg)
-        populateChatModel([])
+        // Don't wipe out chats already on screen (e.g. loaded from cache)
+        // just because the follow-up network refresh failed - only show the
+        // empty state if we never had anything to show in the first place.
+        if (originalChats.length === 0) {
+            populateChatModel([])
+        }
     }
 
     // Zero out a chat's unread badge immediately once it's been marked read,
@@ -686,6 +725,24 @@ Rectangle {
         }
     }
 
+    // Refresh the whole list the moment we (re)connect - otherwise anything
+    // sent or changed while we were offline is silently missed until the
+    // app restarts or the user happens to navigate away and back.
+    function onWsReconnected() {
+        chatService.fetchChats()
+    }
+
+    // Live-update a contact's online dot the instant they connect/disconnect,
+    // instead of only after the next full chat-list refetch.
+    function onPresenceChanged(userId, online) {
+        for (var i = 0; i < originalChats.length; i++) {
+            if (originalChats[i].otherUserId === userId) originalChats[i].online = online
+        }
+        for (var j = 0; j < chatModel.count; j++) {
+            if (chatModel.get(j).otherUserId === userId) chatModel.setProperty(j, "online", online)
+        }
+    }
+
     Component.onCompleted: {
         // Connect to chat service signals
         if (chatService !== undefined && chatService !== null) {
@@ -698,6 +755,8 @@ Rectangle {
         }
         if (websocketService !== undefined && websocketService !== null) {
             websocketService.messageReceived.connect(onMessageReceived)
+            websocketService.presenceChanged.connect(onPresenceChanged)
+            websocketService.connected.connect(onWsReconnected)
         }
     }
 }

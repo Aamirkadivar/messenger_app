@@ -45,7 +45,7 @@ Rectangle {
                     height: 40
                     background: Rectangle {
                         radius: 8
-                        color: mouseArea.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.3)" : "rgba(108, 99, 255, 0.1)") : "transparent"
+                        color: mouseArea.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.3) : Qt.rgba(108/255, 99/255, 255/255, 0.1)) : "transparent"
                         MouseArea { id: mouseArea; anchors.fill: parent; hoverEnabled: true; onClicked: settingsRoot.backClicked() }
                     }
                     Image {
@@ -77,7 +77,7 @@ Rectangle {
         Rectangle {
             Layout.fillWidth: true
             height: 120
-            color: darkMode ? "rgba(22, 33, 62, 0.5)" : "rgba(255, 255, 255, 0.3)"
+            color: darkMode ? Qt.rgba(22/255, 33/255, 62/255, 0.5) : Qt.rgba(1, 1, 1, 0.3)
 
             ColumnLayout {
                 anchors.fill: parent
@@ -139,7 +139,7 @@ Rectangle {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 64
-                    color: dmMouse.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.08)" : "rgba(108, 99, 255, 0.05)") : "transparent"
+                    color: dmMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
 
                     MouseArea {
                         id: dmMouse
@@ -211,7 +211,7 @@ Rectangle {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 64
-                    color: notifMouse.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.08)" : "rgba(108, 99, 255, 0.05)") : "transparent"
+                    color: notifMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
 
                     MouseArea {
                         id: notifMouse
@@ -263,7 +263,7 @@ Rectangle {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 64
-                    color: privacyMouse.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.08)" : "rgba(108, 99, 255, 0.05)") : "transparent"
+                    color: privacyMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
 
                     MouseArea {
                         id: privacyMouse
@@ -315,7 +315,7 @@ Rectangle {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 64
-                    color: securityMouse.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.08)" : "rgba(108, 99, 255, 0.05)") : "transparent"
+                    color: securityMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
 
                     MouseArea {
                         id: securityMouse
@@ -367,7 +367,7 @@ Rectangle {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 64
-                    color: aboutMouse.containsPress ? (darkMode ? "rgba(108, 99, 255, 0.08)" : "rgba(108, 99, 255, 0.05)") : "transparent"
+                    color: aboutMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
 
                     MouseArea {
                         id: aboutMouse
@@ -412,7 +412,7 @@ Rectangle {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 56
-                    color: logoutMouse.containsPress ? "rgba(244, 67, 54, 0.1)" : "transparent"
+                    color: logoutMouse.containsPress ? Qt.rgba(244/255, 67/255, 54/255, 0.1) : "transparent"
 
                     MouseArea {
                         id: logoutMouse

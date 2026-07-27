@@ -90,40 +90,40 @@ func (h *Hub) Run() {
 			}
 
 			h.mu.RLock()
-			for _, client := range h.Clients {
-				if wsMsg.Type == "message" || wsMsg.Type == "typing" {
-					if wsMsg.Data != nil {
-						data := wsMsg.Data.(map[string]interface{})
-						chatID, _ := data["chat_id"].(string)
-						chatType, _ := data["chat_type"].(string)
-
-						if chatType == "direct" {
-							if client.Rooms[chatID] {
-								select {
-								case client.Send <- message:
-								default:
-									close(client.Send)
-								}
-							}
-						} else if chatType == "group" {
-							if client.Rooms[chatID] {
-								select {
-								case client.Send <- message:
-								default:
-									close(client.Send)
-								}
-							}
-						}
+			if wsMsg.Type == "presence" {
+				// Presence isn't scoped to a single chat room - anyone connected
+				// should see it, since the user could appear in several chats.
+				for _, client := range h.Clients {
+					select {
+					case client.Send <- message:
+					default:
+						close(client.Send)
 					}
-				} else if wsMsg.Type == "presence" || wsMsg.Type == "typing" {
-					if wsMsg.Data != nil {
-						data := wsMsg.Data.(map[string]interface{})
-						chatID, _ := data["chat_id"].(string)
-						if chatID != "" && client.Rooms[chatID] {
-							select {
-							case client.Send <- message:
-							default:
-								close(client.Send)
+				}
+			} else {
+				for _, client := range h.Clients {
+					if wsMsg.Type == "message" || wsMsg.Type == "typing" || wsMsg.Type == "read" {
+						if wsMsg.Data != nil {
+							data := wsMsg.Data.(map[string]interface{})
+							chatID, _ := data["chat_id"].(string)
+							chatType, _ := data["chat_type"].(string)
+
+							if chatType == "direct" {
+								if client.Rooms[chatID] {
+									select {
+									case client.Send <- message:
+									default:
+										close(client.Send)
+									}
+								}
+							} else if chatType == "group" {
+								if client.Rooms[chatID] {
+									select {
+									case client.Send <- message:
+									default:
+										close(client.Send)
+									}
+								}
 							}
 						}
 					}
@@ -230,7 +230,7 @@ func HandleWebSocket(hub *Hub) fiber.Handler {
 		hub.JoinRoom(userID, fmt.Sprintf("user:%s", userID.String()))
 
 		// Update presence
-		updatePresence(userID, true)
+		updatePresence(hub, userID, true)
 
 		// Keepalive: reset the read deadline on every pong so the connection
 		// stays open as long as the client keeps responding to pings.
@@ -257,7 +257,7 @@ func HandleWebSocket(hub *Hub) fiber.Handler {
 
 		// Unregister and cleanup
 		hub.Unregister <- client
-		leavePresence(userID)
+		leavePresence(hub, userID)
 	})
 }
 
@@ -292,33 +292,38 @@ func handleClientMessage(hub *Hub, userID uuid.UUID, message []byte) {
 	}
 }
 
-// updatePresence updates user presence in database
-func updatePresence(userID uuid.UUID, isOnline bool) {
+// updatePresence updates user presence in database and tells every connected
+// client right away - without this, a contact's online dot only ever
+// reflected reality after the next full chat-list refetch.
+func updatePresence(hub *Hub, userID uuid.UUID, isOnline bool) {
 	database.DB.Model(&models.User{}).Where("id = ?", userID).Updates(map[string]interface{}{
 		"is_online": isOnline,
 		"last_seen": time.Now(),
 	})
+	broadcastPresence(hub, userID, isOnline)
 }
 
 // leavePresence handles user disconnect
-func leavePresence(userID uuid.UUID) {
+func leavePresence(hub *Hub, userID uuid.UUID) {
 	database.DB.Model(&models.User{}).Where("id = ?", userID).Update("is_online", false)
+	broadcastPresence(hub, userID, false)
+}
 
-	// Update or create presence record
-	var presence models.Presence
-	result := database.DB.Where("user_id = ?", userID).First(&presence)
-	if result.Error != nil {
-		presence = models.Presence{
-			UserID:   userID,
-			IsOnline: false,
-			LastSeen: time.Now(),
-		}
-		database.DB.Create(&presence)
-	} else {
-		database.DB.Model(&presence).Updates(map[string]interface{}{
-			"is_online": false,
+func broadcastPresence(hub *Hub, userID uuid.UUID, isOnline bool) {
+	if hub == nil {
+		return
+	}
+	wsMsg := models.WebSocketMessage{
+		Type: "presence",
+		Data: map[string]interface{}{
+			"user_id":   userID.String(),
+			"is_online": isOnline,
 			"last_seen": time.Now(),
-		})
+		},
+		Timestamp: time.Now(),
+	}
+	if data, err := json.Marshal(wsMsg); err == nil {
+		hub.Broadcast <- data
 	}
 }
 

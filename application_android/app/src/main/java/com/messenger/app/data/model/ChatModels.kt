@@ -42,6 +42,7 @@ data class MessageDto(
     @SerialName("file_type") val fileType: String? = null,
     val type: String? = null,
     @SerialName("delivered_at") val deliveredAt: String? = null,
+    @SerialName("read_at") val readAt: String? = null,
     @SerialName("created_at") val createdAt: String
 )
 

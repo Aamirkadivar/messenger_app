@@ -3,9 +3,9 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
-	"messenger-app/crypto"
 	"messenger-app/database"
 	"messenger-app/middleware"
 	"messenger-app/models"
@@ -13,6 +13,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // GroupService handles group chat operations
@@ -27,6 +28,29 @@ func NewGroupService(hub *websocket.Hub) *GroupService {
 	}
 }
 
+// notify publishes a group event over the WebSocket hub.
+//
+// NOTE: this goes out on the hub's global Broadcast channel, so every connected
+// client receives it and filters on chat_id. That is how message delivery in
+// this codebase already works (see handlers/message.go) rather than something
+// specific to groups - but it does mean group membership changes are visible to
+// clients outside the group. Fixing it properly means adding room-scoped
+// delivery to the hub and moving all senders over at once.
+func (s *GroupService) notify(eventType string, data fiber.Map) {
+	if s.hub == nil {
+		return
+	}
+	payload, err := json.Marshal(models.WebSocketMessage{
+		Type:      eventType,
+		Data:      data,
+		Timestamp: time.Now(),
+	})
+	if err != nil {
+		return
+	}
+	s.hub.Broadcast <- payload
+}
+
 // CreateGroup handles creating a new group chat
 func (s *GroupService) CreateGroup(c *fiber.Ctx) error {
 	userID := middleware.GetCurrentUserID(c)
@@ -39,78 +63,145 @@ func (s *GroupService) CreateGroup(c *fiber.Ctx) error {
 		})
 	}
 
-	if req.Name == "" {
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
 			"error":   "validation error",
 			"message": "Group name is required",
 		})
 	}
-
-	// Generate group ID
-	groupID := uuid.New().String()
-
-	// Create group chat
-	chat := models.Chat{
-		ID:      groupID,
-		Type:    "group",
-		Name:    req.Name,
-		AvatarURL: req.AvatarURL,
-		OwnerID: userID,
+	if len(name) > 255 {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "validation error",
+			"message": "Group name must be 255 characters or fewer",
+		})
 	}
-	if err := database.DB.Create(&chat).Error; err != nil {
+
+	// De-duplicate the requested members and drop the creator, who is added
+	// separately as admin - otherwise passing yourself in member_ids would
+	// create two participant rows for the same user and demote you to member.
+	uniqueMemberIDs := make([]uuid.UUID, 0, len(req.MemberIDs))
+	seen := map[uuid.UUID]bool{userID: true}
+	for _, id := range req.MemberIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		uniqueMemberIDs = append(uniqueMemberIDs, id)
+	}
+
+	// Every member must exist. Resolved up front so we fail before writing
+	// anything, and so the response can carry real names instead of blanks.
+	var users []models.User
+	if len(uniqueMemberIDs) > 0 {
+		if err := database.DB.Where("id IN ?", uniqueMemberIDs).Find(&users).Error; err != nil {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+				"error":   "internal error",
+				"message": "Failed to look up members",
+			})
+		}
+		if len(users) != len(uniqueMemberIDs) {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+				"error":   "validation error",
+				"message": "One or more member_ids do not exist",
+			})
+		}
+	}
+
+	var creator models.User
+	if err := database.DB.Where("id = ?", userID).First(&creator).Error; err != nil {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"error":   "unauthorized",
+			"message": "Current user not found",
+		})
+	}
+
+	groupID := uuid.New().String()
+	now := time.Now()
+
+	chat := models.Chat{
+		ID:          groupID,
+		Type:        "group",
+		Name:        name,
+		AvatarURL:   req.AvatarURL,
+		Description: req.Description,
+		OwnerID:     userID,
+	}
+
+	// One transaction: a group with no participants (or a partial member list)
+	// is not a valid group, so a failure halfway through must roll back rather
+	// than leave an orphaned chat row behind.
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&chat).Error; err != nil {
+			return err
+		}
+
+		participants := make([]models.ChatParticipant, 0, len(uniqueMemberIDs)+1)
+		participants = append(participants, models.ChatParticipant{
+			ChatID:   groupID,
+			UserID:   userID,
+			Role:     "admin",
+			JoinedAt: now,
+		})
+		for _, memberID := range uniqueMemberIDs {
+			participants = append(participants, models.ChatParticipant{
+				ChatID:   groupID,
+				UserID:   memberID,
+				Role:     "member",
+				JoinedAt: now,
+			})
+		}
+		return tx.Create(&participants).Error
+	})
+	if err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 			"error":   "internal error",
 			"message": "Failed to create group",
 		})
 	}
 
-	// Add creator as admin
-	database.DB.Create(&models.ChatParticipant{
-		ChatID: groupID,
-		UserID: userID,
-		Role:   "admin",
-		JoinedAt: time.Now(),
-	})
-
-	// Add initial members
-	members := make([]fiber.Map, 0, len(req.MemberIDs)+1)
+	members := make([]fiber.Map, 0, len(users)+1)
 	members = append(members, fiber.Map{
-		"id":         userID,
-		"email":      "",
-		"username":   "",
-		"display_name": "",
-		"role":       "admin",
+		"id":           creator.ID,
+		"email":        creator.Email,
+		"username":     creator.Username,
+		"display_name": creator.DisplayName,
+		"avatar_url":   creator.AvatarURL,
+		"role":         "admin",
 	})
-
-	for _, memberID := range req.MemberIDs {
-		database.DB.Create(&models.ChatParticipant{
-			ChatID: groupID,
-			UserID: memberID,
-			Role:   "member",
-			JoinedAt: time.Now(),
-		})
-
-		var user models.User
-		database.DB.First(&user, memberID)
+	for _, u := range users {
 		members = append(members, fiber.Map{
-			"id":           memberID,
-			"email":        user.Email,
-			"username":     user.Username,
-			"display_name": user.DisplayName,
+			"id":           u.ID,
+			"email":        u.Email,
+			"username":     u.Username,
+			"display_name": u.DisplayName,
+			"avatar_url":   u.AvatarURL,
 			"role":         "member",
 		})
 	}
 
-	return c.JSON(fiber.Map{
+	// Tell the new members a group appeared, so their chat list updates without
+	// waiting for a manual refresh.
+	s.notify("group_created", fiber.Map{
+		"chat_id":      groupID,
+		"name":         name,
+		"type":         "group",
+		"owner_id":     userID,
+		"member_count": len(members),
+	})
+
+	return c.Status(http.StatusCreated).JSON(fiber.Map{
 		"message": "Group created successfully",
 		"data": fiber.Map{
-			"id":        groupID,
-			"name":      req.Name,
-			"type":      "group",
-			"avatar_url": req.AvatarURL,
-			"owner_id":   userID,
-			"members":    members,
-			"created_at": chat.CreatedAt,
+			"id":           groupID,
+			"name":         name,
+			"type":         "group",
+			"avatar_url":   req.AvatarURL,
+			"description":  req.Description,
+			"owner_id":     userID,
+			"members":      members,
+			"member_count": len(members),
+			"created_at":   chat.CreatedAt,
 		},
 	})
 }
@@ -131,7 +222,7 @@ func (s *GroupService) GetGroupInfo(c *fiber.Ctx) error {
 
 	// Get chat info
 	var chat models.Chat
-	if err := database.DB.First(&chat, chatID).Error; err != nil {
+	if err := database.DB.Where("id = ?", chatID).First(&chat).Error; err != nil {
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{
 			"error":   "group not found",
 			"message": "Group not found",
@@ -145,7 +236,7 @@ func (s *GroupService) GetGroupInfo(c *fiber.Ctx) error {
 	members := make([]fiber.Map, len(participants))
 	for i, p := range participants {
 		var user models.User
-		database.DB.First(&user, p.UserID)
+		database.DB.Where("id = ?", p.UserID).First(&user)
 		members[i] = fiber.Map{
 			"id":           user.ID,
 			"email":        user.Email,
@@ -189,16 +280,16 @@ func (s *GroupService) GetGroups(c *fiber.Ctx) error {
 
 	type ChatWithInfo struct {
 		models.Chat
-		MemberCount int `json:"member_count"`
+		MemberCount int       `json:"member_count"`
 		LastMessage fiber.Map `json:"last_message"`
-		UnreadCount int64 `json:"unread_count"`
-		UserRole    string `json:"user_role"`
+		UnreadCount int64     `json:"unread_count"`
+		UserRole    string    `json:"user_role"`
 	}
 
 	groups := make([]ChatWithInfo, 0)
 	for _, p := range participants {
 		var chat models.Chat
-		if err := database.DB.First(&chat, p.ChatID).Error; err != nil {
+		if err := database.DB.Where("id = ?", p.ChatID).First(&chat).Error; err != nil {
 			continue
 		}
 
@@ -225,7 +316,7 @@ func (s *GroupService) GetGroups(c *fiber.Ctx) error {
 		lastMsgInfo := fiber.Map{}
 		if lastMessage.ID != uuid.Nil {
 			var sender models.User
-			database.DB.First(&sender, lastMessage.SenderID)
+			database.DB.Where("id = ?", lastMessage.SenderID).First(&sender)
 			lastMsgInfo = fiber.Map{
 				"id":        lastMessage.ID,
 				"sender_id": sender.ID,
@@ -280,14 +371,14 @@ func (s *GroupService) AddMembers(c *fiber.Ctx) error {
 		}
 
 		database.DB.Create(&models.ChatParticipant{
-			ChatID: chatID,
-			UserID: memberID,
-			Role:   "member",
+			ChatID:   chatID,
+			UserID:   memberID,
+			Role:     "member",
 			JoinedAt: time.Now(),
 		})
 
 		var user models.User
-		database.DB.First(&user, memberID)
+		database.DB.Where("id = ?", memberID).First(&user)
 		addedMembers = append(addedMembers, fiber.Map{
 			"id":           memberID,
 			"email":        user.Email,
@@ -295,24 +386,15 @@ func (s *GroupService) AddMembers(c *fiber.Ctx) error {
 			"display_name": user.DisplayName,
 		})
 
-		// Notify via WebSocket
-		wsMsg := models.WebSocketMessage{
-			Type: "member_added",
-			Data: fiber.Map{
-				"chat_id": chatID,
-				"member":  addedMembers[len(addedMembers)-1],
-			},
-			Timestamp: time.Now(),
-		}
-		wsData, _ := json.Marshal(wsMsg)
-		if s.hub != nil {
-			s.hub.Broadcast <- wsData
-		}
+		s.notify("member_added", fiber.Map{
+			"chat_id": chatID,
+			"member":  addedMembers[len(addedMembers)-1],
+		})
 	}
 
 	return c.JSON(fiber.Map{
 		"message": "Members added successfully",
-		"data":   addedMembers,
+		"data":    addedMembers,
 	})
 }
 
@@ -344,19 +426,10 @@ func (s *GroupService) RemoveMember(c *fiber.Ctx) error {
 			Update("left_at", time.Now())
 	}
 
-	// Notify via WebSocket
-	wsMsg := models.WebSocketMessage{
-		Type: "member_removed",
-		Data: fiber.Map{
-			"chat_id":  chatID,
-			"member_id": memberID,
-		},
-		Timestamp: time.Now(),
-	}
-	wsData, _ := json.Marshal(wsMsg)
-	if s.hub != nil {
-		s.hub.Broadcast <- wsData
-	}
+	s.notify("member_removed", fiber.Map{
+		"chat_id":   chatID,
+		"member_id": memberID,
+	})
 
 	return c.JSON(fiber.Map{
 		"message": "Member removed successfully",
@@ -398,19 +471,10 @@ func (s *GroupService) LeaveGroup(c *fiber.Ctx) error {
 		Where("chat_id = ? AND user_id = ?", chatID, userID).
 		Update("left_at", time.Now())
 
-	// Notify via WebSocket
-	wsMsg := models.WebSocketMessage{
-		Type: "user_left",
-		Data: fiber.Map{
-			"chat_id": chatID,
-			"user_id": userID,
-		},
-		Timestamp: time.Now(),
-	}
-	wsData, _ := json.Marshal(wsMsg)
-	if s.hub != nil {
-		s.hub.Broadcast <- wsData
-	}
+	s.notify("user_left", fiber.Map{
+		"chat_id": chatID,
+		"user_id": userID,
+	})
 
 	return c.JSON(fiber.Map{
 		"message": "Left group successfully",
@@ -493,13 +557,28 @@ func (s *GroupService) SearchUsers(c *fiber.Ctx) error {
 	})
 }
 
-// EncryptForGroup encrypts a message for all recipients in a group
-func EncryptForGroup(content string, recipientPublicKeys []string) (string, error) {
-	// For group chats, we use a symmetric session key approach
-	// In production, you'd use a more sophisticated key management system
-	encrypted, err := crypto.EncryptMessage(content, recipientPublicKeys[0], "aes256")
-	if err != nil {
-		return "", err
-	}
-	return encrypted, nil
-}
+// Group message encryption is deliberately absent.
+//
+// An EncryptForGroup helper used to live here, but it encrypted only for
+// recipientPublicKeys[0] and panicked on an empty slice - despite its name
+// promising otherwise. It was unreferenced, so it has been removed rather than
+// left as a trap for the first caller.
+//
+// Direct messages are end-to-end encrypted with pairwise X25519 crypto_box
+// (see handlers/crypto.go and the clients' E2ECrypto). That does not extend to
+// N participants without a real decision, and the server must never see
+// plaintext, so the choice has to be made client-side:
+//
+//   - Per-recipient fanout: the sender encrypts once per member and uploads N-1
+//     ciphertexts. No new primitives, but message size grows with the group and
+//     the Message model needs somewhere to put per-recipient payloads (today it
+//     has a single Content column).
+//
+//   - Sender keys (Signal-style): each sender derives a symmetric chain key,
+//     distributes it over the existing pairwise channel, then encrypts each
+//     message once. Efficient, but requires rekeying whenever membership
+//     changes so removed members lose forward access.
+//
+// Until one is implemented, group chats can be created and managed but group
+// messages have no encryption path - do not route them through the direct
+// message crypto, which assumes exactly two parties.

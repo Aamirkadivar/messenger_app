@@ -5,6 +5,7 @@
         <file>../qml/Register.qml</file>
         <file>../qml/ChatList.qml</file>
         <file>../qml/ChatView.qml</file>
+        <file>../qml/ChatBackground.qml</file>
         <file>../qml/NewChatDialog.qml</file>
         <file>../qml/MessageBubble.qml</file>
         <file>../qml/Settings.qml</file>

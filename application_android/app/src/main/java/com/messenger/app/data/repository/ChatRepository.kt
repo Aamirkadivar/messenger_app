@@ -2,8 +2,10 @@ package com.messenger.app.data.repository
 
 import android.util.Log
 import com.messenger.app.data.encryption.E2ECrypto
+import com.messenger.app.data.local.dao.CachedChatDao
 import com.messenger.app.data.local.dao.ConversationDao
 import com.messenger.app.data.local.dao.MessageDao
+import com.messenger.app.data.local.entity.CachedChatEntity
 import com.messenger.app.data.local.entity.ConversationEntity
 import com.messenger.app.data.local.entity.MessageEntity
 import com.messenger.app.data.model.*
@@ -17,6 +19,8 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import java.time.OffsetDateTime
 
 /**
  * Repository for chat/messaging operations, matching the real backend's
@@ -31,12 +35,23 @@ class ChatRepository(
     private val chatApiService: ChatApiService,
     private val messageDao: MessageDao,
     private val conversationDao: ConversationDao,
+    private val cachedChatDao: CachedChatDao,
     private val webSocketManager: WebSocketManager,
-    private val tokenManager: TokenManager
+    private val tokenManager: TokenManager,
+    private val json: Json
 ) {
     companion object {
         private const val TAG = "ChatRepository"
         private const val ENCRYPTED_PLACEHOLDER = "🔒 Encrypted message"
+
+        /** Parses a server ISO-8601 timestamp to epoch millis for local storage/ordering. */
+        private fun parseTimestamp(iso: String?): Long =
+            try {
+                if (iso.isNullOrBlank()) System.currentTimeMillis()
+                else OffsetDateTime.parse(iso).toInstant().toEpochMilli()
+            } catch (e: Exception) {
+                System.currentTimeMillis()
+            }
     }
 
     private fun bearer(token: String) = "Bearer $token"
@@ -50,29 +65,85 @@ class ChatRepository(
     // don't each generate a different keypair and clobber each other.
     private val keyMutex = Mutex()
 
-    /** Generate a keypair if this device doesn't have one yet, then publish the public key. */
-    suspend fun ensureKeysPublished(token: String): Result<Unit> = withContext(Dispatchers.IO) {
+    /**
+     * Outcome of establishing this device's E2EE identity key.
+     */
+    sealed interface KeyStatus {
+        /** This device already had its keypair; nothing changed. */
+        data object Existing : KeyStatus
+
+        /** First key for this account - no prior history to lose. */
+        data object Created : KeyStatus
+
+        /**
+         * The account already had a public key registered by another device,
+         * and this device does not hold the matching private key. We generated
+         * a new one and took the registration over, which means every message
+         * sent before now is undecryptable everywhere.
+         */
+        data object ReplacedAnotherDevicesKey : KeyStatus
+    }
+
+    /**
+     * Ensures this device has an E2EE keypair and that its public half is
+     * registered with the server.
+     *
+     * The account's registered key is checked *before* generating, because
+     * publishing a fresh key silently destroys readable history: crypto_box
+     * derives its shared secret from both halves, so replacing one end makes
+     * every earlier message undecryptable on every device. This used to happen
+     * with no indication whatsoever the moment you signed in somewhere new.
+     *
+     * The takeover still goes ahead when it happens - refusing would leave the
+     * new device unable to send or read anything at all - but it is reported
+     * back as [KeyStatus.ReplacedAnotherDevicesKey] so the UI can say so
+     * plainly instead of showing a wall of "Encrypted message".
+     */
+    suspend fun ensureKeysPublished(token: String): Result<KeyStatus> = withContext(Dispatchers.IO) {
         keyMutex.withLock {
             try {
                 val userId = tokenManager.getCurrentUserId().getOrNull()
                     ?: return@withLock Result.failure(Exception("No current user"))
                 myUserId = userId
 
-                var priv = tokenManager.getE2EEPrivateKey(userId).getOrNull()
-                var pub = tokenManager.getE2EEPublicKey(userId).getOrNull()
+                val priv = tokenManager.getE2EEPrivateKey(userId).getOrNull()
+                val pub = tokenManager.getE2EEPublicKey(userId).getOrNull()
 
-                if (priv.isNullOrEmpty() || pub.isNullOrEmpty()) {
-                    val kp = E2ECrypto.generateKeyPair()
-                        ?: return@withLock Result.failure(Exception("Keygen failed"))
-                    tokenManager.saveE2EEKeys(userId, kp.publicHex, kp.privateHex)
-                    priv = kp.privateHex
-                    pub = kp.publicHex
-                    Log.d(TAG, "Generated new E2EE keypair")
+                // Happy path: we already own this account's key on this device.
+                if (!priv.isNullOrEmpty() && !pub.isNullOrEmpty()) {
+                    myPrivateHex = priv
+                    chatApiService.savePublicKey(bearer(token), mapOf("public_key" to pub))
+                    return@withLock Result.success(KeyStatus.Existing)
                 }
-                myPrivateHex = priv
 
-                chatApiService.savePublicKey(bearer(token), mapOf("public_key" to (pub ?: "")))
-                Result.success(Unit)
+                // No local key. Does the account already have one elsewhere?
+                val registered = runCatching {
+                    val response = chatApiService.getMyPublicKey(bearer(token))
+                    if (response.isSuccessful) {
+                        response.body()?.get("public_key")?.takeIf { it.isNotBlank() }
+                    } else {
+                        null
+                    }
+                }.getOrNull()
+
+                val kp = E2ECrypto.generateKeyPair()
+                    ?: return@withLock Result.failure(Exception("Keygen failed"))
+                tokenManager.saveE2EEKeys(userId, kp.publicHex, kp.privateHex)
+                myPrivateHex = kp.privateHex
+                chatApiService.savePublicKey(bearer(token), mapOf("public_key" to kp.publicHex))
+
+                if (registered != null && registered != kp.publicHex) {
+                    Log.w(
+                        TAG,
+                        "Took over E2EE identity for this account: another device had " +
+                            "registered a different public key. Messages sent before now " +
+                            "cannot be decrypted on any device."
+                    )
+                    Result.success(KeyStatus.ReplacedAnotherDevicesKey)
+                } else {
+                    Log.d(TAG, "Generated first E2EE keypair for this account")
+                    Result.success(KeyStatus.Created)
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "ensureKeysPublished error", e)
                 Result.failure(e)
@@ -114,14 +185,48 @@ class ChatRepository(
                 chats.forEach { c ->
                     c.otherUser?.publicKey?.takeIf { it.isNotEmpty() }?.let { chatOtherPub[c.id] = it }
                 }
+                cacheChats(chats)
                 Result.success(chats)
             } else {
-                Result.failure(Exception("Failed to load chats: ${response.code()}"))
+                if (response.code() == 401) Result.failure(SessionExpiredException())
+                else Result.failure(Exception("Failed to load chats: ${response.code()}"))
             }
         } catch (e: Exception) {
             Log.e(TAG, "getChats error", e)
             Result.failure(e)
         }
+    }
+
+    /**
+     * Chat list read straight from the local cache (raw JSON snapshots), so the
+     * list can render offline/instantly before the network refresh completes.
+     * Learns E2EE public keys the same way getChats() does, so a cache-only
+     * cold start can still decrypt last-message previews.
+     */
+    suspend fun loadCachedChats(): List<ChatListItemDto> = withContext(Dispatchers.IO) {
+        cachedChatDao.getAllCached().mapNotNull { entity ->
+            try {
+                json.decodeFromString(ChatListItemDto.serializer(), entity.rawJson).also { dto ->
+                    dto.otherUser?.publicKey?.takeIf { it.isNotEmpty() }?.let { chatOtherPub[dto.id] = it }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to decode cached chat ${entity.id}", e)
+                null
+            }
+        }
+    }
+
+    private suspend fun cacheChats(chats: List<ChatListItemDto>) {
+        if (chats.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val entities = chats.map { dto ->
+            CachedChatEntity(
+                id = dto.id,
+                rawJson = json.encodeToString(ChatListItemDto.serializer(), dto),
+                cachedAt = now
+            )
+        }
+        cachedChatDao.insertAll(entities)
     }
 
     suspend fun getOrCreateDirectChat(token: String, contactId: String): Result<DirectChatDto> =
@@ -140,7 +245,8 @@ class ChatRepository(
                     )
                     Result.success(chat)
                 } else {
-                    Result.failure(Exception("Failed to start chat: ${response.code()}"))
+                    if (response.code() == 401) Result.failure(SessionExpiredException())
+                    else Result.failure(Exception("Failed to start chat: ${response.code()}"))
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "getOrCreateDirectChat error", e)
@@ -168,20 +274,29 @@ class ChatRepository(
             )
             if (response.isSuccessful && response.body() != null) {
                 val sent = response.body()!!.data
+                if (conversationDao.getConversationById(sent.chatId) == null) {
+                    conversationDao.insertConversation(ConversationEntity(id = sent.chatId, type = chatType))
+                }
                 messageDao.insertMessage(
                     MessageEntity(
                         id = sent.id,
                         conversation_id = sent.chatId,
                         senderId = sent.senderId,
-                        content = plaintext,
+                        // Store what was actually sent over the wire (ciphertext when
+                        // E2EE is active), never the decrypted plaintext - matches the
+                        // "server never sees plaintext, and neither does disk" principle.
+                        content = sent.content ?: outContent,
                         type = "text",
                         status = "SENT",
-                        timestamp = System.currentTimeMillis()
+                        timestamp = parseTimestamp(sent.createdAt),
+                        isEncrypted = sent.encrypted,
+                        readAt = null
                     )
                 )
                 Result.success(sent)
             } else {
-                Result.failure(Exception("Failed to send message: ${response.code()}"))
+                if (response.code() == 401) Result.failure(SessionExpiredException())
+                else Result.failure(Exception("Failed to send message: ${response.code()}"))
             }
         } catch (e: Exception) {
             Log.e(TAG, "sendMessage error", e)
@@ -198,14 +313,62 @@ class ChatRepository(
         try {
             val response = chatApiService.getMessages(bearer(token), chatId, limit, before)
             if (response.isSuccessful && response.body() != null) {
-                Result.success(response.body()!!)
+                val body = response.body()!!
+                cacheMessages(chatId, body.data)
+                Result.success(body)
             } else {
-                Result.failure(Exception("Failed to get messages: ${response.code()}"))
+                if (response.code() == 401) Result.failure(SessionExpiredException())
+                else Result.failure(Exception("Failed to get messages: ${response.code()}"))
             }
         } catch (e: Exception) {
             Log.e(TAG, "getMessages error", e)
             Result.failure(e)
         }
+    }
+
+    /**
+     * Message history read straight from the local cache, newest-first (same
+     * order the server returns), so a chat can render offline/instantly before
+     * the network fetch completes. Stored content is exactly what the server
+     * sent - ciphertext or plaintext-as-received, never decrypted - matching
+     * the "server never sees plaintext, and neither does disk" principle.
+     */
+    suspend fun loadCachedMessages(chatId: String): List<MessageDto> = withContext(Dispatchers.IO) {
+        messageDao.getAllMessagesByConversation(chatId).map { e ->
+            MessageDto(
+                id = e.id,
+                chatId = e.conversation_id,
+                senderId = e.senderId,
+                content = e.content,
+                encrypted = e.isEncrypted,
+                readAt = e.readAt,
+                createdAt = java.time.Instant.ofEpochMilli(e.timestamp).toString()
+            )
+        }
+    }
+
+    private suspend fun cacheMessages(chatId: String, dtos: List<MessageDto>) {
+        if (dtos.isEmpty()) return
+        // Messages carry a FK to conversations; upsert a placeholder row only if
+        // one doesn't exist yet so we never REPLACE (and thus cascade-delete) an
+        // existing conversation's already-cached messages.
+        if (conversationDao.getConversationById(chatId) == null) {
+            conversationDao.insertConversation(ConversationEntity(id = chatId, type = "direct"))
+        }
+        val entities = dtos.map { dto ->
+            MessageEntity(
+                id = dto.id,
+                conversation_id = chatId,
+                senderId = dto.senderId,
+                content = dto.content,
+                type = "text",
+                status = "SENT",
+                timestamp = parseTimestamp(dto.createdAt),
+                isEncrypted = dto.encrypted,
+                readAt = dto.readAt
+            )
+        }
+        messageDao.insertMessages(entities)
     }
 
     suspend fun searchUsers(token: String, query: String): Result<List<UserSearchResult>> =
@@ -235,6 +398,8 @@ class ChatRepository(
     fun leaveChatRoom(chatId: String) = webSocketManager.leaveChat(chatId)
     val incomingMessages get() = webSocketManager.incomingMessages
     val typingUpdates get() = webSocketManager.typingUpdates
+    val readReceipts get() = webSocketManager.readReceipts
+    val presenceUpdates get() = webSocketManager.presenceUpdates
 
     // ==================== Local cache access ====================
 
@@ -254,6 +419,15 @@ class ChatRepository(
             }
             .flowOn(Dispatchers.IO)
 
+    /** Mutes or unmutes a conversation locally. */
+    suspend fun setChatMuted(chatId: String, muted: Boolean) = withContext(Dispatchers.IO) {
+        // The row may not exist yet if this chat has never been opened.
+        if (conversationDao.getConversationById(chatId) == null) {
+            conversationDao.insertConversation(ConversationEntity(id = chatId, type = "direct"))
+        }
+        conversationDao.toggleMute(chatId, muted)
+    }
+
     suspend fun markAsRead(token: String, chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.markAsRead(bearer(token), chatId)
@@ -261,7 +435,8 @@ class ChatRepository(
                 conversationDao.clearUnreadCount(chatId)
                 Result.success(Unit)
             } else {
-                Result.failure(Exception("Failed to mark chat read: ${response.code()}"))
+                if (response.code() == 401) Result.failure(SessionExpiredException())
+                else Result.failure(Exception("Failed to mark chat read: ${response.code()}"))
             }
         } catch (e: Exception) {
             Log.e(TAG, "markAsRead error", e)

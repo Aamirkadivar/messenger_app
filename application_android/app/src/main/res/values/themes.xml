@@ -8,7 +8,11 @@
         <item name="android:colorPrimary">@color/primary_color</item>
         <item name="android:statusBarColor">@color/status_bar_color</item>
         <item name="android:windowBackground">@color/window_background</item>
-        <item name="android:background">@color/background_color</item>
+        <!-- Deliberately no android:background. A theme-level background is
+             inherited by every view that doesn't set its own, including the
+             DialogLayout that Compose hosts dialogs in, where it painted an
+             opaque white band around each dialog panel. windowBackground above
+             is what actually styles the launch window. -->
     </style>
 
     <!-- Translucent theme for auth redirects -->

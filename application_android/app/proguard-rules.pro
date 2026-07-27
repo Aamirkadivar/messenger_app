@@ -16,14 +16,14 @@
 -keepattributes *Annotation*
 -keepclassmembers enum * {
     public static **[] $VALUES;
-    public **;
+    public static *** values();
+    public static *** valueOf(java.lang.String);
 }
 -dontwarn kotlin.**
 
 # Kotlinx Serialization
 -keepattributes *SerialName*
 -keepattributes *Serialization*
--keep class * @kotlinx.serialization.*
 -dontwarn kotlinx.serialization.**
 
 # Room
@@ -42,11 +42,25 @@
 -keep class com.scottyab.** { *; }
 -dontwarn com.scottyab.**
 
+# JNA - its native code (Native.initIDs) looks up field/method IDs on these
+# classes by exact name via JNI, so R8 renaming/removing them crashes with
+# "Can't obtain peer field ID for class com.sun.jna.Pointer" at runtime.
+-keep class com.sun.jna.** { *; }
+-keepclassmembers class com.sun.jna.** { *; }
+-dontwarn com.sun.jna.**
+
+# lazysodium (libsodium JNA bindings used for E2EE) - binds native functions
+# reflectively via JNA proxies, so its interfaces/structures must survive
+# unobfuscated too.
+-keep class com.goterl.lazysodium.** { *; }
+-keepclassmembers class com.goterl.lazysodium.** { *; }
+-dontwarn com.goterl.lazysodium.**
+
 # Timber
 -keep class timber.log.Timber
 
 # Coroutines
--keepclassmembers,allowshrinking,allowobfuscation * {
+-keepclassmembers,allowshrinking,allowobfuscation class * {
     @kotlinx.coroutines.** *;
 }
 -dontwarn kotlinx.coroutines.internal.**

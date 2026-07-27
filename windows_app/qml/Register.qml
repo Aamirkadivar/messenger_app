@@ -1,10 +1,16 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Window 2.15
 
 Item {
     id: registerPage
     anchors.fill: parent
+
+    // The Window attached type only attaches to Item-derived elements, so it
+    // can't be referenced directly from inside a Behavior - resolve it once
+    // here instead and have the Behaviors below read this plain property.
+    property bool instantThemeActive: Window.window ? Window.window.instantTheme : false
 
     property bool isLoading: false
     property int passwordStrengthLevel: 0
@@ -49,9 +55,9 @@ Item {
         anchors.centerIn: parent
         width: Math.min(420, parent.width * 0.9)
         height: formLayout.y + formLayout.implicitHeight + 40
-        color: darkMode ? "rgba(22, 33, 62, 0.95)" : "rgba(255, 255, 255, 0.95)"
+        color: darkMode ? Qt.rgba(22/255, 33/255, 62/255, 0.95) : Qt.rgba(1, 1, 1, 0.95)
         radius: 24
-        border.color: darkMode ? "rgba(255, 255, 255, 0.06)" : "rgba(0, 0, 0, 0.04)"
+        border.color: darkMode ? Qt.rgba(1, 1, 1, 0.06) : Qt.rgba(0, 0, 0, 0.04)
         border.width: 1
         opacity: 0
         scale: 0.94
@@ -160,8 +166,8 @@ Item {
                     Layout.fillWidth: true
                     height: 46
                     radius: 12
-                    color: darkMode ? "rgba(42, 42, 74, 0.5)" : "rgba(240, 240, 245, 1)"
-                    border.color: usernameField.activeFocus ? "#4CAF50" : (darkMode ? "rgba(255, 255, 255, 0.08)" : "rgba(224, 224, 229, 1)")
+                    color: darkMode ? Qt.rgba(42/255, 42/255, 74/255, 0.5) : Qt.rgba(240/255, 240/255, 245/255, 1)
+                    border.color: usernameField.activeFocus ? "#4CAF50" : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1))
                     border.width: usernameField.activeFocus ? 2 : 1
                     Behavior on border.color { ColorAnimation { duration: 150 } }
 
@@ -208,8 +214,8 @@ Item {
                     Layout.fillWidth: true
                     height: 46
                     radius: 12
-                    color: darkMode ? "rgba(42, 42, 74, 0.5)" : "rgba(240, 240, 245, 1)"
-                    border.color: emailField.activeFocus ? "#4CAF50" : (darkMode ? "rgba(255, 255, 255, 0.08)" : "rgba(224, 224, 229, 1)")
+                    color: darkMode ? Qt.rgba(42/255, 42/255, 74/255, 0.5) : Qt.rgba(240/255, 240/255, 245/255, 1)
+                    border.color: emailField.activeFocus ? "#4CAF50" : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1))
                     border.width: emailField.activeFocus ? 2 : 1
                     Behavior on border.color { ColorAnimation { duration: 150 } }
 
@@ -260,8 +266,8 @@ Item {
                     Layout.fillWidth: true
                     height: 46
                     radius: 12
-                    color: darkMode ? "rgba(42, 42, 74, 0.5)" : "rgba(240, 240, 245, 1)"
-                    border.color: passwordField.activeFocus ? "#4CAF50" : (darkMode ? "rgba(255, 255, 255, 0.08)" : "rgba(224, 224, 229, 1)")
+                    color: darkMode ? Qt.rgba(42/255, 42/255, 74/255, 0.5) : Qt.rgba(240/255, 240/255, 245/255, 1)
+                    border.color: passwordField.activeFocus ? "#4CAF50" : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1))
                     border.width: passwordField.activeFocus ? 2 : 1
                     Behavior on border.color { ColorAnimation { duration: 150 } }
 
@@ -360,7 +366,10 @@ Item {
                             color: index < registerPage.passwordStrengthLevel
                                    ? registerPage.strengthColors[registerPage.passwordStrengthLevel - 1]
                                    : (darkMode ? "#2A2A4A" : "#E0E0E5")
-                            Behavior on color { ColorAnimation { duration: 150 } }
+                            Behavior on color {
+                                enabled: !registerPage.instantThemeActive
+                                ColorAnimation { duration: 150 }
+                            }
                         }
                     }
                 }
@@ -405,8 +414,8 @@ Item {
                     Layout.fillWidth: true
                     height: 46
                     radius: 12
-                    color: darkMode ? "rgba(42, 42, 74, 0.5)" : "rgba(240, 240, 245, 1)"
-                    border.color: confirmPasswordField.activeFocus ? "#4CAF50" : (darkMode ? "rgba(255, 255, 255, 0.08)" : "rgba(224, 224, 229, 1)")
+                    color: darkMode ? Qt.rgba(42/255, 42/255, 74/255, 0.5) : Qt.rgba(240/255, 240/255, 245/255, 1)
+                    border.color: confirmPasswordField.activeFocus ? "#4CAF50" : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1))
                     border.width: confirmPasswordField.activeFocus ? 2 : 1
                     Behavior on border.color { ColorAnimation { duration: 150 } }
 
@@ -511,7 +520,10 @@ Item {
                     border.color: termsCheck.checked ? "#4CAF50" : (darkMode ? "#5A5A7A" : "#9E9E9E")
                     border.width: 1.5
                     color: termsCheck.checked ? "#4CAF50" : "transparent"
-                    Behavior on color { ColorAnimation { duration: 120 } }
+                    Behavior on color {
+                        enabled: !registerPage.instantThemeActive
+                        ColorAnimation { duration: 120 }
+                    }
 
                     Canvas {
                         anchors.centerIn: parent
@@ -568,7 +580,10 @@ Item {
                     radius: 13
                     color: !registerButton.enabled ? (darkMode ? "#2A2A4A" : "#E0E0E5")
                            : registerMouse.pressed ? "#3D8B40" : (registerMouse.containsMouse ? "#5CBF60" : "#4CAF50")
-                    Behavior on color { ColorAnimation { duration: 120 } }
+                    Behavior on color {
+                        enabled: !registerPage.instantThemeActive
+                        ColorAnimation { duration: 120 }
+                    }
 
                     MouseArea {
                         id: registerMouse
@@ -601,7 +616,7 @@ Item {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 1
-                    color: darkMode ? "rgba(255, 255, 255, 0.08)" : "rgba(224, 224, 229, 1)"
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1)
                 }
                 Text {
                     text: "or"
@@ -611,7 +626,7 @@ Item {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 1
-                    color: darkMode ? "rgba(255, 255, 255, 0.08)" : "rgba(224, 224, 229, 1)"
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1)
                 }
             }
 
@@ -632,7 +647,10 @@ Item {
                     font.pixelSize: 13
                     font.bold: true
                     color: signInArea.containsMouse ? "#6FCF73" : "#4CAF50"
-                    Behavior on color { ColorAnimation { duration: 120 } }
+                    Behavior on color {
+                        enabled: !registerPage.instantThemeActive
+                        ColorAnimation { duration: 120 }
+                    }
 
                     MouseArea {
                         id: signInArea

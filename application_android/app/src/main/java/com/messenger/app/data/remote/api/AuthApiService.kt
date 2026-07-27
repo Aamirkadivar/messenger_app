@@ -3,9 +3,11 @@ package com.messenger.app.data.remote.api
 import com.messenger.app.data.model.*
 import retrofit2.Response
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 
@@ -65,6 +67,55 @@ interface ChatApiService {
         @Query("before") before: String? = null
     ): Response<MessagesResponse>
 
+    // ==================== Groups ====================
+    // Trailing slashes match the backend's groupRoutes.Post("/") registration.
+    // Member search when *creating* a group uses users/search above; the
+    // groups/{id}/search-users endpoint requires an existing group id.
+
+    @POST("groups/")
+    suspend fun createGroup(
+        @Header("Authorization") token: String,
+        @Body request: CreateGroupRequest
+    ): Response<GroupResponse>
+
+    @GET("groups/")
+    suspend fun getGroups(
+        @Header("Authorization") token: String
+    ): Response<GroupsListResponse>
+
+    @GET("groups/{chatId}")
+    suspend fun getGroupInfo(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String
+    ): Response<GroupResponse>
+
+    @PUT("groups/{chatId}")
+    suspend fun updateGroup(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Body request: UpdateGroupRequest
+    ): Response<Unit>
+
+    @POST("groups/{chatId}/members")
+    suspend fun addGroupMembers(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Body request: AddMembersRequest
+    ): Response<Unit>
+
+    @DELETE("groups/{chatId}/members/{memberId}")
+    suspend fun removeGroupMember(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Path("memberId") memberId: String
+    ): Response<Unit>
+
+    @POST("groups/{chatId}/leave")
+    suspend fun leaveGroup(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String
+    ): Response<Unit>
+
     @POST("crypto/public-key")
     suspend fun savePublicKey(
         @Header("Authorization") token: String,
@@ -75,5 +126,14 @@ interface ChatApiService {
     suspend fun getPublicKey(
         @Header("Authorization") token: String,
         @Path("userId") userId: String
+    ): Response<Map<String, String>>
+
+    /**
+     * The *current* user's registered public key. Used before generating a
+     * keypair to detect that this account already has one on another device.
+     */
+    @GET("crypto/public-key")
+    suspend fun getMyPublicKey(
+        @Header("Authorization") token: String
     ): Response<Map<String, String>>
 }
