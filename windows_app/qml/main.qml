@@ -116,6 +116,68 @@ ApplicationWindow {
 
                     Item { Layout.fillWidth: true }
 
+                    // Settings
+                    Rectangle {
+                        Layout.preferredWidth: 36
+                        Layout.preferredHeight: 36
+                        radius: 8
+                        visible: appRoot.isLoggedIn
+                        color: settingsMouse.containsPress ? appRoot.borderColor : (settingsMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
+                        Behavior on color {
+                            enabled: !appRoot.instantTheme
+                            ColorAnimation { duration: 100 }
+                        }
+
+                        Canvas {
+                            anchors.centerIn: parent
+                            width: 16
+                            height: 16
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.reset()
+                                ctx.fillStyle = appRoot.textSecondary
+                                var cx = 8, cy = 8
+                                var bodyR = 4.6
+                                var toothLen = 2.1
+                                var toothW = 2.0
+                                var teeth = 8
+
+                                ctx.beginPath()
+                                ctx.arc(cx, cy, bodyR, 0, Math.PI * 2)
+                                ctx.fill()
+
+                                for (var i = 0; i < teeth; i++) {
+                                    var angle = (i / teeth) * Math.PI * 2
+                                    ctx.save()
+                                    ctx.translate(cx, cy)
+                                    ctx.rotate(angle)
+                                    ctx.fillRect(-toothW / 2, -(bodyR + toothLen), toothW, toothLen + 0.5)
+                                    ctx.restore()
+                                }
+
+                                // Punch the center hole through everything
+                                // drawn so far, regardless of background.
+                                ctx.globalCompositeOperation = "destination-out"
+                                ctx.beginPath()
+                                ctx.arc(cx, cy, 1.9, 0, Math.PI * 2)
+                                ctx.fill()
+                                ctx.globalCompositeOperation = "source-over"
+                            }
+                        }
+
+                        ToolTip.visible: settingsMouse.containsMouse
+                        ToolTip.text: "Settings"
+                        ToolTip.delay: 400
+
+                        MouseArea {
+                            id: settingsMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: settingsPanel.open()
+                        }
+                    }
+
                     // Logout
                     Rectangle {
                         Layout.preferredWidth: 36
@@ -359,7 +421,7 @@ ApplicationWindow {
                     offlineColor: appRoot.offlineColor
                     activeChatId: chatViewLoader.item ? chatViewLoader.item.currentChatId : ""
 
-                    onChatSelected: (chatId, chatName, otherUserId, online) => {
+                    onChatSelected: (chatId, chatName, otherUserId, online, chatType, avatarUrl) => {
                         chatViewLoader.source = "qrc:/qml/ChatView.qml"
                         // Theme/color properties are kept live via the Binding
                         // elements on chatViewLoader below - only this chat's
@@ -368,10 +430,16 @@ ApplicationWindow {
                         chatViewLoader.item.currentChatName = chatName
                         chatViewLoader.item.otherUserId = otherUserId
                         chatViewLoader.item.isOnline = online
+                        chatViewLoader.item.currentChatType = chatType || "direct"
+                        chatViewLoader.item.currentChatAvatarUrl = avatarUrl || ""
                     }
 
                     onNewChatClicked: {
                         newChatDialog.open()
+                    }
+
+                    onNewGroupClicked: {
+                        newGroupDialog.open()
                     }
                 }
 
@@ -404,6 +472,14 @@ ApplicationWindow {
                     Binding { target: chatViewLoader.item; property: "onlineColor"; value: appRoot.onlineColor; when: chatViewLoader.status === Loader.Ready }
                     Binding { target: chatViewLoader.item; property: "myMessageBg"; value: appRoot.myMessageBg; when: chatViewLoader.status === Loader.Ready }
                     Binding { target: chatViewLoader.item; property: "theirMessageBg"; value: appRoot.theirMessageBg; when: chatViewLoader.status === Loader.Ready }
+
+                    Connections {
+                        target: chatViewLoader.item
+                        function onOpenChatInfo(chatId) {
+                            groupInfoPanel.chatId = chatId
+                            groupInfoPanel.open()
+                        }
+                    }
 
                     Rectangle {
                         anchors.fill: parent
@@ -467,6 +543,76 @@ ApplicationWindow {
             onlineColor: appRoot.onlineColor
         }
 
+        NewGroupDialog {
+            id: newGroupDialog
+            parent: appRoot.contentItem
+            darkMode: appRoot.darkMode
+            bgColor: appRoot.bgColor
+            surfaceColor: appRoot.surfaceColor
+            surfaceColorHover: appRoot.surfaceColorHover
+            textColor: appRoot.textColor
+            textSecondary: appRoot.textSecondary
+            borderColor: appRoot.borderColor
+            accentColor: appRoot.accentColor
+            onlineColor: appRoot.onlineColor
+
+            onGroupCreated: (chatId, chatName, avatarUrl) => {
+                chatViewLoader.source = "qrc:/qml/ChatView.qml"
+                chatViewLoader.item.darkMode = appRoot.darkMode
+                chatViewLoader.item.bgColor = appRoot.bgColor
+                chatViewLoader.item.surfaceColor = appRoot.surfaceColor
+                chatViewLoader.item.textColor = appRoot.textColor
+                chatViewLoader.item.textSecondary = appRoot.textSecondary
+                chatViewLoader.item.borderColor = appRoot.borderColor
+                chatViewLoader.item.accentColor = appRoot.accentColor
+                chatViewLoader.item.onlineColor = appRoot.onlineColor
+                chatViewLoader.item.currentChatId = chatId
+                chatViewLoader.item.currentChatName = chatName
+                chatViewLoader.item.currentChatType = "group"
+                chatViewLoader.item.currentChatAvatarUrl = avatarUrl || ""
+            }
+        }
+
+        Settings {
+            id: settingsPanel
+            parent: appRoot.contentItem
+            darkMode: appRoot.darkMode
+            bgColor: appRoot.bgColor
+            surfaceColor: appRoot.surfaceColor
+            surfaceColorHover: appRoot.surfaceColorHover
+            textColor: appRoot.textColor
+            textSecondary: appRoot.textSecondary
+            borderColor: appRoot.borderColor
+            accentColor: appRoot.accentColor
+
+            onDarkModeToggled: {
+                appRoot.instantTheme = true
+                appRoot.darkMode = !appRoot.darkMode
+                Qt.callLater(function() { appRoot.instantTheme = false })
+            }
+
+            onLogoutRequested: logoutDialog.open()
+        }
+
+        GroupInfoPanel {
+            id: groupInfoPanel
+            parent: appRoot.contentItem
+            darkMode: appRoot.darkMode
+            bgColor: appRoot.bgColor
+            surfaceColor: appRoot.surfaceColor
+            surfaceColorHover: appRoot.surfaceColorHover
+            textColor: appRoot.textColor
+            textSecondary: appRoot.textSecondary
+            borderColor: appRoot.borderColor
+            accentColor: appRoot.accentColor
+
+            onGroupGone: (chatId) => {
+                if (chatViewLoader.item && chatViewLoader.item.currentChatId === chatId) {
+                    chatViewLoader.source = ""
+                }
+            }
+        }
+
         Connections {
             target: chatService
 
@@ -482,6 +628,8 @@ ApplicationWindow {
                 chatViewLoader.item.onlineColor = appRoot.onlineColor
                 chatViewLoader.item.currentChatId = chatId
                 chatViewLoader.item.currentChatName = chatName
+                chatViewLoader.item.currentChatType = "direct"
+                chatViewLoader.item.currentChatAvatarUrl = ""
             }
 
             function onSearchError(error) {

@@ -7,6 +7,9 @@ import android.os.Build
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.messenger.app.BuildConfig
+import android.net.Uri
+import com.messenger.app.data.remote.api.ChatApiService
+import com.messenger.app.data.repository.AvatarRepository
 import com.messenger.app.data.repository.ChatRepository
 import com.messenger.app.data.settings.AppSettings
 import com.messenger.app.data.settings.AutoDeleteWindow
@@ -19,6 +22,7 @@ import com.messenger.app.data.settings.SettingsRepository
 import com.messenger.app.data.storage.StorageAnalyzer
 import com.messenger.app.data.storage.StorageScanState
 import com.messenger.app.data.storage.formatBytes
+import com.messenger.app.security.TokenManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
@@ -29,6 +33,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.time.LocalTime
 import java.util.Locale
@@ -36,6 +41,13 @@ import javax.inject.Inject
 
 /** A conversation the user has muted. */
 data class MutedChatUi(val chatId: String, val name: String)
+
+/** The signed-in user, shown in the Settings profile row. */
+data class ProfileUi(
+    val name: String = "",
+    val email: String = "",
+    val avatarUrl: String? = null
+)
 
 /** Read-only build and device facts shown in About. */
 data class AboutInfo(
@@ -61,7 +73,10 @@ class SettingsViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val settingsRepository: SettingsRepository,
     private val storageAnalyzer: StorageAnalyzer,
-    private val chatRepository: ChatRepository
+    private val chatRepository: ChatRepository,
+    private val avatarRepository: AvatarRepository,
+    private val chatApiService: ChatApiService,
+    private val tokenManager: TokenManager
 ) : ViewModel() {
 
     /**
@@ -112,9 +127,53 @@ class SettingsViewModel @Inject constructor(
     private val _toast = MutableStateFlow<String?>(null)
     val toast: StateFlow<String?> = _toast.asStateFlow()
 
+    /** The signed-in user, for the profile row (name + picture). */
+    private val _profile = MutableStateFlow(ProfileUi())
+    val profile: StateFlow<ProfileUi> = _profile.asStateFlow()
+
+    private val _uploadingAvatar = MutableStateFlow(false)
+    val uploadingAvatar: StateFlow<Boolean> = _uploadingAvatar.asStateFlow()
+
+    private fun loadProfile() {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            runCatching { chatApiService.getCurrentUser("Bearer $token") }
+                .getOrNull()
+                ?.takeIf { it.isSuccessful }
+                ?.body()
+                ?.user
+                ?.let { me ->
+                    _profile.value = ProfileUi(
+                        name = me.displayName?.takeIf { it.isNotBlank() } ?: me.username,
+                        email = me.email,
+                        avatarUrl = me.avatarUrl
+                    )
+                }
+        }
+    }
+
+    /** Uploads a new profile picture from a picked image. */
+    fun setProfilePhoto(uri: Uri) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            _uploadingAvatar.value = true
+            avatarRepository.uploadMyAvatar(token, uri)
+                .onSuccess { url ->
+                    _uploadingAvatar.value = false
+                    _profile.update { it.copy(avatarUrl = url) }
+                    _toast.value = "Profile picture updated"
+                }
+                .onFailure { e ->
+                    _uploadingAvatar.value = false
+                    _toast.value = e.message ?: "Failed to update picture"
+                }
+        }
+    }
+
     init {
         // Kick off the (slow) scan as soon as Settings is first constructed.
         storageAnalyzer.scan()
+        loadProfile()
     }
 
     fun consumeToast() { _toast.value = null }

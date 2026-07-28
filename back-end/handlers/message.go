@@ -87,6 +87,9 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 	if req.FileURL != "" {
 		message.FileURL = req.FileURL
 		message.ContentType = req.FileType
+		message.DurationMs = req.DurationMs
+		message.FileName = req.FileName
+		message.FileSize = req.FileSize
 	}
 
 	if err := database.DB.Create(&message).Error; err != nil {
@@ -100,13 +103,18 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 	wsMsg := models.WebSocketMessage{
 		Type: "message",
 		Data: map[string]interface{}{
-			"chat_id":    chatID,
-			"chat_type":  chat.Type,
-			"message_id": messageID.String(),
-			"sender_id":  userID.String(),
-			"content":    content,
-			"encrypted":  req.Encrypted,
-			"timestamp":  message.CreatedAt,
+			"chat_id":     chatID,
+			"chat_type":   chat.Type,
+			"message_id":  messageID.String(),
+			"sender_id":   userID.String(),
+			"content":     content,
+			"encrypted":   req.Encrypted,
+			"file_url":    message.FileURL,
+			"file_type":   message.ContentType,
+			"file_name":   message.FileName,
+			"file_size":   message.FileSize,
+			"duration_ms": message.DurationMs,
+			"timestamp":   message.CreatedAt,
 		},
 		Timestamp: time.Now(),
 	}
@@ -128,6 +136,9 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 			"content":      content,
 			"file_url":     message.FileURL,
 			"file_type":    message.ContentType,
+			"file_name":    message.FileName,
+			"file_size":    message.FileSize,
+			"duration_ms":  message.DurationMs,
 			"type":         chat.Type,
 			"delivered_at": message.CreatedAt,
 			"created_at":   message.CreatedAt,
@@ -291,6 +302,9 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 		Encrypted   bool       `json:"encrypted"`
 		FileURL     *string    `json:"file_url,omitempty"`
 		FileType    *string    `json:"file_type,omitempty"`
+		FileName    *string    `json:"file_name,omitempty"`
+		FileSize    int64      `json:"file_size"`
+		DurationMs  int64      `json:"duration_ms"`
 		Type        string     `json:"type"`
 		DeliveredAt *time.Time `json:"delivered_at"`
 		ReadAt      *time.Time `json:"read_at"`
@@ -320,7 +334,14 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 
 	for i, m := range messages {
 		sender := senderMap[m.SenderID.String()]
+		// Both of these must be per-iteration copies. go.mod declares go 1.21,
+		// where the range variable is reused between iterations - taking
+		// &m.ContentType directly gave every message the same pointer, so the
+		// whole list reported the *last* message's content type and voice notes
+		// came back as "text".
 		fileURL := m.FileURL
+		contentType := m.ContentType
+		fileName := m.FileName
 		decryptedMessages[i] = DecryptedMessage{
 			ID:       m.ID.String(),
 			ChatID:   m.ChatID,
@@ -334,7 +355,10 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 			Content:     m.EncryptedContent,
 			Encrypted:   m.IsEncrypted,
 			FileURL:     &fileURL,
-			FileType:    &m.ContentType,
+			FileType:    &contentType,
+			FileName:    &fileName,
+			FileSize:    m.FileSize,
+			DurationMs:  m.DurationMs,
 			Type:        m.ChatType,
 			DeliveredAt: m.DeliveredAt,
 			ReadAt:      m.ReadAt,
@@ -489,27 +513,28 @@ func (s *MessageService) GetUnreadCount(c *fiber.Ctx) error {
 
 // ChatListItem represents a single chat entry in the user's chat list
 type ChatListItem struct {
-	ID             string       `json:"id"`
-	Type           string       `json:"type"`
-	Name           string       `json:"name"`
-	AvatarURL      string       `json:"avatar_url"`
-	OtherUserID    *uuid.UUID   `json:"other_user_id,omitempty"`
-	OtherUser      *models.User `json:"other_user,omitempty"`
-	LastMessage    *MessageResp `json:"last_message"`
-	LastMessageAt  *time.Time   `json:"last_message_at"`
-	UnreadCount    int64        `json:"unread_count"`
-	LastReadAt     *time.Time   `json:"last_read_at"`
-	IsOnline       bool         `json:"is_online"`
-	UpdatedAt      time.Time    `json:"updated_at"`
+	ID            string       `json:"id"`
+	Type          string       `json:"type"`
+	Name          string       `json:"name"`
+	AvatarURL     string       `json:"avatar_url"`
+	OtherUserID   *uuid.UUID   `json:"other_user_id,omitempty"`
+	OtherUser     *models.User `json:"other_user,omitempty"`
+	LastMessage   *MessageResp `json:"last_message"`
+	LastMessageAt *time.Time   `json:"last_message_at"`
+	UnreadCount   int64        `json:"unread_count"`
+	LastReadAt    *time.Time   `json:"last_read_at"`
+	IsOnline      bool         `json:"is_online"`
+	UpdatedAt     time.Time    `json:"updated_at"`
 }
 
 type MessageResp struct {
-	ID        string    `json:"id"`
-	SenderID  string    `json:"sender_id"`
-	Content   string    `json:"content"`
-	ContentType string  `json:"content_type"`
-	Encrypted bool      `json:"encrypted"`
-	CreatedAt time.Time `json:"created_at"`
+	ID          string    `json:"id"`
+	SenderID    string    `json:"sender_id"`
+	Content     string    `json:"content"`
+	ContentType string    `json:"content_type"`
+	FileName    string    `json:"file_name,omitempty"`
+	Encrypted   bool      `json:"encrypted"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // GetChatsByUserID handles getting all chats for the current user
@@ -596,13 +621,13 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 		}
 
 		item := ChatListItem{
-			ID:          ch.ID,
-			Type:        ch.Type,
-			Name:        ch.Name,
-			AvatarURL:   ch.AvatarURL,
+			ID:            ch.ID,
+			Type:          ch.Type,
+			Name:          ch.Name,
+			AvatarURL:     ch.AvatarURL,
 			LastMessageAt: ch.LastMessageAt,
-			LastReadAt:  p.LastReadAt,
-			UpdatedAt:   ch.UpdatedAt,
+			LastReadAt:    p.LastReadAt,
+			UpdatedAt:     ch.UpdatedAt,
 		}
 
 		// Find other user(s)
@@ -630,6 +655,7 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 				SenderID:    msg.SenderID.String(),
 				Content:     msg.EncryptedContent,
 				ContentType: msg.ContentType,
+				FileName:    msg.FileName,
 				Encrypted:   msg.IsEncrypted,
 				CreatedAt:   msg.CreatedAt,
 			}

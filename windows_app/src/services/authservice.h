@@ -13,6 +13,8 @@ class AuthService : public QObject {
     Q_PROPERTY(bool isLoggedIn READ isLoggedIn NOTIFY isLoggedInChanged)
     Q_PROPERTY(QString currentUserId READ currentUserId NOTIFY currentUserIdChanged)
     Q_PROPERTY(QString currentUsername READ currentUsername NOTIFY currentUsernameChanged)
+    Q_PROPERTY(QString currentUserEmail READ currentUserEmail NOTIFY profileChanged)
+    Q_PROPERTY(QString currentUserAvatarUrl READ currentUserAvatarUrl NOTIFY profileChanged)
 
 public:
     explicit AuthService(QObject* parent = nullptr);
@@ -20,6 +22,13 @@ public:
     bool isLoggedIn() const { return m_loggedIn; }
     const QString& currentUserId() const { return m_currentUserId; }
     const QString& currentUsername() const { return m_currentUsername; }
+    const QString& currentUserEmail() const { return m_currentUserEmail; }
+    const QString& currentUserAvatarUrl() const { return m_currentUserAvatarUrl; }
+
+    // GET /users/me - fills in email/avatar (not returned by login/restoreSession).
+    Q_INVOKABLE void fetchOwnProfile();
+    // POST /users/me/avatar (multipart). filePath is a file:// URL or plain path.
+    Q_INVOKABLE void uploadAvatar(const QString& filePath);
 
     Q_INVOKABLE void login(const QString& username, const QString& password);
     Q_INVOKABLE void registerUser(const QString& username, const QString& email, const QString& password);
@@ -53,6 +62,9 @@ signals:
     void registerFailed(const QString& error);
     void logoutSuccess();
     void tokenReady(const QString& token);
+    void profileChanged();
+    void avatarUploaded(const QString& avatarUrl);
+    void avatarUploadFailed(const QString& message);
 
 private slots:
     void onLoginReplyFinished();
@@ -70,6 +82,8 @@ private:
     bool m_loggedIn = false;
     QString m_currentUserId;
     QString m_currentUsername;
+    QString m_currentUserEmail;
+    QString m_currentUserAvatarUrl;
     QNetworkAccessManager* m_networkManager = nullptr;
     QNetworkReply* m_currentReply = nullptr;
     QString m_accessToken;

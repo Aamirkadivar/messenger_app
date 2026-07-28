@@ -140,6 +140,7 @@ void WebSocketService::onDisconnected() {
     emit disconnected();
     emit connectedChanged();
     if (m_autoReconnect) {
+        emit connectionAttemptFailed();
         m_reconnectTimer.start();
     }
 }
@@ -163,6 +164,11 @@ void WebSocketService::onTextMessageReceived(const QString& message) {
         m["content"] = data[QStringLiteral("content")].toString();
         m["encrypted"] = data[QStringLiteral("encrypted")].toBool(false);
         m["createdAt"] = data[QStringLiteral("timestamp")].toString();
+        m["fileUrl"] = data[QStringLiteral("file_url")].toString();
+        m["fileType"] = data[QStringLiteral("file_type")].toString();
+        m["fileName"] = data[QStringLiteral("file_name")].toString();
+        m["fileSize"] = static_cast<qint64>(data[QStringLiteral("file_size")].toDouble(0));
+        m["durationMs"] = static_cast<qint64>(data[QStringLiteral("duration_ms")].toDouble(0));
 
         emit messageReceived(chatId, m);
     } else if (type == QStringLiteral("typing")) {

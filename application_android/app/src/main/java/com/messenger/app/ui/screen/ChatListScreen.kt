@@ -27,26 +27,17 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.messenger.app.ui.components.Avatar
 import com.messenger.app.ui.theme.OnlineColor
 import com.messenger.app.ui.theme.ThemeState
 import com.messenger.app.ui.viewmodel.ChatListItemUi
 import com.messenger.app.ui.viewmodel.ChatViewModel
 
-private val avatarPalette = listOf(
-    Color(0xFF6C63FF), Color(0xFF4CAF50), Color(0xFFFF9800),
-    Color(0xFFE91E63), Color(0xFF9C27B0), Color(0xFF00BCD4)
-)
-
-private fun avatarColorFor(name: String): Color {
-    if (name.isEmpty()) return avatarPalette[0]
-    return avatarPalette[(name.hashCode().and(Int.MAX_VALUE)) % avatarPalette.size]
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatListScreen(
     chatViewModel: ChatViewModel,
-    onChatClick: (chatId: String, chatName: String) -> Unit,
+    onChatClick: (chatId: String, chatName: String, isGroup: Boolean) -> Unit,
     onOpenSettings: () -> Unit,
     onCreateGroup: () -> Unit,
     onSessionExpired: () -> Unit,
@@ -123,7 +114,7 @@ fun ChatListScreen(
                 else -> {
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
                         items(listState.chats, key = { it.id }) { chat ->
-                            ChatRow(chat, onClick = { onChatClick(chat.id, chat.name) })
+                            ChatRow(chat, onClick = { onChatClick(chat.id, chat.name, chat.isGroup) })
                         }
                     }
                 }
@@ -138,7 +129,7 @@ fun ChatListScreen(
             onDismiss = { showNewChat = false },
             onChatStarted = { chatId, name ->
                 showNewChat = false
-                onChatClick(chatId, name)
+                onChatClick(chatId, name, false)
             }
         )
     }
@@ -205,19 +196,7 @@ private fun ChatRow(chat: ChatListItemUi, onClick: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(modifier = Modifier.size(48.dp), contentAlignment = Alignment.BottomEnd) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(avatarColorFor(chat.name), CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    chat.name.take(1).uppercase(),
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleMedium
-                )
-            }
+            Avatar(name = chat.name, avatarUrl = chat.avatarUrl, size = 48.dp)
             if (chat.isOnline) {
                 Box(
                     modifier = Modifier

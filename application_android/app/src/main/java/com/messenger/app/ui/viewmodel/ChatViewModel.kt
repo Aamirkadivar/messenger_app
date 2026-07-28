@@ -8,8 +8,14 @@ import com.messenger.app.data.model.MessageDto
 import com.messenger.app.data.model.UserSearchResult
 import com.messenger.app.data.repository.ChatRepository
 import com.messenger.app.data.repository.SessionExpiredException
+import com.messenger.app.data.repository.VoiceRepository
+import com.messenger.app.data.voice.VoicePlaybackState
+import com.messenger.app.data.voice.VoicePlayer
+import com.messenger.app.data.voice.VoiceRecorder
 import com.messenger.app.security.TokenManager
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -32,12 +38,20 @@ data class ChatMessageUi(
     val content: String,
     val timestamp: Long,
     val isMine: Boolean,
-    val isRead: Boolean = false
-)
+    val isRead: Boolean = false,
+    /** Non-null for voice notes; the bubble renders a player instead of text. */
+    val voiceUrl: String? = null,
+    val voiceDurationMs: Long = 0,
+    val voiceEncrypted: Boolean = false
+) {
+    val isVoice: Boolean get() = !voiceUrl.isNullOrBlank()
+}
 
 data class ChatUiState(
     val chatId: String? = null,
     val chatName: String = "",
+    val chatAvatarUrl: String? = null,
+    val chatType: String = "direct",
     val messages: List<ChatMessageUi> = emptyList(),
     val isSending: Boolean = false,
     val error: String? = null
@@ -57,7 +71,16 @@ data class ChatListItemUi(
     val timestamp: String,
     val unreadCount: Long,
     val isOnline: Boolean,
-    val isGroup: Boolean = false
+    val isGroup: Boolean = false,
+    /** Group picture for groups, the other person's picture for direct chats. */
+    val avatarUrl: String? = null
+)
+
+/** Live state while the mic is open. */
+data class RecordingUiState(
+    val isRecording: Boolean = false,
+    val elapsedMs: Long = 0,
+    val amplitude: Float = 0f
 )
 
 data class ChatListUiState(
@@ -69,6 +92,9 @@ data class ChatListUiState(
 @HiltViewModel
 class ChatViewModel @Inject constructor(
     private val chatRepository: ChatRepository,
+    private val voiceRepository: VoiceRepository,
+    private val voiceRecorder: VoiceRecorder,
+    private val voicePlayer: VoicePlayer,
     private val tokenManager: TokenManager
 ) : ViewModel() {
 
@@ -199,7 +225,8 @@ class ChatViewModel @Inject constructor(
             // A group has no presence of its own; showing other_user's dot would
             // report one arbitrary member as "the group being online".
             isOnline = if (isGroup) false else (dto.otherUser?.isOnline ?: dto.isOnline),
-            isGroup = isGroup
+            isGroup = isGroup,
+            avatarUrl = if (isGroup) dto.avatarUrl else dto.otherUser?.avatarUrl
         )
     }
 
@@ -305,6 +332,20 @@ class ChatViewModel @Inject constructor(
             // Show cached history immediately (works offline too), then refresh
             // from the network below - mirrors the windows_app cache-first
             // pattern for message history.
+            // Header picture: look it up locally instead of passing an encoded
+            // URL through the nav route.
+            runCatching {
+                chatRepository.loadCachedChats().firstOrNull { it.id == chatId }
+            }.getOrNull()?.let { dto ->
+                val isGroupChat = dto.type.equals("group", true)
+                val url = if (isGroupChat) dto.avatarUrl else dto.otherUser?.avatarUrl
+                if (_chatState.value.chatId == chatId) {
+                    _chatState.update {
+                        it.copy(chatAvatarUrl = url, chatType = dto.type.ifBlank { "direct" })
+                    }
+                }
+            }
+
             val cachedMessages = chatRepository.loadCachedMessages(chatId)
             if (cachedMessages.isNotEmpty()) {
                 val cachedHistory = cachedMessages.asReversed().map { dto ->
@@ -340,15 +381,24 @@ class ChatViewModel @Inject constructor(
 
     private suspend fun toChatMessageUi(chatId: String, dto: MessageDto, myId: String): ChatMessageUi {
         val isMine = dto.senderId == myId
+        val isVoice = dto.fileType == ChatRepository.VOICE_CONTENT_TYPE &&
+            !dto.fileUrl.isNullOrBlank()
         return ChatMessageUi(
             id = dto.id,
             senderId = dto.senderId,
             senderName = dto.sender?.displayName?.takeIf { it.isNotBlank() }
                 ?: dto.sender?.username ?: "",
-            content = chatRepository.decryptFor(chatId, dto.content, dto.encrypted),
+            // A voice note has no text body; decrypting the empty content would
+            // just yield the "encrypted" placeholder.
+            content = if (isVoice) "" else {
+                chatRepository.decryptFor(chatId, dto.content, dto.encrypted)
+            },
             timestamp = parseMessageTimestamp(dto.createdAt),
             isMine = isMine,
-            isRead = isMine && !dto.readAt.isNullOrEmpty()
+            isRead = isMine && !dto.readAt.isNullOrEmpty(),
+            voiceUrl = if (isVoice) dto.fileUrl else null,
+            voiceDurationMs = dto.durationMs,
+            voiceEncrypted = isVoice && dto.encrypted
         )
     }
 
@@ -416,6 +466,141 @@ class ChatViewModel @Inject constructor(
                     _chatState.update { it.copy(isSending = false, error = e.message ?: "Failed to send") }
                 }
         }
+    }
+
+    // ==================== Voice notes ====================
+
+    private val _recording = MutableStateFlow(RecordingUiState())
+    val recording: StateFlow<RecordingUiState> = _recording.asStateFlow()
+
+    val playback: StateFlow<VoicePlaybackState> get() = voicePlayer.state
+
+    private var tickJob: Job? = null
+
+    /** Begins recording. The caller must already hold RECORD_AUDIO. */
+    fun startRecording() {
+        if (_chatState.value.chatId == null) return
+        if (!voiceRecorder.start()) {
+            _chatState.update { it.copy(error = "Could not start recording") }
+            return
+        }
+        _recording.value = RecordingUiState(isRecording = true)
+        tickJob?.cancel()
+        tickJob = viewModelScope.launch {
+            while (voiceRecorder.isRecording) {
+                _recording.update {
+                    it.copy(
+                        elapsedMs = voiceRecorder.elapsedMs(),
+                        amplitude = voiceRecorder.amplitude()
+                    )
+                }
+                delay(100)
+            }
+        }
+    }
+
+    /** Discards the recording without sending. */
+    fun cancelRecording() {
+        tickJob?.cancel()
+        voiceRecorder.cancel()
+        _recording.value = RecordingUiState()
+    }
+
+    /** Stops, encrypts, uploads and posts the voice note. */
+    fun stopRecordingAndSend() {
+        tickJob?.cancel()
+        val chatId = _chatState.value.chatId
+        val result = voiceRecorder.stop()
+        _recording.value = RecordingUiState()
+
+        if (chatId == null) return
+        if (result == null) {
+            _chatState.update { it.copy(error = "Hold to record - that was too short") }
+            return
+        }
+
+        viewModelScope.launch {
+            _chatState.update { it.copy(isSending = true) }
+            val token = tokenManager.getAccessToken().getOrNull()
+            if (token.isNullOrEmpty()) {
+                _chatState.update { it.copy(isSending = false, error = "Not signed in") }
+                return@launch
+            }
+
+            voiceRepository.upload(token, chatId, result.file)
+                .onSuccess { uploaded ->
+                    chatRepository.sendVoiceMessage(
+                        token = token,
+                        chatId = chatId,
+                        // The server derives the real type from the chat row, but
+                        // don't claim "direct" for a group either.
+                        chatType = _chatState.value.chatType,
+                        fileUrl = uploaded.fileUrl,
+                        durationMs = result.durationMs,
+                        encrypted = uploaded.encrypted
+                    )
+                        .onSuccess {
+                            _chatState.update { it.copy(isSending = false) }
+                            openChat(chatId, _chatState.value.chatName)
+                        }
+                        .onFailure { e ->
+                            _chatState.update {
+                                it.copy(isSending = false, error = e.message ?: "Failed to send")
+                            }
+                        }
+                }
+                .onFailure { e ->
+                    Log.e(TAG, "voice upload failed", e)
+                    _chatState.update {
+                        it.copy(isSending = false, error = e.message ?: "Failed to send voice note")
+                    }
+                }
+        }
+    }
+
+    /** Play/pause a voice note, downloading and decrypting it on first play. */
+    fun toggleVoicePlayback(message: ChatMessageUi) {
+        val chatId = _chatState.value.chatId ?: return
+        val url = message.voiceUrl ?: return
+
+        // Already the active note - just toggle, no refetch.
+        if (voicePlayer.state.value.messageId == message.id) {
+            voicePlayer.toggle(message.id, java.io.File(""))
+            return
+        }
+
+        viewModelScope.launch {
+            voiceRepository.fetchForPlayback(chatId, message.id, url, message.voiceEncrypted)
+                .onSuccess { file ->
+                    voicePlayer.toggle(message.id, file)
+                    startPlaybackTicker()
+                }
+                .onFailure { e ->
+                    _chatState.update {
+                        it.copy(error = e.message ?: "Could not play voice note")
+                    }
+                }
+        }
+    }
+
+    private var playbackTicker: Job? = null
+
+    private fun startPlaybackTicker() {
+        playbackTicker?.cancel()
+        playbackTicker = viewModelScope.launch {
+            while (voicePlayer.state.value.isPlaying) {
+                voicePlayer.syncPosition()
+                delay(200)
+            }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        tickJob?.cancel()
+        playbackTicker?.cancel()
+        voiceRecorder.cancel()
+        voicePlayer.stop()
     }
 
     fun setTypingStatus(isTyping: Boolean) {

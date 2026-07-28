@@ -7,8 +7,11 @@
         <file>../qml/ChatView.qml</file>
         <file>../qml/ChatBackground.qml</file>
         <file>../qml/NewChatDialog.qml</file>
+        <file>../qml/NewGroupDialog.qml</file>
+        <file>../qml/GroupInfoPanel.qml</file>
         <file>../qml/MessageBubble.qml</file>
         <file>../qml/Settings.qml</file>
+        <file>../qml/Avatar.qml</file>
     </qresource>
     <qresource prefix="/icons">
         <file alias="send.svg">icons/send.svg</file>

@@ -4,7 +4,9 @@ import android.util.Log
 import com.messenger.app.data.model.AddMembersRequest
 import com.messenger.app.data.model.CreateGroupRequest
 import com.messenger.app.data.model.GroupDto
+import com.messenger.app.data.model.GroupRole
 import com.messenger.app.data.model.UpdateGroupRequest
+import com.messenger.app.data.model.UpdateMemberRoleRequest
 import com.messenger.app.data.remote.api.ChatApiService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -143,6 +145,47 @@ class GroupRepository(
             }
         }
 
+    /**
+     * Promotes a member to admin, or demotes an admin back to member.
+     * Admin only; the server refuses to change the owner's role.
+     */
+    suspend fun setMemberRole(
+        token: String,
+        chatId: String,
+        memberId: String,
+        role: GroupRole
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val response = chatApiService.updateMemberRole(
+                bearer(token), chatId, memberId, UpdateMemberRoleRequest(role.id)
+            )
+            if (response.isSuccessful) {
+                Result.success(Unit)
+            } else {
+                Result.failure(Exception(response.errorMessage("Failed to update role")))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "setMemberRole error", e)
+            Result.failure(e)
+        }
+    }
+
+    /** Owner only - irreversible, removes the group for every member. */
+    suspend fun deleteGroup(token: String, chatId: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val response = chatApiService.deleteGroup(bearer(token), chatId)
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(Exception(response.errorMessage("Failed to delete group")))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "deleteGroup error", e)
+                Result.failure(e)
+            }
+        }
+
     /** Admin only. */
     suspend fun updateGroup(
         token: String,
@@ -190,7 +233,7 @@ class GroupRepository(
  * The backend returns {"error": ..., "message": ...} on failure; prefer its
  * message over a bare HTTP code so validation problems are actionable.
  */
-private fun Response<*>.errorMessage(fallback: String): String {
+internal fun Response<*>.errorMessage(fallback: String): String {
     val body = runCatching { errorBody()?.string() }.getOrNull()
     val serverMessage = body
         ?.substringAfter("\"message\":\"", "")

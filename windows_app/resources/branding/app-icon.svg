@@ -1,0 +1,27 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Messenger app icon">
+  <title>Messenger</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#17141C"/>
+      <stop offset="100%" stop-color="#0A0A0F"/>
+    </linearGradient>
+    <linearGradient id="bubble" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#DBBE7E"/>
+      <stop offset="100%" stop-color="#A6803A"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="42%" r="60%">
+      <stop offset="0%" stop-color="#C9A961" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#C9A961" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="112" fill="none" stroke="#C9A961" stroke-opacity="0.18" stroke-width="2"/>
+  <circle cx="256" cy="215" r="180" fill="url(#glow)"/>
+
+  <path d="M172,150 L340,150 A36,36 0 0 1 376,186 L376,294 A36,36 0 0 1 340,330 L237,330 L203,370 L218,330 L172,330 A36,36 0 0 1 136,294 L136,186 A36,36 0 0 1 172,150 Z"
+        fill="url(#bubble)"/>
+  <circle cx="196" cy="240" r="12" fill="#17141C"/>
+  <circle cx="256" cy="240" r="12" fill="#17141C"/>
+  <circle cx="316" cy="240" r="12" fill="#17141C"/>
+</svg>

@@ -7,6 +7,11 @@
 #include <QUrlQuery>
 #include <QDebug>
 #include <QUrl>
+#include <QHttpMultiPart>
+#include <QHttpPart>
+#include <QFile>
+#include <QFileInfo>
+#include <QMimeDatabase>
 
 namespace {
 // Prefer the server's own {"error": "..."} message over Qt's generic
@@ -45,6 +50,7 @@ void AuthService::restoreSession() {
     // Republish our public key (and generate a keypair if this device somehow
     // has a session but no keys yet) so contacts can always encrypt to us.
     ensureE2EEKeysAndPublish();
+    fetchOwnProfile();
 }
 
 void AuthService::setupNetworkManager() {
@@ -223,6 +229,91 @@ QString AuthService::getContactPublicKey(const QString& contactId) {
     return QString{}; // Will be filled asynchronously
 }
 
+void AuthService::fetchOwnProfile() {
+    QString token = authToken();
+    if (token.isEmpty()) return;
+
+    QUrl url(Config::apiBaseUrl() + QStringLiteral("/users/me"));
+    QNetworkRequest request(url);
+    request.setRawHeader("Authorization", ("Bearer " + token).toUtf8());
+
+    QNetworkReply* reply = m_networkManager->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            qWarning() << "[AuthService] fetchOwnProfile failed:" << reply->errorString();
+            return;
+        }
+        // The backend wraps this one: {"user": {...}} - unlike most endpoints,
+        // which return {"data": {...}}.
+        QJsonObject root = QJsonDocument::fromJson(reply->readAll()).object();
+        QJsonObject user = root.value(QStringLiteral("user")).toObject();
+        if (user.isEmpty()) return;
+
+        m_currentUserEmail = user.value(QStringLiteral("email")).toString();
+        m_currentUserAvatarUrl = user.value(QStringLiteral("avatar_url")).toString();
+        if (m_currentUsername.isEmpty()) {
+            m_currentUsername = user.value(QStringLiteral("username")).toString();
+            emit currentUsernameChanged();
+        }
+        emit profileChanged();
+    });
+}
+
+void AuthService::uploadAvatar(const QString& filePath) {
+    QString token = authToken();
+    if (token.isEmpty()) {
+        emit avatarUploadFailed(QStringLiteral("Not authenticated. Please login first."));
+        return;
+    }
+
+    QString localPath = QUrl(filePath).isLocalFile() ? QUrl(filePath).toLocalFile() : filePath;
+    auto* file = new QFile(localPath);
+    if (!file->open(QIODevice::ReadOnly)) {
+        emit avatarUploadFailed(QStringLiteral("Could not open the selected image"));
+        delete file;
+        return;
+    }
+
+    auto* multiPart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
+    QHttpPart imagePart;
+    QString mime = QMimeDatabase().mimeTypeForFile(localPath).name();
+    imagePart.setHeader(QNetworkRequest::ContentTypeHeader, mime.isEmpty() ? "application/octet-stream" : mime);
+    imagePart.setHeader(QNetworkRequest::ContentDispositionHeader,
+                         QVariant(QStringLiteral("form-data; name=\"file\"; filename=\"%1\"")
+                                      .arg(QFileInfo(localPath).fileName())));
+    imagePart.setBodyDevice(file);
+    file->setParent(multiPart);
+    multiPart->append(imagePart);
+
+    QUrl url(Config::apiBaseUrl() + QStringLiteral("/users/me/avatar"));
+    QNetworkRequest request(url);
+    request.setRawHeader("Authorization", ("Bearer " + token).toUtf8());
+
+    QNetworkReply* reply = m_networkManager->post(request, multiPart);
+    multiPart->setParent(reply);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        // extractErrorMessage() calls reply->readAll() itself, so the error
+        // branch must not read the body first - a second readAll() on an
+        // already-drained QNetworkReply returns empty, which would silently
+        // fall back to Qt's generic error string instead of the server's.
+        if (reply->error() != QNetworkReply::NoError) {
+            emit avatarUploadFailed(extractErrorMessage(reply));
+            return;
+        }
+        QByteArray data = reply->readAll();
+        QString avatarUrl = QJsonDocument::fromJson(data).object().value(QStringLiteral("avatar_url")).toString();
+        if (avatarUrl.isEmpty()) {
+            emit avatarUploadFailed(QStringLiteral("Server did not return an avatar URL"));
+            return;
+        }
+        m_currentUserAvatarUrl = avatarUrl;
+        emit profileChanged();
+        emit avatarUploaded(avatarUrl);
+    });
+}
+
 void AuthService::onLoginReplyFinished() {
     QNetworkReply* reply = qobject_cast<QNetworkReply*>(sender());
     if (!reply) return;
@@ -306,8 +397,20 @@ void AuthService::onRefreshReplyFinished() {
         CredentialManager::instance().saveToken(QStringLiteral("access_token"), m_accessToken);
         emit tokenReady(m_accessToken);
     } else {
-        emit loginFailed(QStringLiteral("Token refresh failed"));
-        logout();
+        int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (httpStatus == 401 || httpStatus == 403) {
+            // The server actually looked at the refresh token and rejected
+            // it (expired/revoked) - there's no way to recover without a
+            // fresh login.
+            emit loginFailed(QStringLiteral("Session expired. Please log in again."));
+            logout();
+        } else {
+            // Never reached the server at all (offline, DNS, timeout) - the
+            // refresh token is probably still fine, so don't wipe a good
+            // session over a network blip. Whoever asked for the refresh
+            // (WebSocketService's reconnect loop) will just try again later.
+            qWarning() << "[AuthService] Token refresh failed (network):" << reply->errorString();
+        }
     }
     reply->deleteLater();
 }

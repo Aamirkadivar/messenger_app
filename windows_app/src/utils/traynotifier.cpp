@@ -6,6 +6,8 @@
 TrayNotifier::TrayNotifier(QObject* parent)
     : QObject(parent)
 {
+    m_notificationsEnabled = m_settings.value(QStringLiteral("notifications/enabled"), true).toBool();
+
     m_trayIcon = new QSystemTrayIcon(QIcon(QStringLiteral(":/icons/tray.png")), this);
     m_trayIcon->setToolTip(QStringLiteral("Messenger"));
 
@@ -28,7 +30,15 @@ TrayNotifier::TrayNotifier(QObject* parent)
 }
 
 void TrayNotifier::showMessage(const QString& title, const QString& body) {
+    if (!m_notificationsEnabled) return;
     if (m_trayIcon) {
         m_trayIcon->showMessage(title, body, QSystemTrayIcon::Information, 5000);
     }
+}
+
+void TrayNotifier::setNotificationsEnabled(bool enabled) {
+    if (m_notificationsEnabled == enabled) return;
+    m_notificationsEnabled = enabled;
+    m_settings.setValue(QStringLiteral("notifications/enabled"), enabled);
+    emit notificationsEnabledChanged();
 }

@@ -26,8 +26,9 @@ Rectangle {
     color: bgColor
 
     // Signals
-    signal chatSelected(string chatId, string chatName, string otherUserId, bool online)
+    signal chatSelected(string chatId, string chatName, string otherUserId, bool online, string chatType, string avatarUrl)
     signal newChatClicked()
+    signal newGroupClicked()
 
     property bool searchVisible: false
     property var onlineUsers: []
@@ -36,9 +37,6 @@ Rectangle {
     // Whichever chat is currently open in the main window (set by main.qml),
     // so a live-arriving message for it doesn't also bump its own unread badge.
     property string activeChatId: ""
-
-    // Avatar color palette for users
-    property var avatarPalette: ["#6C63FF", "#4CAF50", "#FF9800", "#E91E63", "#9C27B0", "#00BCD4", "#FF5722", "#795548", "#607D8B", "#3F51B5"]
 
     ListModel {
         id: chatModel
@@ -59,22 +57,68 @@ Rectangle {
 
             Text {
                 id: chatsTitle
-                // Telegram-style: while not connected, the header itself
-                // becomes the status ("Connecting…"/"Reconnecting…") instead
-                // of a separate banner - reverts to "Chats" once connected.
-                property string connState: websocketService !== undefined ? websocketService.connectionState : "connected"
-
                 Layout.fillWidth: true
-                text: connState === "connecting" ? "Connecting…"
-                      : connState === "reconnecting" ? "Reconnecting…"
-                      : "Chats"
+                text: "Chats"
                 font.pixelSize: 24
                 font.weight: Font.Bold
                 font.letterSpacing: -0.3
-                color: connState === "connecting" || connState === "reconnecting" ? chatListRoot.accentColor : chatListRoot.textColor
+                color: chatListRoot.textColor
                 Behavior on color {
                     enabled: !chatListRoot.instantThemeActive
                     ColorAnimation { duration: 200 }
+                }
+            }
+
+            Rectangle {
+                Layout.preferredWidth: 38
+                Layout.preferredHeight: 38
+                radius: 11
+                scale: newGroupMouse.pressed ? 0.94 : 1.0
+                color: newGroupMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.22)
+                       : (newGroupMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.12) : "transparent")
+                Behavior on color {
+                    enabled: !chatListRoot.instantThemeActive
+                    ColorAnimation { duration: 150; easing.type: Easing.OutCubic }
+                }
+                Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
+                Canvas {
+                    anchors.centerIn: parent
+                    width: 17
+                    height: 14
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        ctx.strokeStyle = chatListRoot.textSecondary
+                        ctx.fillStyle = chatListRoot.textSecondary
+                        ctx.lineWidth = 1.5
+                        // Two overlapping person glyphs to read as "group"
+                        ctx.beginPath(); ctx.arc(5.5, 3.5, 2.6, 0, Math.PI * 2); ctx.fill()
+                        ctx.beginPath(); ctx.arc(11, 4.2, 2.1, 0, Math.PI * 2); ctx.fill()
+                        ctx.beginPath()
+                        ctx.moveTo(0.5, 13.5); ctx.arcTo(0.5, 8, 5.5, 7, 5); ctx.arcTo(10.5, 8, 10.5, 13.5, 5)
+                        ctx.fill()
+                        ctx.beginPath()
+                        ctx.moveTo(9, 13.5); ctx.arcTo(9, 9, 11, 7.5, 4); ctx.arcTo(16.5, 9, 16.5, 13.5, 4)
+                        ctx.fill()
+                        // plus badge
+                        ctx.strokeStyle = chatListRoot.accentColor
+                        ctx.lineWidth = 1.8
+                        ctx.beginPath(); ctx.moveTo(14, 1); ctx.lineTo(14, 5); ctx.stroke()
+                        ctx.beginPath(); ctx.moveTo(12, 3); ctx.lineTo(16, 3); ctx.stroke()
+                    }
+                }
+
+                ToolTip.visible: newGroupMouse.containsMouse
+                ToolTip.text: "New group"
+                ToolTip.delay: 400
+
+                MouseArea {
+                    id: newGroupMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: chatListRoot.newGroupClicked()
                 }
             }
 
@@ -116,6 +160,66 @@ Rectangle {
                         if (chatListRoot.searchVisible) searchField.forceActiveFocus()
                         else { searchField.text = ""; filterChats("") }
                     }
+                }
+            }
+        }
+
+        // Connection status - a slim, dismissible-feeling banner rather than
+        // replacing the "Chats" title text, so the header stays put and this
+        // reads as "something in the background needs a moment" instead of
+        // the whole page's identity flickering between two states.
+        Rectangle {
+            id: connectionBanner
+            property string connState: websocketService !== undefined ? websocketService.connectionState : "connected"
+            property bool connVisible: connState === "connecting" || connState === "reconnecting"
+
+            Layout.fillWidth: true
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Layout.bottomMargin: connVisible ? 14 : 0
+            Layout.preferredHeight: connVisible ? 38 : 0
+            radius: 10
+            color: Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g, chatListRoot.accentColor.b, 0.12)
+            border.color: Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g, chatListRoot.accentColor.b, 0.35)
+            border.width: 1
+            clip: true
+            opacity: connVisible ? 1 : 0
+            Behavior on Layout.preferredHeight { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+            Behavior on Layout.bottomMargin { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+            Behavior on opacity { NumberAnimation { duration: 150 } }
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 12
+                anchors.rightMargin: 12
+                spacing: 9
+
+                Rectangle {
+                    Layout.preferredWidth: 7
+                    Layout.preferredHeight: 7
+                    radius: 3.5
+                    color: chatListRoot.accentColor
+                    SequentialAnimation on opacity {
+                        running: connectionBanner.connVisible
+                        loops: Animation.Infinite
+                        NumberAnimation { to: 0.25; duration: 600; easing.type: Easing.InOutSine }
+                        NumberAnimation { to: 1.0; duration: 600; easing.type: Easing.InOutSine }
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: connectionBanner.connState === "reconnecting" ? "Reconnecting…" : "Connecting…"
+                    font.pixelSize: 13
+                    font.weight: Font.Medium
+                    color: chatListRoot.accentColor
+                    elide: Text.ElideRight
+                }
+
+                BusyIndicator {
+                    Layout.preferredWidth: 16
+                    Layout.preferredHeight: 16
+                    running: connectionBanner.connVisible
                 }
             }
         }
@@ -364,7 +468,7 @@ Rectangle {
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: chatListRoot.chatSelected(model.chatId, model.chatName, model.otherUserId, model.online)
+                                onClicked: chatListRoot.chatSelected(model.chatId, model.chatName, model.otherUserId, model.online, model.chatType, model.avatarUrl)
                             }
 
                             RowLayout {
@@ -378,18 +482,11 @@ Rectangle {
                                     Layout.preferredWidth: 48
                                     Layout.preferredHeight: 48
 
-                                    Rectangle {
+                                    Avatar {
                                         anchors.fill: parent
-                                        radius: 24
-                                        color: model.avatarColor !== "" ? model.avatarColor : chatListRoot.accentColor
-
-                                        Text {
-                                            anchors.centerIn: parent
-                                            text: (model.chatName && model.chatName.length > 0) ? model.chatName.substring(0, 1).toUpperCase() : "?"
-                                            font.pixelSize: 18
-                                            font.weight: Font.DemiBold
-                                            color: "#FFFFFF"
-                                        }
+                                        name: model.chatName
+                                        avatarUrl: model.avatarUrl || ""
+                                        size: 48
                                     }
 
                                     Rectangle {
@@ -559,7 +656,6 @@ Rectangle {
         var otherUser = chatData.other_user || {}
         var otherUserId = otherUser.id || ""
         var lastMessageData = chatData.last_message || {}
-        var avatarColor = chatData.avatar_url !== undefined ? chatData.avatar_url : ""
         var isOnline = chatData.is_online || false
 
         // For direct chats, always prefer the other user's name - chat.name is
@@ -570,15 +666,9 @@ Rectangle {
             isOnline = otherUser.is_online || isOnline
         }
 
-        // Generate avatar color based on name
-        if (avatarColor === "") {
-            var hash = 0
-            for (var i = 0; i < chatName.length; i++) {
-                hash = chatName.charCodeAt(i) + ((hash << 5) - hash)
-            }
-            var index = Math.abs(hash) % avatarPalette.length
-            avatarColor = avatarPalette[index]
-        }
+        // A group's picture is its own; a direct chat's is the other person's -
+        // there's no per-chat picture distinct from the two participants.
+        var avatarUrl = chatType === "group" ? (chatData.avatar_url || "") : (otherUser.avatar_url || "")
 
         // Parse last message
         var lastMessage = lastMessageData.content || ""
@@ -628,7 +718,7 @@ Rectangle {
             timestamp: timestamp,
             unreadCount: unreadCount,
             online: isOnline,
-            avatarColor: avatarColor,
+            avatarUrl: avatarUrl,
             chatType: chatType,
             _rawData: chatData
         }

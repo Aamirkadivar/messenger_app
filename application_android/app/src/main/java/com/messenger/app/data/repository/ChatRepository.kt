@@ -44,6 +44,9 @@ class ChatRepository(
         private const val TAG = "ChatRepository"
         private const val ENCRYPTED_PLACEHOLDER = "🔒 Encrypted message"
 
+        /** content_type marking a message as a voice note. */
+        const val VOICE_CONTENT_TYPE = "audio"
+
         /** Parses a server ISO-8601 timestamp to epoch millis for local storage/ordering. */
         private fun parseTimestamp(iso: String?): Long =
             try {
@@ -166,6 +169,24 @@ class ChatRepository(
         val priv = myPriv() ?: return plaintext to false
         val cipher = E2ECrypto.encrypt(plaintext, otherPub, priv) ?: return plaintext to false
         return cipher to true
+    }
+
+    /**
+     * Encrypts binary content (voice notes) for a chat, or null when we have no
+     * key for it - notably group chats, where the pairwise scheme doesn't apply.
+     * Callers must treat null as "this will be sent in the clear".
+     */
+    suspend fun encryptBytesFor(chatId: String, plain: ByteArray): ByteArray? {
+        val otherPub = chatOtherPub[chatId] ?: return null
+        val priv = myPriv() ?: return null
+        return E2ECrypto.encryptBytes(plain, otherPub, priv)
+    }
+
+    /** Decrypts binary content produced by [encryptBytesFor]. */
+    suspend fun decryptBytesFor(chatId: String, payload: ByteArray): ByteArray? {
+        val otherPub = chatOtherPub[chatId] ?: return null
+        val priv = myPriv() ?: return null
+        return E2ECrypto.decryptBytes(payload, otherPub, priv)
     }
 
     /** Decrypt a message for a chat. Returns plaintext, or a placeholder if we can't. */
@@ -300,6 +321,47 @@ class ChatRepository(
             }
         } catch (e: Exception) {
             Log.e(TAG, "sendMessage error", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Posts a voice-note message. The audio itself is already uploaded; this
+     * records the pointer to it plus how long it runs.
+     */
+    suspend fun sendVoiceMessage(
+        token: String,
+        chatId: String,
+        chatType: String,
+        fileUrl: String,
+        durationMs: Long,
+        encrypted: Boolean
+    ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
+        try {
+            val response = chatApiService.sendMessage(
+                bearer(token),
+                SendMessageRequest(
+                    chatId = chatId,
+                    chatType = chatType,
+                    // The bubble renders from file_url; content stays empty so a
+                    // client that doesn't understand voice shows nothing rather
+                    // than a bogus blob of text.
+                    content = "",
+                    contentType = VOICE_CONTENT_TYPE,
+                    encrypted = encrypted,
+                    fileUrl = fileUrl,
+                    fileType = VOICE_CONTENT_TYPE,
+                    durationMs = durationMs
+                )
+            )
+            if (response.isSuccessful && response.body() != null) {
+                Result.success(response.body()!!.data)
+            } else {
+                if (response.code() == 401) Result.failure(SessionExpiredException())
+                else Result.failure(Exception("Failed to send voice note: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "sendVoiceMessage error", e)
             Result.failure(e)
         }
     }

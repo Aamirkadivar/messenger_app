@@ -1,442 +1,400 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
-import QtQuick.Transitions 1.15
+import QtQuick.Dialogs
 
-Rectangle {
+Popup {
     id: settingsRoot
-    radius: 0
 
-    // External properties from parent
     property bool darkMode: true
-    property color bgColor: "#1A1A2E"
-    property color surfaceColor: "#16213E"
-    property color textColor: "#E8E8E8"
-    property color textSecondary: "#8B8B9E"
-    property color borderColor: "#2A2A4A"
+    property color bgColor: "#15152B"
+    property color surfaceColor: "#1B1B36"
+    property color surfaceColorHover: "#22224A"
+    property color textColor: "#EDEDF2"
+    property color textSecondary: "#9494AC"
+    property color borderColor: Qt.rgba(1, 1, 1, 0.08)
     property color accentColor: "#6C63FF"
-    property string username: ""
-    property string email: ""
-    property string avatar: ""
 
-    // Signals
-    signal darkModeToggled(bool enabled)
-    signal logoutClicked()
-    signal backClicked()
+    // The "off" state of a toggle still needs to read as neutral/inactive,
+    // but a flat iOS-grey (#8E8E93) clashes with the rest of the app's warm
+    // ivory/bronze palette - this stays in the same warm family instead.
+    readonly property color toggleOffColor: darkMode ? "#4A4438" : "#D9CFB8"
 
-    color: bgColor
+    // The shared surfaceColor (#14141F) has a cool, blue-leaning near-black
+    // (its blue channel runs well above red/green) that barely registers as
+    // blue against the smaller surfaces it's normally used on - but filling
+    // this whole panel with it makes that cast obvious. A warmer near-black
+    // (blue channel now the lowest, not the highest) keeps the same depth
+    // without the tint, without touching the shared color everywhere else
+    // in the app still relies on.
+    readonly property color panelSurfaceColor: darkMode ? "#17140F" : surfaceColor
+    readonly property color panelHoverColor: darkMode ? "#221E15" : surfaceColorHover
 
-    ColumnLayout {
-        anchors.fill: parent
+    signal darkModeToggled()
+    signal logoutRequested()
+
+    property string cacheSizeText: "…"
+
+    modal: true
+    focus: true
+    width: 380
+    height: 600
+    x: (parent ? parent.width - width : 0) / 2
+    y: (parent ? parent.height - height : 0) / 2
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    padding: 0
+
+    onOpened: refreshCacheSize()
+
+    function refreshCacheSize() {
+        if (typeof chatService === "undefined") return
+        var bytes = chatService.cacheSizeBytes()
+        cacheSizeText = bytes < 1024 ? bytes + " B"
+                        : bytes < 1024 * 1024 ? (bytes / 1024).toFixed(1) + " KB"
+                        : (bytes / (1024 * 1024)).toFixed(1) + " MB"
+    }
+
+    background: Rectangle {
+        color: settingsRoot.panelSurfaceColor
+        radius: 12
+        border.color: settingsRoot.borderColor
+        border.width: 1
+    }
+
+    FileDialog {
+        id: avatarPicker
+        title: "Choose a profile photo"
+        nameFilters: ["Images (*.png *.jpg *.jpeg *.webp)"]
+        onAccepted: authService.uploadAvatar(selectedFile.toString())
+    }
+
+    Connections {
+        target: authService
+        function onAvatarUploadFailed(message) { avatarError.text = message }
+        function onAvatarUploaded() { avatarError.text = "" }
+    }
+
+    contentItem: ColumnLayout {
         spacing: 0
 
-        // Header
-        Item {
+        RowLayout {
             Layout.fillWidth: true
-            height: 64
+            Layout.margins: 16
+            Layout.bottomMargin: 8
 
-            RowLayout {
-                anchors.fill: parent
-                anchors.margins: 20
-                spacing: 16
+            Text {
+                Layout.fillWidth: true
+                text: "Settings"
+                font.pixelSize: 17
+                font.bold: true
+                color: settingsRoot.textColor
+            }
 
-                Button {
-                    width: 40
-                    height: 40
-                    background: Rectangle {
-                        radius: 8
-                        color: mouseArea.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.3) : Qt.rgba(108/255, 99/255, 255/255, 0.1)) : "transparent"
-                        MouseArea { id: mouseArea; anchors.fill: parent; hoverEnabled: true; onClicked: settingsRoot.backClicked() }
-                    }
-                    Image {
-                        anchors.centerIn: parent
-                        source: "qrc:/icons/back.svg"
-                        width: 20
-                        height: 20
-                    }
-                }
-
-                Text {
-                    text: "Settings"
-                    font.pixelSize: 24
-                    font.bold: true
-                    color: settingsRoot.textColor
-                    Layout.fillWidth: true
+            Rectangle {
+                Layout.preferredWidth: 28
+                Layout.preferredHeight: 28
+                radius: 14
+                color: closeSettingsMouse.containsMouse ? settingsRoot.panelHoverColor : "transparent"
+                Text { anchors.centerIn: parent; text: "✕"; font.pixelSize: 13; color: settingsRoot.textSecondary }
+                MouseArea {
+                    id: closeSettingsMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: settingsRoot.close()
                 }
             }
         }
 
-        // Divider
-        Rectangle {
-            Layout.fillWidth: true
-            height: 1
-            color: borderColor
-        }
-
-        // Profile section
-        Rectangle {
-            Layout.fillWidth: true
-            height: 120
-            color: darkMode ? Qt.rgba(22/255, 33/255, 62/255, 0.5) : Qt.rgba(1, 1, 1, 0.3)
-
-            ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: 20
-                spacing: 12
-
-                // Avatar
-                Rectangle {
-                    Layout.preferredWidth: 64
-                    Layout.preferredHeight: 64
-                    Layout.alignment: Qt.AlignHCenter
-                    radius: 32
-                    color: accentColor
-
-                    Text {
-                        anchors.centerIn: parent
-                        text: username ? username.substring(0, 1).toUpperCase() : "U"
-                        font.pixelSize: 28
-                        font.bold: true
-                        color: "#FFFFFF"
-                    }
-                }
-
-                // Username
-                Text {
-                    Layout.fillWidth: true
-                    Layout.alignment: Qt.AlignHCenter
-                    text: username || "User"
-                    font.pixelSize: 18
-                    font.bold: true
-                    color: textColor
-                    elide: Text.ElideMiddle
-                }
-
-                // Email
-                Text {
-                    Layout.fillWidth: true
-                    Layout.alignment: Qt.AlignHCenter
-                    text: email || ""
-                    font.pixelSize: 13
-                    color: textSecondary
-                    elide: Text.ElideMiddle
-                }
-            }
-        }
-
-        // Settings list
-        Rectangle {
+        ScrollView {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            color: bgColor
+            clip: true
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: 0
+                width: settingsRoot.width
                 spacing: 0
 
-                // Dark mode toggle
-                Rectangle {
+                // ---- Profile ----
+                // A plain Column, not ColumnLayout: every child is centered
+                // via anchors.horizontalCenter, which is straightforward on a
+                // Column's children - ColumnLayout's Layout.alignment was not
+                // reliably centering these under a ScrollView's content item.
+                Column {
+                    // Being a ColumnLayout child, this needs Layout.fillWidth
+                    // - without it, ColumnLayout shrinks the Column down to
+                    // its content's own implicit width (just wide enough for
+                    // the avatar) and left-aligns that narrow box, so every
+                    // "centered" child below was only centered within that
+                    // sliver, not the actual 380px panel.
                     Layout.fillWidth: true
-                    height: 64
-                    color: dmMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
+                    topPadding: 6
+                    bottomPadding: 16
+                    spacing: 10
 
-                    MouseArea {
-                        id: dmMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
+                    Item {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: 84
+                        height: 84
+
+                        Avatar {
+                            anchors.fill: parent
+                            name: authService.currentUsername
+                            avatarUrl: authService.currentUserAvatarUrl || ""
+                            size: 84
+                        }
+
+                        Rectangle {
+                            anchors.bottom: parent.bottom
+                            anchors.right: parent.right
+                            width: 28
+                            height: 28
+                            radius: 14
+                            color: settingsRoot.accentColor
+                            border.color: settingsRoot.surfaceColor
+                            border.width: 2
+
+                            Canvas {
+                                anchors.centerIn: parent
+                                width: 13
+                                height: 13
+                                onPaint: {
+                                    var ctx = getContext("2d")
+                                    ctx.reset()
+                                    ctx.strokeStyle = "#FFFFFF"
+                                    ctx.lineWidth = 1.4
+                                    ctx.lineCap = "round"
+                                    ctx.lineJoin = "round"
+                                    ctx.strokeRect(1, 3.5, 11, 8)
+                                    ctx.beginPath(); ctx.arc(6.5, 7.5, 2.4, 0, Math.PI * 2); ctx.stroke()
+                                    ctx.beginPath(); ctx.moveTo(4, 3.5); ctx.lineTo(5, 1.5); ctx.lineTo(8, 1.5); ctx.lineTo(9, 3.5); ctx.stroke()
+                                }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: avatarPicker.open()
+                            }
+                        }
                     }
 
-                    Row {
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: authService.currentUsername || "User"
+                        font.pixelSize: 18
+                        font.bold: true
+                        color: settingsRoot.textColor
+                    }
+
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: authService.currentUserEmail || ""
+                        font.pixelSize: 13
+                        color: settingsRoot.textSecondary
+                    }
+
+                    Text {
+                        id: avatarError
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: parent.width - 40
+                        horizontalAlignment: Text.AlignHCenter
+                        text: ""
+                        font.pixelSize: 12
+                        color: "#E74C3C"
+                        wrapMode: Text.WordWrap
+                        visible: text.length > 0
+                    }
+                }
+
+                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+
+                // ---- Dark mode ----
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 60
+                    color: darkModeMouse.containsMouse ? settingsRoot.panelHoverColor : "transparent"
+
+                    RowLayout {
                         anchors.fill: parent
-                        anchors.margins: 16
+                        anchors.leftMargin: 16
+                        anchors.rightMargin: 16
                         spacing: 14
 
-                        Image {
-                            source: "qrc:/icons/darkmode.svg"
-                            width: 20
-                            height: 20
-                        }
-
-                        Column {
+                        ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 2
-
-                            Text {
-                                text: "Dark Mode"
-                                font.pixelSize: 15
-                                font.bold: true
-                                color: darkMode ? "#E8E8E8" : "#1A1A2E"
-                            }
-
-                            Text {
-                                text: darkMode ? "On" : "Off"
-                                font.pixelSize: 12
-                                color: darkMode ? "#8B8B9E" : "#666666"
-                            }
+                            Text { text: "Dark Mode"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
+                            Text { text: settingsRoot.darkMode ? "On" : "Off"; font.pixelSize: 12; color: settingsRoot.textSecondary }
                         }
 
-                        Toggle {
-                            checked: darkMode
-                            onCheckedChanged: settingsRoot.darkModeToggled(checked)
-                            indicator: Rectangle {
-                                implicitWidth: 48
-                                implicitHeight: 26
-                                radius: 13
-                                color: parent.checked ? accentColor : "#CCCCCC"
-                                Rectangle {
-                                    width: 22
-                                    height: 22
-                                    radius: 11
-                                    color: "white"
-                                    x: parent.checked ? 22 : 2
-                                    y: 2
-                                    Behavior on x { NumberAnimation { duration: 200; easing.type: Easing.OutBack } }
+                        Rectangle {
+                            Layout.preferredWidth: 46
+                            Layout.preferredHeight: 26
+                            radius: 13
+                            color: settingsRoot.darkMode ? settingsRoot.accentColor : settingsRoot.toggleOffColor
+
+                            Rectangle {
+                                width: 20
+                                height: 20
+                                radius: 10
+                                color: "#FFFFFF"
+                                y: 3
+                                x: settingsRoot.darkMode ? parent.width - width - 3 : 3
+                                Behavior on x { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+                            }
+                        }
+                    }
+
+                    MouseArea {
+                        id: darkModeMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: settingsRoot.darkModeToggled()
+                    }
+                }
+
+                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+
+                // ---- Notifications ----
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 60
+                    color: notifSettingsMouse.containsMouse ? settingsRoot.panelHoverColor : "transparent"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 16
+                        anchors.rightMargin: 16
+                        spacing: 14
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 2
+                            Text { text: "Notifications"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
+                            Text { text: "Tray pop-ups for new messages"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                        }
+
+                        Rectangle {
+                            Layout.preferredWidth: 46
+                            Layout.preferredHeight: 26
+                            radius: 13
+                            color: trayNotifier.notificationsEnabled ? settingsRoot.accentColor : settingsRoot.toggleOffColor
+
+                            Rectangle {
+                                width: 20
+                                height: 20
+                                radius: 10
+                                color: "#FFFFFF"
+                                y: 3
+                                x: trayNotifier.notificationsEnabled ? parent.width - width - 3 : 3
+                                Behavior on x { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+                            }
+                        }
+                    }
+
+                    MouseArea {
+                        id: notifSettingsMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: trayNotifier.notificationsEnabled = !trayNotifier.notificationsEnabled
+                    }
+                }
+
+                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+
+                // ---- Storage ----
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 60
+                    color: "transparent"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 16
+                        anchors.rightMargin: 16
+                        spacing: 14
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 2
+                            Text { text: "Storage"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
+                            Text { text: settingsRoot.cacheSizeText + " used for cached chats"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                        }
+
+                        Text {
+                            text: "Clear"
+                            font.pixelSize: 13
+                            font.weight: Font.DemiBold
+                            color: settingsRoot.accentColor
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -8
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    chatService.clearCache()
+                                    settingsRoot.refreshCacheSize()
                                 }
                             }
                         }
                     }
-
-                    // Separator
-                    Rectangle {
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.bottom: parent.bottom
-                        height: 1
-                        color: darkMode ? "#2A2A4A" : "#E0E0E5"
-                    }
                 }
 
-                // Notifications
+                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+
+                // ---- About ----
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 64
-                    color: notifMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
+                    height: 60
+                    color: "transparent"
 
-                    MouseArea {
-                        id: notifMouse
+                    RowLayout {
                         anchors.fill: parent
-                        hoverEnabled: true
-                    }
-
-                    Row {
-                        anchors.fill: parent
-                        anchors.margins: 16
+                        anchors.leftMargin: 16
+                        anchors.rightMargin: 16
                         spacing: 14
 
-                        Image {
-                            source: "qrc:/icons/notification.svg"
-                            width: 20
-                            height: 20
-                        }
-
-                        Column {
+                        ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 2
-
-                            Text {
-                                text: "Notifications"
-                                font.pixelSize: 15
-                                font.bold: true
-                                color: darkMode ? "#E8E8E8" : "#1A1A2E"
-                            }
-
-                            Text {
-                                text: "Manage notification settings"
-                                font.pixelSize: 12
-                                color: darkMode ? "#8B8B9E" : "#666666"
-                            }
-                        }
-                    }
-
-                    // Separator
-                    Rectangle {
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.bottom: parent.bottom
-                        height: 1
-                        color: darkMode ? "#2A2A4A" : "#E0E0E5"
-                    }
-                }
-
-                // Privacy
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 64
-                    color: privacyMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
-
-                    MouseArea {
-                        id: privacyMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                    }
-
-                    Row {
-                        anchors.fill: parent
-                        anchors.margins: 16
-                        spacing: 14
-
-                        Image {
-                            source: "qrc:/icons/privacy.svg"
-                            width: 20
-                            height: 20
-                        }
-
-                        Column {
-                            Layout.fillWidth: true
-                            spacing: 2
-
-                            Text {
-                                text: "Privacy"
-                                font.pixelSize: 15
-                                font.bold: true
-                                color: darkMode ? "#E8E8E8" : "#1A1A2E"
-                            }
-
-                            Text {
-                                text: "Encryption, block list"
-                                font.pixelSize: 12
-                                color: darkMode ? "#8B8B9E" : "#666666"
-                            }
-                        }
-                    }
-
-                    // Separator
-                    Rectangle {
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.bottom: parent.bottom
-                        height: 1
-                        color: darkMode ? "#2A2A4A" : "#E0E0E5"
-                    }
-                }
-
-                // Security
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 64
-                    color: securityMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
-
-                    MouseArea {
-                        id: securityMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                    }
-
-                    Row {
-                        anchors.fill: parent
-                        anchors.margins: 16
-                        spacing: 14
-
-                        Image {
-                            source: "qrc:/icons/security.svg"
-                            width: 20
-                            height: 20
-                        }
-
-                        Column {
-                            Layout.fillWidth: true
-                            spacing: 2
-
-                            Text {
-                                text: "Security"
-                                font.pixelSize: 15
-                                font.bold: true
-                                color: darkMode ? "#E8E8E8" : "#1A1A2E"
-                            }
-
-                            Text {
-                                text: "Two-factor authentication"
-                                font.pixelSize: 12
-                                color: darkMode ? "#8B8B9E" : "#666666"
-                            }
-                        }
-                    }
-
-                    // Separator
-                    Rectangle {
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.bottom: parent.bottom
-                        height: 1
-                        color: darkMode ? "#2A2A4A" : "#E0E0E5"
-                    }
-                }
-
-                // About
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 64
-                    color: aboutMouse.containsPress ? (darkMode ? Qt.rgba(108/255, 99/255, 255/255, 0.08) : Qt.rgba(108/255, 99/255, 255/255, 0.05)) : "transparent"
-
-                    MouseArea {
-                        id: aboutMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                    }
-
-                    Row {
-                        anchors.fill: parent
-                        anchors.margins: 16
-                        spacing: 14
-
-                        Image {
-                            source: "qrc:/icons/info.svg"
-                            width: 20
-                            height: 20
-                        }
-
-                        Column {
-                            Layout.fillWidth: true
-                            spacing: 2
-
-                            Text {
-                                text: "About"
-                                font.pixelSize: 15
-                                font.bold: true
-                                color: darkMode ? "#E8E8E8" : "#1A1A2E"
-                            }
-
-                            Text {
-                                text: "Version 1.0.0"
-                                font.pixelSize: 12
-                                color: darkMode ? "#8B8B9E" : "#666666"
-                            }
+                            Text { text: "About"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
+                            Text { text: "Messenger for Windows — version 1.0.0"; font.pixelSize: 12; color: settingsRoot.textSecondary }
                         }
                     }
                 }
 
-                Item { Layout.fillHeight: true }
+                Item { Layout.preferredHeight: 8 }
 
-                // Logout button
+                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+
+                // ---- Logout ----
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 56
-                    color: logoutMouse.containsPress ? Qt.rgba(244/255, 67/255, 54/255, 0.1) : "transparent"
+                    Layout.margins: 16
+                    height: 42
+                    radius: 11
+                    color: settingsLogoutMouse.containsMouse ? Qt.rgba(231/255, 76/255, 60/255, 0.15) : "transparent"
+                    border.color: "#E74C3C"
+                    border.width: 1
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Log out"
+                        font.pixelSize: 13
+                        font.weight: Font.DemiBold
+                        color: "#E74C3C"
+                    }
 
                     MouseArea {
-                        id: logoutMouse
+                        id: settingsLogoutMouse
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: settingsRoot.logoutClicked()
-                    }
-
-                    RowLayout {
-                        anchors.centerIn: parent
-                        spacing: 12
-
-                        Image {
-                            source: "qrc:/icons/logout.svg"
-                            width: 20
-                            height: 20
-                        }
-
-                        Text {
-                            text: "Logout"
-                            font.pixelSize: 15
-                            font.bold: true
-                            color: "#F44336"
+                        onClicked: {
+                            settingsRoot.close()
+                            settingsRoot.logoutRequested()
                         }
                     }
                 }

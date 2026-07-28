@@ -59,6 +59,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.messenger.app.data.model.UserSearchResult
+import com.messenger.app.ui.components.Avatar
 import com.messenger.app.ui.components.HairlineDivider
 import com.messenger.app.ui.components.SectionHeader
 import com.messenger.app.ui.theme.Tokens
@@ -337,7 +338,7 @@ private fun SelectedMembersRow(
                     },
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Avatar(name = member.name, size = 28.dp)
+                Avatar(name = member.name, avatarUrl = null, size = 28.dp)
                 Spacer(Modifier.size(Tokens.Space.md))
                 Text(
                     text = member.name,
@@ -433,7 +434,7 @@ private fun UserRow(
             },
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Avatar(name = name, size = 40.dp)
+        Avatar(name = name, avatarUrl = user.avatarUrl, size = 40.dp)
         Spacer(Modifier.size(Tokens.Space.md))
         Column(modifier = Modifier.weight(1f)) {
             Text(
@@ -462,20 +463,3 @@ private fun UserRow(
     }
 }
 
-@Composable
-private fun Avatar(name: String, size: androidx.compose.ui.unit.Dp) {
-    val dark = isDarkTheme()
-    Box(
-        modifier = Modifier
-            .size(size)
-            .background(Tokens.Palette.accent(dark), CircleShape),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = name.take(1).uppercase(),
-            color = Color.White,
-            fontWeight = FontWeight.Medium,
-            style = Tokens.Type.rowValue
-        )
-    }
-}

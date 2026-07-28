@@ -55,6 +55,11 @@ func main() {
 	groupService := handlers.NewGroupService(hub)
 	userHandler := handlers.NewUserHandler()
 	cryptoHandler := handlers.NewCryptoHandler()
+	uploadHandler := handlers.NewUploadHandler()
+
+	if err := handlers.EnsureUploadDirs(); err != nil {
+		log.Fatalf("Failed to create upload directories: %v", err)
+	}
 	_ = middleware.AuthMiddleware // referenced for documentation
 
 	// Create Fiber app
@@ -62,7 +67,7 @@ func main() {
 		Prefork:               false,
 		DisableStartupMessage: true,
 		ErrorHandler:          middleware.ErrorHandler,
-		BodyLimit:             10 * 1024 * 1024, // 10MB
+		BodyLimit:             25 * 1024 * 1024, // 25MB - raised from 10MB for file/image attachments
 		ReadTimeout:           30 * time.Second,
 		WriteTimeout:          30 * time.Second,
 		IdleTimeout:           120 * time.Second,
@@ -70,6 +75,15 @@ func main() {
 
 	// Middleware
 	app.Use(middleware.CORS())
+
+	// Uploaded avatars. Served unauthenticated: filenames are random UUIDs, so
+	// they are unguessable, and this avoids every avatar request needing a
+	// token (image loaders don't carry one). Nothing sensitive is stored here.
+	app.Static("/"+handlers.UploadRoot, "./"+handlers.UploadRoot, fiber.Static{
+		Browse:    false,
+		ByteRange: true,
+		MaxAge:    86400,
+	})
 
 	// Health check
 	app.Get("/health", func(c *fiber.Ctx) error {
@@ -98,6 +112,7 @@ func main() {
 	userRoutes.Put("/me", userHandler.UpdateMe)
 	userRoutes.Get("/search", userHandler.SearchUsers)
 	userRoutes.Get("/:user_id/presence", userHandler.GetUserPresence)
+	userRoutes.Post("/me/avatar", uploadHandler.UploadMyAvatar)
 
 	// Chat routes
 	chatRoutes := protected.Group("/chats")
@@ -125,12 +140,17 @@ func main() {
 	groupRoutes.Put("/:chat_id", groupService.UpdateGroup)
 	groupRoutes.Post("/:chat_id/members", groupService.AddMembers)
 	groupRoutes.Delete("/:chat_id/members/:member_id", groupService.RemoveMember)
+	groupRoutes.Put("/:chat_id/members/:member_id/role", groupService.UpdateMemberRole)
+	groupRoutes.Delete("/:chat_id", groupService.DeleteGroup)
+	groupRoutes.Post("/:chat_id/avatar", uploadHandler.UploadGroupAvatar)
 	groupRoutes.Post("/:chat_id/leave", groupService.LeaveGroup)
 	groupRoutes.Get("/:chat_id/search-users", groupService.SearchUsers)
 
 	// Message routes
 	messageRoutes := protected.Group("/messages")
 	messageRoutes.Post("/", messageService.SendMessage)
+	messageRoutes.Post("/voice", uploadHandler.UploadVoice)
+	messageRoutes.Post("/attachment", uploadHandler.UploadAttachment)
 	messageRoutes.Get("/:chat_id", messageService.GetMessages)
 	messageRoutes.Delete("/:chat_id/:message_id", messageService.DeleteMessage)
 	messageRoutes.Post("/:chat_id/unread", messageService.GetUnreadCount)

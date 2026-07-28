@@ -48,6 +48,14 @@ signals:
     // Fired whenever any user connects/disconnects - not scoped to a chat room.
     void presenceChanged(const QString& userId, bool online);
     void errorOccurred(const QString& error);
+    // Fired once per failed connect/reconnect attempt (while auto-reconnect
+    // is on) - distinct from connectionStateChanged so a caller can react to
+    // "an attempt just failed" without having to infer it from state-string
+    // transitions. The most common cause is a stale access token that the
+    // server keeps rejecting; a caller can use this to refresh the token and
+    // hand the socket a fresh one instead of retrying the same dead one
+    // forever.
+    void connectionAttemptFailed();
 
 private slots:
     void onConnected();

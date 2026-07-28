@@ -11,6 +11,24 @@ public:
         return QStringLiteral("http://192.168.1.52:3000/api/v1");
     }
 
+    // Server origin with no /api/v1 suffix - avatar/voice paths come back from
+    // the backend as root-relative ("/uploads/avatars/<uuid>.jpg") because the
+    // server's host/IP can change between networks, so clients resolve them
+    // against whatever base URL they're already using instead of the server
+    // baking in an absolute one.
+    static QString serverOrigin() {
+        QString base = apiBaseUrl();
+        int idx = base.indexOf(QStringLiteral("/api/"));
+        return idx >= 0 ? base.left(idx) : base;
+    }
+
+    static QString resolveServerUrl(const QString& path) {
+        if (path.isEmpty()) return {};
+        if (path.startsWith(QStringLiteral("http://")) || path.startsWith(QStringLiteral("https://")))
+            return path;
+        return serverOrigin() + (path.startsWith(QChar('/')) ? path : QStringLiteral("/") + path);
+    }
+
     static QString wsUrl() {
         return QStringLiteral("ws://192.168.1.52:3000/ws");
     }

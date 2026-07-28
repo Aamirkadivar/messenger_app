@@ -36,6 +36,12 @@ data class UserDto(
     @SerialName("created_at") val createdAt: String? = null
 )
 
+/** GET /users/me wraps the user object as {"user": {...}}. */
+@Serializable
+data class MeResponse(
+    val user: UserDto
+)
+
 @Serializable
 data class TokensDto(
     @SerialName("access_token") val accessToken: String,

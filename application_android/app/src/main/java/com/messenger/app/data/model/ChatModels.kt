@@ -40,6 +40,7 @@ data class MessageDto(
     val encrypted: Boolean = true,
     @SerialName("file_url") val fileUrl: String? = null,
     @SerialName("file_type") val fileType: String? = null,
+    @SerialName("duration_ms") val durationMs: Long = 0,
     val type: String? = null,
     @SerialName("delivered_at") val deliveredAt: String? = null,
     @SerialName("read_at") val readAt: String? = null,
@@ -62,7 +63,12 @@ data class SendMessageRequest(
     val content: String,
     @SerialName("content_type") val contentType: String = "text",
     @SerialName("recipient_public_key") val recipientPublicKey: String = "",
-    val encrypted: Boolean = false
+    val encrypted: Boolean = false,
+    /** Set for voice notes; content_type carries the kind. */
+    @SerialName("file_url") val fileUrl: String = "",
+    @SerialName("file_type") val fileType: String = "",
+    /** Voice length in milliseconds, so the bubble can show it before playing. */
+    @SerialName("duration_ms") val durationMs: Long = 0
 )
 
 @Serializable

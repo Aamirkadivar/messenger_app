@@ -84,6 +84,18 @@ public:
                               const QString& otherPublicHex,
                               const QString& myPrivateHex);
 
+    // Binary variant of boxEncrypt/boxDecrypt for file payloads (voice notes).
+    // Same construction and wire layout (nonce || ciphertext) as the hex
+    // functions, but raw bytes: a voice note is hundreds of KB and hex would
+    // double it for no benefit, since the payload travels as a binary upload
+    // body rather than embedded in JSON.
+    static QByteArray boxEncryptBytes(const QByteArray& plain,
+                                      const QString& recipientPublicHex,
+                                      const QString& senderPrivateHex);
+    static QByteArray boxDecryptBytes(const QByteArray& payload,
+                                      const QString& otherPublicHex,
+                                      const QString& myPrivateHex);
+
     // Convert bytes to hex for display (inline for convenience)
     static QString bytesToHex(const QByteArray& bytes);
 

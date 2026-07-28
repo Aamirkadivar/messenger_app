@@ -3,7 +3,18 @@ package com.messenger.app.ui.screen
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -13,6 +24,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.PhotoCamera
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -35,7 +48,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -45,6 +63,7 @@ import com.messenger.app.data.settings.NotificationSound
 import com.messenger.app.data.settings.PreviewPrivacy
 import com.messenger.app.data.storage.ConversationStorage
 import com.messenger.app.data.storage.formatBytes
+import com.messenger.app.ui.components.Avatar
 import com.messenger.app.ui.components.ConfirmDialog
 import com.messenger.app.ui.components.LuxDialog
 import com.messenger.app.ui.components.OptionList
@@ -82,8 +101,17 @@ fun SettingsScreen(
     val mutedChats by viewModel.mutedChats.collectAsStateWithLifecycle()
     val toast by viewModel.toast.collectAsStateWithLifecycle()
 
+    val profile by viewModel.profile.collectAsStateWithLifecycle()
+    val uploadingAvatar by viewModel.uploadingAvatar.collectAsStateWithLifecycle()
+
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // System photo picker - no storage permission, and only the chosen image
+    // is ever shared with the app.
+    val pickProfilePhoto = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri -> uri?.let(viewModel::setProfilePhoto) }
 
     var activeDialog by remember { mutableStateOf<ActiveDialog?>(null) }
 
@@ -145,6 +173,18 @@ fun SettingsScreen(
                 .padding(padding)
                 .verticalScroll(rememberScrollState())
         ) {
+            ProfileCard(
+                name = profile.name,
+                email = profile.email,
+                avatarUrl = profile.avatarUrl,
+                uploading = uploadingAvatar,
+                onChangePhoto = {
+                    pickProfilePhoto.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    )
+                }
+            )
+
             NotificationsSection(
                 settings = settings.notifications,
                 mutedChats = mutedChats,
@@ -368,6 +408,79 @@ fun SettingsScreen(
             },
             onDismiss = { activeDialog = null }
         )
+    }
+}
+
+/** Profile identity card with a tappable picture. */
+@Composable
+private fun ProfileCard(
+    name: String,
+    email: String,
+    avatarUrl: String?,
+    uploading: Boolean,
+    onChangePhoto: () -> Unit
+) {
+    val dark = isDarkTheme()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = Tokens.Space.md, vertical = Tokens.Space.sm)
+            .clip(RoundedCornerShape(Tokens.Radius.md))
+            .background(Tokens.Elevation.level1(dark))
+            .clickable(role = Role.Button, onClick = onChangePhoto)
+            .padding(Tokens.Space.md)
+            .semantics(mergeDescendants = true) {
+                contentDescription = "$name. Change profile picture"
+            },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(contentAlignment = Alignment.BottomEnd) {
+            Avatar(name = name.ifBlank { "?" }, avatarUrl = avatarUrl, size = 64.dp)
+            Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .clip(CircleShape)
+                    .background(Tokens.Palette.accent(dark)),
+                contentAlignment = Alignment.Center
+            ) {
+                if (uploading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(13.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.White
+                    )
+                } else {
+                    Icon(
+                        Icons.Outlined.PhotoCamera,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.width(Tokens.Space.md))
+
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = name.ifBlank { "Your profile" },
+                style = Tokens.Type.rowTitle,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            if (email.isNotBlank()) {
+                Text(
+                    text = email,
+                    style = Tokens.Type.rowSubtitle,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Text(
+                text = "Tap to change your picture",
+                style = Tokens.Type.rowSubtitle,
+                color = Tokens.Palette.accent(dark)
+            )
+        }
     }
 }
 

@@ -12,13 +12,17 @@
 #include <QFontDatabase>
 #include <QFile>
 #include <QLoggingCategory>
+#include <QDateTime>
 
 #include "utils/config.h"
+#include "utils/appconfig.h"
 #include "utils/credentialmanager.h"
 #include "utils/traynotifier.h"
 #include "services/authservice.h"
 #include "services/websocketservice.h"
 #include "services/chatservice.h"
+#include "services/groupservice.h"
+#include "services/voiceservice.h"
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -65,6 +69,9 @@ int main(int argc, char* argv[]) {
     AuthService authService;
     WebSocketService websocketService;
     ChatService chatService(&authService);
+    GroupService groupService(&authService);
+    VoiceService voiceService;
+    AppConfig appConfig;
 
     // Connect auth to websocket
     QObject::connect(&authService, &AuthService::loginSuccess,
@@ -82,11 +89,41 @@ int main(int argc, char* argv[]) {
         websocketService.disconnectFromServer();
     });
 
+    // A stale access token (the common case: the app was closed longer than
+    // the token's lifetime) makes every WebSocket connect attempt fail the
+    // same way forever, since connectToServer() keeps retrying with that
+    // same dead token - the sidebar gets stuck on "Connecting…" and nothing
+    // ever tells AuthService to get a new one. Ask for a fresh token after a
+    // failed attempt and hand it straight to the socket.
+    static qint64 lastTokenRefreshAttemptMs = 0;
+    QObject::connect(&websocketService, &WebSocketService::connectionAttemptFailed,
+                     &authService, [&authService]() {
+        qint64 now = QDateTime::currentMSecsSinceEpoch();
+        // Cooldown so the reconnect timer's retries (a few seconds apart)
+        // don't spam the refresh endpoint - one attempt is enough to know
+        // whether a fresh token fixes it.
+        if (now - lastTokenRefreshAttemptMs < 10000) return;
+        lastTokenRefreshAttemptMs = now;
+        authService.refreshToken();
+    });
+
+    QObject::connect(&authService, &AuthService::tokenReady,
+                     &websocketService, [&websocketService](const QString& token) {
+        if (!websocketService.isConnected()) {
+            websocketService.connectToServer(token);
+        }
+    });
+
     // Fetch chats whenever a token becomes available (fresh login or restored session)
     QObject::connect(&authService, &AuthService::tokenReady,
                      &chatService, [&chatService]() {
         chatService.fetchChats();
     });
+
+    QObject::connect(&groupService, &GroupService::groupError,
+                     [](const QString& error) {
+                         qWarning() << "[GroupService] Error:" << error;
+                     });
 
     // Connect chat service signals
     QObject::connect(&chatService, &ChatService::chatError,
@@ -102,6 +139,9 @@ int main(int argc, char* argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("authService"), &authService);
     engine.rootContext()->setContextProperty(QStringLiteral("websocketService"), &websocketService);
     engine.rootContext()->setContextProperty(QStringLiteral("chatService"), &chatService);
+    engine.rootContext()->setContextProperty(QStringLiteral("groupService"), &groupService);
+    engine.rootContext()->setContextProperty(QStringLiteral("voiceService"), &voiceService);
+    engine.rootContext()->setContextProperty(QStringLiteral("appConfig"), &appConfig);
     engine.rootContext()->setContextProperty(QStringLiteral("credentialManager"), &CredentialManager::instance());
     engine.rootContext()->setContextProperty(QStringLiteral("trayNotifier"), &trayNotifier);
 

@@ -82,6 +82,12 @@ data class AddMembersRequest(
 )
 
 @Serializable
+data class UpdateMemberRoleRequest(
+    /** "admin" or "member". */
+    val role: String
+)
+
+@Serializable
 data class UpdateGroupRequest(
     val name: String? = null,
     val description: String? = null,

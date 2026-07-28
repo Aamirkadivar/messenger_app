@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import QtQuick.Dialogs
 
 Rectangle {
     id: chatViewRoot
@@ -24,8 +25,11 @@ Rectangle {
     property color onlineColor: "#4CAF50"
     property string currentChatId: ""
     property string currentChatName: ""
+    property string currentChatType: "direct"
+    property string currentChatAvatarUrl: ""
     property string otherUserId: ""
     property bool isOnline: false
+    readonly property bool isGroupChat: currentChatType === "group"
     property bool typingIndicator: false
     property string typingUser: ""
 
@@ -68,7 +72,9 @@ Rectangle {
                 var m = messages[i]
                 var isMine = m.senderId === authService.currentUserId
                 var isRead = isMine && m.readAt && m.readAt.length > 0
-                chatViewRoot.addMessage(m.senderId, m.senderName, m.content, chatViewRoot.formatTime(m.createdAt), isMine, isRead)
+                chatViewRoot.addMessage(m.senderId, m.senderName, m.content, chatViewRoot.formatTime(m.createdAt),
+                                         isMine, isRead, m.fileUrl, m.durationMs, m.voiceEncrypted, m.id,
+                                         m.fileType, m.fileName, m.fileSize)
                 if (firstUnreadIndex === -1 && !isMine && (!m.readAt || m.readAt.length === 0)) {
                     firstUnreadIndex = i
                 }
@@ -82,6 +88,57 @@ Rectangle {
             console.log("[ChatView] Error:", error)
             chatViewRoot.isLoadingMore = false
         }
+
+        // Voice notes aren't shown optimistically like text - the bubble
+        // needs the server-assigned message id to correlate with playback
+        // prep (preparePlayableVoice / voiceReadyForPlayback), and the local
+        // plaintext temp file is already gone by the time this fires (it's
+        // deleted right after being read for upload).
+        function onVoiceMessageSent(chatId, message) {
+            if (chatId !== chatViewRoot.currentChatId) return
+            chatViewRoot.addMessage(authService.currentUserId, "Me", "", chatViewRoot.formatTime(message.createdAt),
+                                     true, false, message.fileUrl, message.durationMs,
+                                     message.encrypted === true, message.id, "audio", "", 0)
+        }
+
+        function onVoiceUploadError(error) {
+            console.log("[ChatView] Voice upload error:", error)
+        }
+
+        // Same reasoning as onVoiceMessageSent: shown once the server has
+        // assigned a real message id, needed to correlate with
+        // prepareAttachment/attachmentReady.
+        function onAttachmentMessageSent(chatId, message) {
+            if (chatId !== chatViewRoot.currentChatId) return
+            chatViewRoot.addMessage(authService.currentUserId, "Me", "", chatViewRoot.formatTime(message.createdAt),
+                                     true, false, message.fileUrl, 0,
+                                     message.encrypted === true, message.id,
+                                     message.fileType, message.fileName, message.fileSize)
+        }
+
+        function onAttachmentUploadError(error) {
+            console.log("[ChatView] Attachment upload error:", error)
+        }
+    }
+
+    Connections {
+        target: voiceService
+
+        function onRecordingFinished(filePath, durationMs) {
+            chatService.sendVoiceNote(chatViewRoot.currentChatId, chatViewRoot.currentChatType, filePath, durationMs)
+        }
+
+        function onRecordingFailed(error) {
+            console.log("[ChatView] Recording failed:", error)
+        }
+
+        function onRecordingTooShort() {
+            console.log("[ChatView] Recording too short, discarded")
+        }
+
+        function onPlaybackFailed(error) {
+            console.log("[ChatView] Playback failed:", error)
+        }
     }
 
     Connections {
@@ -91,9 +148,14 @@ Rectangle {
             if (chatId !== chatViewRoot.currentChatId) return
             // Our own sends are already shown optimistically when we hit send
             if (message.senderId === authService.currentUserId) return
-            var text = chatService.decryptMessage(chatId, message.content, message.encrypted === true)
+            var hasFile = (message.fileType === "audio" || message.fileType === "image" || message.fileType === "file")
+                          && message.fileUrl && message.fileUrl.length > 0
+            var text = hasFile ? "" : chatService.decryptMessage(chatId, message.content, message.encrypted === true)
             chatViewRoot.addMessage(message.senderId, chatViewRoot.currentChatName, text,
-                                     chatViewRoot.formatTime(message.createdAt), false, false)
+                                     chatViewRoot.formatTime(message.createdAt), false, false,
+                                     hasFile ? message.fileUrl : "", message.durationMs,
+                                     hasFile && message.encrypted === true, message.id,
+                                     message.fileType, message.fileName, message.fileSize)
             // This chat is already open and visible, so the message that just
             // arrived counts as read immediately - onCurrentChatIdChanged only
             // fires when switching chats, not for new messages in one already open.
@@ -131,6 +193,25 @@ Rectangle {
 
     ListModel {
         id: messagesModel
+    }
+
+    readonly property var imageExtensions: ["png", "jpg", "jpeg", "gif", "bmp", "webp"]
+    function attachmentContentType(fileUrl) {
+        var path = fileUrl.toString()
+        var dot = path.lastIndexOf(".")
+        if (dot === -1) return "file"
+        var ext = path.substring(dot + 1).toLowerCase()
+        return chatViewRoot.imageExtensions.indexOf(ext) !== -1 ? "image" : "file"
+    }
+
+    FileDialog {
+        id: attachmentPicker
+        title: "Send a file"
+        onAccepted: {
+            var contentType = chatViewRoot.attachmentContentType(selectedFile)
+            chatService.sendAttachment(chatViewRoot.currentChatId, chatViewRoot.currentChatType,
+                                        selectedFile.toString(), contentType)
+        }
     }
 
     ColumnLayout {
@@ -185,66 +266,87 @@ Rectangle {
                     }
                 }
 
-                // Avatar
+                // Avatar + name/status - tapping either opens group info for a
+                // group chat, same as the "..." button (and matching Android,
+                // where tapping the header does the same thing). Wrapped in a
+                // plain Item (rather than making the MouseArea itself a
+                // RowLayout child) because anchors and Qt Quick Layouts don't
+                // mix - a layout-managed child ignores anchors.fill entirely.
                 Item {
-                    Layout.preferredWidth: 38
+                    Layout.fillWidth: true
                     Layout.preferredHeight: 38
 
-                    Rectangle {
+                    RowLayout {
                         anchors.fill: parent
-                        radius: 19
-                        color: chatViewRoot.accentColor
+                        spacing: 12
 
-                        Text {
-                            anchors.centerIn: parent
-                            text: chatViewRoot.currentChatName ? chatViewRoot.currentChatName.substring(0, 1).toUpperCase() : "?"
-                            font.pixelSize: 15
-                            font.bold: true
-                            color: "#FFFFFF"
+                        Item {
+                            Layout.preferredWidth: 38
+                            Layout.preferredHeight: 38
+
+                            Avatar {
+                                anchors.fill: parent
+                                name: chatViewRoot.currentChatName
+                                avatarUrl: chatViewRoot.currentChatAvatarUrl
+                                size: 38
+                            }
+
+                            Rectangle {
+                                anchors.bottom: parent.bottom
+                                anchors.right: parent.right
+                                width: 11
+                                height: 11
+                                radius: 5.5
+                                color: chatViewRoot.onlineColor
+                                border.color: chatViewRoot.surfaceColor
+                                border.width: 2
+                                visible: chatViewRoot.isOnline && !chatViewRoot.isGroupChat
+                            }
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: chatViewRoot.currentChatName || "Select a chat"
+                                font.pixelSize: 15
+                                font.bold: true
+                                color: chatViewRoot.textColor
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: chatViewRoot.typingIndicator ? chatViewRoot.typingUser + " is typing…"
+                                      : chatViewRoot.isGroupChat ? "Tap for group info"
+                                      : (chatViewRoot.isOnline ? "Online" : "Offline")
+                                font.pixelSize: 12
+                                color: chatViewRoot.typingIndicator ? chatViewRoot.accentColor
+                                       : chatViewRoot.isGroupChat ? chatViewRoot.textSecondary
+                                       : (chatViewRoot.isOnline ? chatViewRoot.onlineColor : chatViewRoot.textSecondary)
+                                elide: Text.ElideRight
+                            }
                         }
                     }
 
-                    Rectangle {
-                        anchors.bottom: parent.bottom
-                        anchors.right: parent.right
-                        width: 11
-                        height: 11
-                        radius: 5.5
-                        color: chatViewRoot.onlineColor
-                        border.color: chatViewRoot.surfaceColor
-                        border.width: 2
-                        visible: chatViewRoot.isOnline
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: chatViewRoot.isGroupChat
+                        cursorShape: chatViewRoot.isGroupChat ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        onClicked: chatViewRoot.openChatInfo(chatViewRoot.currentChatId)
                     }
                 }
 
-                // Name + status
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 1
-
-                    Text {
-                        Layout.fillWidth: true
-                        text: chatViewRoot.currentChatName || "Select a chat"
-                        font.pixelSize: 15
-                        font.bold: true
-                        color: chatViewRoot.textColor
-                        elide: Text.ElideRight
-                    }
-
-                    Text {
-                        Layout.fillWidth: true
-                        text: chatViewRoot.typingIndicator ? chatViewRoot.typingUser + " is typing…" : (chatViewRoot.isOnline ? "Online" : "Offline")
-                        font.pixelSize: 12
-                        color: chatViewRoot.typingIndicator ? chatViewRoot.accentColor : (chatViewRoot.isOnline ? chatViewRoot.onlineColor : chatViewRoot.textSecondary)
-                        elide: Text.ElideRight
-                    }
-                }
-
-                // More options
+                // More options - group info panel. Direct chats have nothing
+                // here yet (no contact-info screen has been built), so the
+                // button is only shown when there's somewhere for it to go.
                 Rectangle {
                     Layout.preferredWidth: 36
                     Layout.preferredHeight: 36
                     radius: 9
+                    visible: chatViewRoot.isGroupChat
                     color: moreMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (moreMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
                     Behavior on color {
                         enabled: !chatViewRoot.instantThemeActive
@@ -339,6 +441,15 @@ Rectangle {
                     myMessageBg: chatViewRoot.myMessageBg
                     theirMessageBg: chatViewRoot.theirMessageBg
                     isEncrypted: true
+                    accentColor: chatViewRoot.accentColor
+                    messageId: model.messageId
+                    voiceUrl: model.voiceUrl
+                    voiceDurationMs: model.voiceDurationMs
+                    voiceEncrypted: model.voiceEncrypted
+                    contentType: model.contentType
+                    fileName: model.fileName
+                    fileSize: model.fileSize
+                    chatId: chatViewRoot.currentChatId
                 }
             }
 
@@ -396,6 +507,7 @@ Rectangle {
                     Layout.preferredWidth: 40
                     Layout.preferredHeight: 40
                     radius: 10
+                    visible: !voiceService.isRecording
                     color: attMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (attMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
                     Behavior on color {
                         enabled: !chatViewRoot.instantThemeActive
@@ -427,6 +539,7 @@ Rectangle {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
+                        onClicked: attachmentPicker.open()
                     }
                 }
 
@@ -435,6 +548,7 @@ Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 42
                     radius: 21
+                    visible: !voiceService.isRecording
                     // Was a "rgba(r,g,b,a)" string literal - that syntax silently
                     // drops the alpha channel in this Qt build (always resolves
                     // fully opaque), which is why this rendered solid black in
@@ -461,14 +575,98 @@ Rectangle {
                     }
                 }
 
-                // Send button
+                // Recording indicator - replaces the text field while a voice
+                // note is being recorded.
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 42
+                    radius: 21
+                    visible: voiceService.isRecording
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 16
+                        anchors.rightMargin: 16
+                        spacing: 8
+
+                        Rectangle {
+                            Layout.preferredWidth: 8
+                            Layout.preferredHeight: 8
+                            radius: 4
+                            color: "#E74C3C"
+                            SequentialAnimation on opacity {
+                                running: voiceService.isRecording
+                                loops: Animation.Infinite
+                                NumberAnimation { to: 0.25; duration: 500 }
+                                NumberAnimation { to: 1.0; duration: 500 }
+                            }
+                        }
+
+                        Text {
+                            text: chatViewRoot.formatDuration(voiceService.recordingElapsedMs)
+                            font.pixelSize: 13
+                            font.weight: Font.DemiBold
+                            color: chatViewRoot.textColor
+                        }
+
+                        Item { Layout.fillWidth: true }
+
+                        Text {
+                            text: "Recording voice message…"
+                            font.pixelSize: 12
+                            color: chatViewRoot.textSecondary
+                        }
+                    }
+                }
+
+                // Cancel recording
+                Rectangle {
+                    Layout.preferredWidth: 40
+                    Layout.preferredHeight: 40
+                    radius: 10
+                    visible: voiceService.isRecording
+                    color: cancelRecMouse.containsMouse ? Qt.rgba(231/255, 76/255, 60/255, 0.15) : "transparent"
+
+                    Canvas {
+                        anchors.centerIn: parent
+                        width: 16
+                        height: 16
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.strokeStyle = "#E74C3C"
+                            ctx.lineWidth = 1.6
+                            ctx.lineCap = "round"
+                            ctx.beginPath(); ctx.moveTo(2, 4); ctx.lineTo(14, 4); ctx.stroke()
+                            ctx.beginPath(); ctx.moveTo(6, 4); ctx.lineTo(6, 2); ctx.lineTo(10, 2); ctx.lineTo(10, 4); ctx.stroke()
+                            ctx.beginPath()
+                            ctx.moveTo(3.5, 4); ctx.lineTo(4.3, 14); ctx.lineTo(11.7, 14); ctx.lineTo(12.5, 4)
+                            ctx.stroke()
+                        }
+                    }
+                    ToolTip.visible: cancelRecMouse.containsMouse
+                    ToolTip.text: "Cancel"
+                    ToolTip.delay: 400
+                    MouseArea {
+                        id: cancelRecMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: voiceService.cancelRecording()
+                    }
+                }
+
+                // Send / mic button - sends the typed text when there is any,
+                // otherwise starts/stops recording a voice note.
                 Rectangle {
                     id: sendButton
                     Layout.preferredWidth: 42
                     Layout.preferredHeight: 42
                     radius: 21
                     property bool canSend: messageInput.text.trim().length > 0
-                    color: !canSend ? (darkMode ? "#2A2A4A" : "#E0E0E5")
+                    color: voiceService.isRecording ? "#E74C3C"
+                           : !canSend ? (sendMouse.containsMouse ? (darkMode ? "#33335A" : "#D6D6DC") : (darkMode ? "#2A2A4A" : "#E0E0E5"))
                            : sendMouse.pressed ? Qt.darker(chatViewRoot.myMessageBg, 1.15) : (sendMouse.containsMouse ? Qt.lighter(chatViewRoot.myMessageBg, 1.08) : chatViewRoot.myMessageBg)
                     Behavior on color {
                         enabled: !chatViewRoot.instantThemeActive
@@ -479,15 +677,17 @@ Rectangle {
                         if (!canSend) return
                         var text = messageInput.text.trim()
                         chatViewRoot.addMessage(authService.currentUserId, "Me", text, chatViewRoot.formatTime(new Date().toISOString()), true, false)
-                        chatService.sendMessage(chatViewRoot.currentChatId, text)
+                        chatService.sendMessage(chatViewRoot.currentChatId, text, chatViewRoot.currentChatType)
                         chatViewRoot.sendMessage(text)
                         messageInput.text = ""
                     }
 
+                    // Send arrow
                     Canvas {
                         anchors.centerIn: parent
                         width: 18
                         height: 18
+                        visible: !voiceService.isRecording && sendButton.canSend
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.reset()
@@ -502,29 +702,89 @@ Rectangle {
                             ctx.fill()
                         }
                     }
+
+                    // Mic icon (idle, no text typed)
+                    Canvas {
+                        anchors.centerIn: parent
+                        width: 16
+                        height: 16
+                        visible: !voiceService.isRecording && !sendButton.canSend
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.fillStyle = chatViewRoot.textSecondary
+                            ctx.strokeStyle = chatViewRoot.textSecondary
+                            ctx.lineWidth = 1.4
+                            ctx.lineCap = "round"
+                            // Capsule body
+                            ctx.beginPath()
+                            ctx.moveTo(8, 1)
+                            ctx.arcTo(11, 1, 11, 4, 3)
+                            ctx.lineTo(11, 8)
+                            ctx.arcTo(11, 11, 8, 11, 3)
+                            ctx.arcTo(5, 11, 5, 8, 3)
+                            ctx.lineTo(5, 4)
+                            ctx.arcTo(5, 1, 8, 1, 3)
+                            ctx.closePath()
+                            ctx.fill()
+                            // Stand
+                            ctx.beginPath(); ctx.moveTo(8, 11); ctx.lineTo(8, 15); ctx.stroke()
+                            ctx.beginPath(); ctx.moveTo(4, 15); ctx.lineTo(12, 15); ctx.stroke()
+                            ctx.beginPath()
+                            ctx.arc(8, 8.5, 5.5, Math.PI * 0.15, Math.PI * 0.85, false)
+                            ctx.stroke()
+                        }
+                    }
+
+                    // Stop (recording -> tap to finish and send)
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: 14
+                        height: 14
+                        radius: 3
+                        color: "#FFFFFF"
+                        visible: voiceService.isRecording
+                    }
+
                     MouseArea {
                         id: sendMouse
                         anchors.fill: parent
                         hoverEnabled: true
-                        cursorShape: sendButton.canSend ? Qt.PointingHandCursor : Qt.ArrowCursor
-                        onClicked: sendButton.trigger()
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (voiceService.isRecording) {
+                                voiceService.stopRecording()
+                            } else if (sendButton.canSend) {
+                                sendButton.trigger()
+                            } else {
+                                voiceService.startRecording()
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    function addMessage(senderId, senderName, text, time, isMine, isRead) {
+    function addMessage(senderId, senderName, text, time, isMine, isRead, fileUrl, fileDurationMs, fileEncrypted,
+                         messageId, contentType, fileName, fileSize) {
         const prev = messagesModel.count > 0 ? messagesModel.get(messagesModel.count - 1) : null
         const showSender = !isMine && (!prev || prev.senderId !== senderId)
         messagesModel.append({
+            messageId: messageId || "",
             senderId: senderId,
             senderName: senderName,
             messageText: text,
             messageTime: time,
             isMine: isMine,
             isRead: isRead === true,
-            showSender: showSender
+            showSender: showSender,
+            voiceUrl: fileUrl || "",
+            voiceDurationMs: fileDurationMs || 0,
+            voiceEncrypted: fileEncrypted === true,
+            contentType: contentType || "",
+            fileName: fileName || "",
+            fileSize: fileSize || 0
         })
     }
 
@@ -538,6 +798,13 @@ Rectangle {
                 messagesListView.positionViewAtEnd()
             }
         })
+    }
+
+    function formatDuration(ms) {
+        var totalSec = Math.max(0, Math.round(ms / 1000))
+        var m = Math.floor(totalSec / 60)
+        var s = totalSec % 60
+        return m + ":" + (s < 10 ? "0" : "") + s
     }
 
     function formatTime(isoString) {

@@ -276,6 +276,67 @@ QString Encryption::boxDecrypt(const QString& payloadHex,
     return QString::fromUtf8(plain);
 }
 
+QByteArray Encryption::boxEncryptBytes(const QByteArray& plain,
+                                       const QString& recipientPublicHex,
+                                       const QString& senderPrivateHex) {
+    if (!init()) return QByteArray();
+
+    QByteArray pk = QByteArray::fromHex(recipientPublicHex.toUtf8());
+    QByteArray sk = QByteArray::fromHex(senderPrivateHex.toUtf8());
+    if (pk.size() != crypto_box_PUBLICKEYBYTES || sk.size() != crypto_box_SECRETKEYBYTES) {
+        qWarning() << "boxEncryptBytes: invalid key size" << pk.size() << sk.size();
+        return QByteArray();
+    }
+
+    QByteArray nonce(crypto_box_NONCEBYTES, '\0');
+    randombytes_buf(nonce.data(), nonce.size());
+
+    QByteArray cipher(plain.size() + crypto_box_MACBYTES, '\0');
+    if (crypto_box_easy(
+            reinterpret_cast<unsigned char*>(cipher.data()),
+            reinterpret_cast<const unsigned char*>(plain.constData()),
+            static_cast<unsigned long long>(plain.size()),
+            reinterpret_cast<const unsigned char*>(nonce.constData()),
+            reinterpret_cast<const unsigned char*>(pk.constData()),
+            reinterpret_cast<const unsigned char*>(sk.constData())) != 0) {
+        qWarning() << "boxEncryptBytes: crypto_box_easy failed";
+        return QByteArray();
+    }
+
+    return nonce + cipher;
+}
+
+QByteArray Encryption::boxDecryptBytes(const QByteArray& payload,
+                                       const QString& otherPublicHex,
+                                       const QString& myPrivateHex) {
+    if (!init()) return QByteArray();
+
+    QByteArray pk = QByteArray::fromHex(otherPublicHex.toUtf8());
+    QByteArray sk = QByteArray::fromHex(myPrivateHex.toUtf8());
+    if (pk.size() != crypto_box_PUBLICKEYBYTES || sk.size() != crypto_box_SECRETKEYBYTES) {
+        return QByteArray();
+    }
+    if (payload.size() < crypto_box_NONCEBYTES + crypto_box_MACBYTES) {
+        return QByteArray();
+    }
+
+    QByteArray nonce = payload.left(crypto_box_NONCEBYTES);
+    QByteArray cipher = payload.mid(crypto_box_NONCEBYTES);
+    QByteArray plain(cipher.size() - crypto_box_MACBYTES, '\0');
+
+    if (crypto_box_open_easy(
+            reinterpret_cast<unsigned char*>(plain.data()),
+            reinterpret_cast<const unsigned char*>(cipher.constData()),
+            static_cast<unsigned long long>(cipher.size()),
+            reinterpret_cast<const unsigned char*>(nonce.constData()),
+            reinterpret_cast<const unsigned char*>(pk.constData()),
+            reinterpret_cast<const unsigned char*>(sk.constData())) != 0) {
+        return QByteArray();
+    }
+
+    return plain;
+}
+
 QString Encryption::bytesToHex(const QByteArray& bytes) {
     return QString::fromUtf8(bytes.toHex());
 }

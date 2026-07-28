@@ -27,6 +27,16 @@ public:
         bool encrypted = false;
         QString readAt;
         QString createdAt;
+        // File-bearing messages (voice/image/file): fileUrl points at the
+        // (opaque, possibly ciphertext) payload; fileType is "audio"/"image"/
+        // "file", empty for a plain text message.
+        QString fileUrl;
+        QString fileType;
+        // fileName/fileSize apply to image/file attachments (display before
+        // fetching); durationMs applies to voice notes.
+        QString fileName;
+        qint64 fileSize = 0;
+        qint64 durationMs = 0;
     };
 
     explicit MessageCache(QObject* parent = nullptr);
@@ -44,6 +54,12 @@ public:
     // through the same parsing/decryption path used for a fresh response.
     void saveChats(const QList<QJsonObject>& chats);
     QList<QJsonObject> loadChats() const;
+
+    // Wipes every cached message and chat (e.g. a user-triggered "clear
+    // cache" in Settings) and reclaims the freed space on disk.
+    void clear();
+    // Size of the on-disk database file, for showing in Settings.
+    qint64 sizeBytes() const;
 
 private:
     void ensureSchema();

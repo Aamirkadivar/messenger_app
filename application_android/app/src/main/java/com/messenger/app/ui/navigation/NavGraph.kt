@@ -11,6 +11,7 @@ import androidx.navigation.navArgument
 import com.messenger.app.ui.screen.ChatListScreen
 import com.messenger.app.ui.screen.ChatScreen
 import com.messenger.app.ui.screen.CreateGroupScreen
+import com.messenger.app.ui.screen.GroupInfoScreen
 import com.messenger.app.ui.screen.LoginScreen
 import com.messenger.app.ui.screen.RegisterScreen
 import com.messenger.app.ui.screen.SettingsScreen
@@ -26,13 +27,16 @@ object Routes {
     const val LOGIN = "login"
     const val REGISTER = "register"
     const val CHAT_LIST = "chat_list"
-    const val CHAT = "chat/{chatId}/{chatName}"
+    const val CHAT = "chat/{chatId}/{chatName}?isGroup={isGroup}"
     const val SETTINGS = "settings"
     const val CREATE_GROUP = "create_group"
+    const val GROUP_INFO = "group_info/{chatId}"
 
-    fun chat(chatId: String, chatName: String): String {
+    fun groupInfo(chatId: String) = "group_info/$chatId"
+
+    fun chat(chatId: String, chatName: String, isGroup: Boolean = false): String {
         val encodedName = URLEncoder.encode(chatName, "UTF-8")
-        return "chat/$chatId/$encodedName"
+        return "chat/$chatId/$encodedName?isGroup=$isGroup"
     }
 }
 
@@ -82,8 +86,8 @@ fun MainNavGraph(
             val chatViewModel: ChatViewModel = hiltViewModel()
             ChatListScreen(
                 chatViewModel = chatViewModel,
-                onChatClick = { chatId, chatName ->
-                    navController.navigate(Routes.chat(chatId, chatName))
+                onChatClick = { chatId, chatName, isGroup ->
+                    navController.navigate(Routes.chat(chatId, chatName, isGroup))
                 },
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
                 onCreateGroup = { navController.navigate(Routes.CREATE_GROUP) },
@@ -116,8 +120,26 @@ fun MainNavGraph(
                 onGroupCreated = { chatId, chatName ->
                     // Replace this screen in the stack: backing out of the new
                     // group should land on the chat list, not the create form.
-                    navController.navigate(Routes.chat(chatId, chatName)) {
+                    navController.navigate(Routes.chat(chatId, chatName, isGroup = true)) {
                         popUpTo(Routes.CREATE_GROUP) { inclusive = true }
+                    }
+                }
+            )
+        }
+
+        composable(
+            route = Routes.GROUP_INFO,
+            arguments = listOf(navArgument("chatId") { type = NavType.StringType })
+        ) { backStackEntry ->
+            val chatId = backStackEntry.arguments?.getString("chatId") ?: return@composable
+            GroupInfoScreen(
+                chatId = chatId,
+                onNavigateBack = { navController.popBackStack() },
+                onGroupExited = {
+                    // Left or deleted - the chat behind this screen is gone too,
+                    // so drop both and return to the list.
+                    navController.navigate(Routes.CHAT_LIST) {
+                        popUpTo(Routes.CHAT_LIST) { inclusive = true }
                     }
                 }
             )
@@ -127,18 +149,28 @@ fun MainNavGraph(
             route = Routes.CHAT,
             arguments = listOf(
                 navArgument("chatId") { type = NavType.StringType },
-                navArgument("chatName") { type = NavType.StringType }
+                navArgument("chatName") { type = NavType.StringType },
+                navArgument("isGroup") {
+                    type = NavType.BoolType
+                    defaultValue = false
+                }
             )
         ) { backStackEntry ->
             val chatId = backStackEntry.arguments?.getString("chatId") ?: return@composable
             val chatNameEncoded = backStackEntry.arguments?.getString("chatName") ?: ""
             val chatName = URLDecoder.decode(chatNameEncoded, "UTF-8")
+            val isGroup = backStackEntry.arguments?.getBoolean("isGroup") ?: false
             val chatViewModel: ChatViewModel = hiltViewModel()
 
             ChatScreen(
                 chatId = chatId,
                 chatName = chatName,
                 viewModel = chatViewModel,
+                onOpenGroupInfo = if (isGroup) {
+                    { navController.navigate(Routes.groupInfo(chatId)) }
+                } else {
+                    null
+                },
                 onNavigateBack = { navController.popBackStack() }
             )
         }

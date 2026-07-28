@@ -13,7 +13,11 @@ import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.data.remote.websocket.WebSocketManager
 import com.messenger.app.data.repository.AuthRepository
 import com.messenger.app.data.repository.ChatRepository
+import com.messenger.app.data.repository.AvatarRepository
 import com.messenger.app.data.repository.GroupRepository
+import com.messenger.app.data.repository.VoiceRepository
+import com.messenger.app.data.voice.VoicePlayer
+import com.messenger.app.data.voice.VoiceRecorder
 import com.messenger.app.data.settings.SettingsRepository
 import com.messenger.app.data.storage.StorageAnalyzer
 import com.messenger.app.security.KeyStoreManager
@@ -155,6 +159,31 @@ object AppModule {
     @Singleton
     fun provideGroupRepository(chatApiService: ChatApiService): GroupRepository =
         GroupRepository(chatApiService)
+
+    @Provides
+    @Singleton
+    fun provideAvatarRepository(
+        @ApplicationContext context: Context,
+        chatApiService: ChatApiService
+    ): AvatarRepository = AvatarRepository(context, chatApiService)
+
+    @Provides
+    @Singleton
+    fun provideVoiceRepository(
+        @ApplicationContext context: Context,
+        chatApiService: ChatApiService,
+        chatRepository: ChatRepository,
+        okHttpClient: OkHttpClient
+    ): VoiceRepository = VoiceRepository(context, chatApiService, chatRepository, okHttpClient)
+
+    @Provides
+    fun provideVoiceRecorder(@ApplicationContext context: Context): VoiceRecorder =
+        VoiceRecorder(context)
+
+    @Provides
+    @Singleton
+    fun provideVoicePlayer(@ApplicationContext context: Context): VoicePlayer =
+        VoicePlayer(context)
 
     @Provides
     @Singleton

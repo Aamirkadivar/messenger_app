@@ -13,6 +13,9 @@ package_config.json
 # Go
 vendor/
 
+# User-uploaded avatars - runtime data, not source
+back-end/uploads/
+
 # Docker
 .env
 .env.local

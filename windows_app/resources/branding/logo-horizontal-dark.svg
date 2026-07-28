@@ -1,0 +1,16 @@
+<svg width="340" height="80" viewBox="0 0 340 80" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Messenger logo">
+  <title>Messenger</title>
+  <defs>
+    <linearGradient id="bubble" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#DBBE7E"/>
+      <stop offset="100%" stop-color="#A6803A"/>
+    </linearGradient>
+  </defs>
+  <path d="M22,8 L74,8 A14,14 0 0 1 88,22 L88,50 A14,14 0 0 1 74,64 L42,64 L30,76 L35,64 L22,64 A14,14 0 0 1 8,50 L8,22 A14,14 0 0 1 22,8 Z"
+        fill="url(#bubble)"/>
+  <circle cx="34" cy="36" r="4" fill="#17141C"/>
+  <circle cx="48" cy="36" r="4" fill="#17141C"/>
+  <circle cx="62" cy="36" r="4" fill="#17141C"/>
+
+  <text x="112" y="47" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="34" font-weight="700" fill="#F0EAD6" letter-spacing="-0.5">Messenger</text>
+</svg>

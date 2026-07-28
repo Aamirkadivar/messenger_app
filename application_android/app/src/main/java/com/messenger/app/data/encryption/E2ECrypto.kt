@@ -82,6 +82,62 @@ object E2ECrypto {
         }
     }
 
+    /**
+     * Binary variant of [encrypt] for file payloads such as voice notes.
+     *
+     * Same construction and same wire layout (nonce || ciphertext), but raw
+     * bytes rather than hex: a voice note is hundreds of kilobytes and hex
+     * would double it for no benefit, since the payload is uploaded as a
+     * binary body rather than embedded in JSON.
+     */
+    fun encryptBytes(
+        plain: ByteArray,
+        recipientPublicHex: String,
+        senderPrivateHex: String
+    ): ByteArray? {
+        return try {
+            val pk = fromHex(recipientPublicHex) ?: return null
+            val sk = fromHex(senderPrivateHex) ?: return null
+            if (pk.size != Box.PUBLICKEYBYTES || sk.size != Box.SECRETKEYBYTES) return null
+
+            val nonce = sodium.randomBytesBuf(Box.NONCEBYTES)
+            val cipher = ByteArray(plain.size + Box.MACBYTES)
+            if (!sodium.cryptoBoxEasy(cipher, plain, plain.size.toLong(), nonce, pk, sk)) {
+                Log.e(TAG, "cryptoBoxEasy (bytes) failed")
+                return null
+            }
+            nonce + cipher
+        } catch (e: Exception) {
+            Log.e(TAG, "encryptBytes error", e)
+            null
+        }
+    }
+
+    /** Decrypts a payload produced by [encryptBytes]. Null on failure. */
+    fun decryptBytes(
+        payload: ByteArray,
+        otherPublicHex: String,
+        myPrivateHex: String
+    ): ByteArray? {
+        return try {
+            val pk = fromHex(otherPublicHex) ?: return null
+            val sk = fromHex(myPrivateHex) ?: return null
+            if (pk.size != Box.PUBLICKEYBYTES || sk.size != Box.SECRETKEYBYTES) return null
+            if (payload.size < Box.NONCEBYTES + Box.MACBYTES) return null
+
+            val nonce = payload.copyOfRange(0, Box.NONCEBYTES)
+            val cipher = payload.copyOfRange(Box.NONCEBYTES, payload.size)
+            val plain = ByteArray(cipher.size - Box.MACBYTES)
+            if (!sodium.cryptoBoxOpenEasy(plain, cipher, cipher.size.toLong(), nonce, pk, sk)) {
+                return null
+            }
+            plain
+        } catch (e: Exception) {
+            Log.e(TAG, "decryptBytes error", e)
+            null
+        }
+    }
+
     private fun toHex(bytes: ByteArray): String {
         val sb = StringBuilder(bytes.size * 2)
         for (b in bytes) sb.append("%02x".format(b.toInt() and 0xFF))

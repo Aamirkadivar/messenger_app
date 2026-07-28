@@ -1,0 +1,14 @@
+<svg width="240" height="220" viewBox="120 140 260 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Messenger logo mark">
+  <title>Messenger mark</title>
+  <defs>
+    <linearGradient id="bubble" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#DBBE7E"/>
+      <stop offset="100%" stop-color="#A6803A"/>
+    </linearGradient>
+  </defs>
+  <path d="M172,150 L340,150 A36,36 0 0 1 376,186 L376,294 A36,36 0 0 1 340,330 L237,330 L203,370 L218,330 L172,330 A36,36 0 0 1 136,294 L136,186 A36,36 0 0 1 172,150 Z"
+        fill="url(#bubble)"/>
+  <circle cx="196" cy="240" r="12" fill="#17141C"/>
+  <circle cx="256" cy="240" r="12" fill="#17141C"/>
+  <circle cx="316" cy="240" r="12" fill="#17141C"/>
+</svg>

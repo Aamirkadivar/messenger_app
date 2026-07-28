@@ -242,6 +242,7 @@ func (s *GroupService) GetGroupInfo(c *fiber.Ctx) error {
 			"email":        user.Email,
 			"username":     user.Username,
 			"display_name": user.DisplayName,
+			"avatar_url":   user.AvatarURL,
 			"role":         p.Role,
 			"joined_at":    p.JoinedAt,
 		}
@@ -413,6 +414,18 @@ func (s *GroupService) RemoveMember(c *fiber.Ctx) error {
 		})
 	}
 
+	// The owner cannot be removed by another admin - otherwise any admin could
+	// evict the group's creator and take it over.
+	var chat models.Chat
+	if err := database.DB.Where("id = ?", chatID).First(&chat).Error; err == nil {
+		if chat.OwnerID.String() == memberID && userID.String() != memberID {
+			return c.Status(http.StatusForbidden).JSON(fiber.Map{
+				"error":   "forbidden",
+				"message": "The group owner cannot be removed",
+			})
+		}
+	}
+
 	// Can't remove yourself unless you're transferring ownership
 	if userID.String() == memberID {
 		// Left the group
@@ -433,6 +446,156 @@ func (s *GroupService) RemoveMember(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{
 		"message": "Member removed successfully",
+	})
+}
+
+// UpdateMemberRoleRequest is the body for promoting/demoting a member.
+type UpdateMemberRoleRequest struct {
+	Role string `json:"role"`
+}
+
+// UpdateMemberRole promotes a member to admin, or demotes an admin to member.
+//
+// Only admins may change roles, and the group owner's role is immutable: the
+// owner is the one account guaranteed to be able to administer the group, so
+// allowing another admin to demote them would let a group be taken over.
+func (s *GroupService) UpdateMemberRole(c *fiber.Ctx) error {
+	chatID := c.Params("chat_id")
+	memberID := c.Params("member_id")
+	userID := middleware.GetCurrentUserID(c)
+
+	var req UpdateMemberRoleRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "invalid request body",
+			"message": "Failed to parse request body",
+		})
+	}
+
+	role := strings.ToLower(strings.TrimSpace(req.Role))
+	if role != "admin" && role != "member" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "validation error",
+			"message": "Role must be either 'admin' or 'member'",
+		})
+	}
+
+	// Caller must be an active admin of this group.
+	var caller models.ChatParticipant
+	if err := database.DB.
+		Where("chat_id = ? AND user_id = ? AND role = ? AND left_at IS NULL", chatID, userID, "admin").
+		First(&caller).Error; err != nil {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "Only group admins can change member roles",
+		})
+	}
+
+	var chat models.Chat
+	if err := database.DB.Where("id = ?", chatID).First(&chat).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{
+			"error":   "group not found",
+			"message": "Group not found",
+		})
+	}
+	if chat.OwnerID.String() == memberID {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "The group owner's role cannot be changed",
+		})
+	}
+
+	// Target must actually still be in the group.
+	var target models.ChatParticipant
+	if err := database.DB.
+		Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, memberID).
+		First(&target).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{
+			"error":   "not found",
+			"message": "That person is not a member of this group",
+		})
+	}
+
+	if err := database.DB.Model(&models.ChatParticipant{}).
+		Where("chat_id = ? AND user_id = ?", chatID, memberID).
+		Update("role", role).Error; err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "internal error",
+			"message": "Failed to update member role",
+		})
+	}
+
+	s.notify("member_role_changed", fiber.Map{
+		"chat_id":   chatID,
+		"member_id": memberID,
+		"role":      role,
+	})
+
+	return c.JSON(fiber.Map{
+		"message": "Member role updated successfully",
+		"data": fiber.Map{
+			"member_id": memberID,
+			"role":      role,
+		},
+	})
+}
+
+// DeleteGroup deletes a group for everyone.
+//
+// Restricted to the owner rather than any admin: this is irreversible and
+// affects every member, so it stays with the single account that created the
+// group. Participants are marked as left and messages soft-deleted in the same
+// transaction as the chat removal, so a partial failure can't leave members
+// pointing at a chat that no longer exists.
+func (s *GroupService) DeleteGroup(c *fiber.Ctx) error {
+	chatID := c.Params("chat_id")
+	userID := middleware.GetCurrentUserID(c)
+
+	var chat models.Chat
+	if err := database.DB.Where("id = ?", chatID).First(&chat).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{
+			"error":   "group not found",
+			"message": "Group not found",
+		})
+	}
+	if chat.Type != "group" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "validation error",
+			"message": "Only group chats can be deleted",
+		})
+	}
+	if chat.OwnerID != userID {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "Only the group owner can delete this group",
+		})
+	}
+
+	now := time.Now()
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.ChatParticipant{}).
+			Where("chat_id = ? AND left_at IS NULL", chatID).
+			Update("left_at", now).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.Message{}).
+			Where("chat_id = ? AND deleted_at IS NULL", chatID).
+			Update("deleted_at", now).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", chatID).Delete(&models.Chat{}).Error
+	})
+	if err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "internal error",
+			"message": "Failed to delete group",
+		})
+	}
+
+	s.notify("group_deleted", fiber.Map{"chat_id": chatID})
+
+	return c.JSON(fiber.Map{
+		"message": "Group deleted successfully",
 	})
 }
 

@@ -1,8 +1,11 @@
 package com.messenger.app.data.remote.api
 
 import com.messenger.app.data.model.*
+import okhttp3.MultipartBody
 import retrofit2.Response
 import retrofit2.http.Body
+import retrofit2.http.Multipart
+import retrofit2.http.Part
 import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.Header
@@ -30,13 +33,32 @@ interface AuthApiService {
  */
 interface ChatApiService {
     @GET("users/me")
-    suspend fun getCurrentUser(@Header("Authorization") token: String): Response<UserDto>
+    // The backend wraps this one: {"user": {...}}. Declaring it as a bare
+    // UserDto made every response fail to deserialize.
+    suspend fun getCurrentUser(@Header("Authorization") token: String): Response<MeResponse>
 
     @GET("users/search")
     suspend fun searchUsers(
         @Header("Authorization") token: String,
         @Query("q") query: String
     ): Response<UserSearchResponse>
+
+    /** Multipart profile picture upload. Returns {"avatar_url": "/uploads/..."}. */
+    @Multipart
+    @POST("users/me/avatar")
+    suspend fun uploadMyAvatar(
+        @Header("Authorization") token: String,
+        @Part file: MultipartBody.Part
+    ): Response<Map<String, String>>
+
+    /** Group picture upload. Admins only. */
+    @Multipart
+    @POST("groups/{chatId}/avatar")
+    suspend fun uploadGroupAvatar(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Part file: MultipartBody.Part
+    ): Response<Map<String, String>>
 
     @GET("chats")
     suspend fun getChats(@Header("Authorization") token: String): Response<ChatsListResponse>
@@ -58,6 +80,14 @@ interface ChatApiService {
         @Header("Authorization") token: String,
         @Body request: SendMessageRequest
     ): Response<SendMessageResponse>
+
+    /** Opaque (usually encrypted) voice payload. Returns {"file_url": ...}. */
+    @Multipart
+    @POST("messages/voice")
+    suspend fun uploadVoice(
+        @Header("Authorization") token: String,
+        @Part file: MultipartBody.Part
+    ): Response<Map<String, kotlinx.serialization.json.JsonElement>>
 
     @GET("messages/{chatId}")
     suspend fun getMessages(
@@ -108,6 +138,21 @@ interface ChatApiService {
         @Header("Authorization") token: String,
         @Path("chatId") chatId: String,
         @Path("memberId") memberId: String
+    ): Response<Unit>
+
+    @PUT("groups/{chatId}/members/{memberId}/role")
+    suspend fun updateMemberRole(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Path("memberId") memberId: String,
+        @Body request: UpdateMemberRoleRequest
+    ): Response<Unit>
+
+    /** Owner only - deletes the group for everyone. */
+    @DELETE("groups/{chatId}")
+    suspend fun deleteGroup(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String
     ): Response<Unit>
 
     @POST("groups/{chatId}/leave")
