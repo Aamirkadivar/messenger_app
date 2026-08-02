@@ -33,6 +33,11 @@ jackson = "2.18.2"
 signalProtocol = "2.10.0"
 opensslJni = "0.0.8"
 lazysodium = "5.1.0"
+webrtc = "144.7559.09"
+# Pinned to what the offline Gradle cache holds - this machine cannot reach
+# Google Maven, so an unavailable version fails the whole build.
+cameraX = "1.3.4"
+media3 = "1.3.1"
 jna = "5.13.0"
 mockk = "1.13.16"
 coroutines = "1.9.0"
@@ -140,6 +145,18 @@ image-loader-core = { group = "io.github.qdsf", name = "ImageLoader", version.re
 
 # Swipe to refresh
 androidx-swiperefreshlayout = { group = "androidx.swiperefreshlayout", name = "swiperefreshlayout", version.ref = "swipeRefresh" }
+
+# WebRTC (audio calling) - community-maintained prebuilt AAR; Google stopped
+# publishing org.webrtc:google-webrtc itself years ago.
+webrtc = { group = "io.github.webrtc-sdk", name = "android", version.ref = "webrtc" }
+androidx-camera-core = { group = "androidx.camera", name = "camera-core", version.ref = "cameraX" }
+androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "cameraX" }
+androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraX" }
+androidx-camera-video = { group = "androidx.camera", name = "camera-video", version.ref = "cameraX" }
+androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "cameraX" }
+androidx-media3-exoplayer = { group = "androidx.media3", name = "media3-exoplayer", version.ref = "media3" }
+androidx-media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "media3" }
+androidx-media3-common = { group = "androidx.media3", name = "media3-common", version.ref = "media3" }
 
 # QR Code
 qrose = { group = "com.vincent.folqrose", name = "qrose", version.ref = "qrose" }

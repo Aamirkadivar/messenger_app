@@ -12,50 +12,35 @@ Item {
     // here instead and have the Behaviors below read this plain property.
     property bool instantThemeActive: Window.window ? Window.window.instantTheme : false
 
+    // Was referenced throughout this file with no declaration and no binding
+    // from main.qml's Loader - always evaluated as undefined/falsy, so this
+    // screen has silently rendered in its (stale, off-palette) "light mode"
+    // colors regardless of the app's actual theme. Declared properly now,
+    // and main.qml's authLoader binds the real value in.
+    property bool darkMode: true
+    // Matches the rest of the app's champagne-gold accent instead of this
+    // file's old flat purple (#6C63FF), which predates the luxury palette.
+    property color accentColor: darkMode ? "#C9A961" : "#A6803A"
+
     property bool isLoading: false
 
-    // Background
-    Rectangle {
+    // Ambient colour behind the glass card, same treatment as the main window.
+    AmbientGlow {
         anchors.fill: parent
-        gradient: Gradient {
-            GradientStop { position: 0.0; color: darkMode ? "#0F0F23" : "#667eea" }
-            GradientStop { position: 1.0; color: darkMode ? "#16213E" : "#764ba2" }
-        }
-    }
-
-    // Ambient background circles
-    Repeater {
-        model: 4
-        Rectangle {
-            width: 200 + Math.random() * 300
-            height: width
-            radius: width / 2
-            color: Qt.rgba(108/255, 99/255, 255/255, 0.05 + Math.random() * 0.04)
-            x: Math.random() * parent.width
-            y: Math.random() * parent.height
-
-            NumberAnimation {
-                target: parent
-                property: "y"
-                to: y + (Math.random() - 0.5) * 50
-                duration: 5000 + Math.random() * 5000
-                running: true
-                loops: Animation.Infinite
-                easing.type: Easing.InOutSine
-            }
-        }
+        baseColor: darkMode ? "#0A0A0F" : "#FAF6EE"
+        primaryGlow: loginPage.accentColor
+        secondaryGlow: darkMode ? "#A6863F" : "#8A6A2E"
+        intensity: darkMode ? 1.0 : 0.6
     }
 
     // Login card
-    Rectangle {
+    GlassPanel {
         id: loginCard
         anchors.centerIn: parent
         width: Math.min(420, parent.width * 0.9)
         height: formLayout.y + formLayout.implicitHeight + 40
-        color: darkMode ? Qt.rgba(22/255, 33/255, 62/255, 0.95) : Qt.rgba(1, 1, 1, 0.95)
+        darkMode: loginPage.darkMode
         radius: 24
-        border.color: darkMode ? Qt.rgba(1, 1, 1, 0.06) : Qt.rgba(0, 0, 0, 0.04)
-        border.width: 1
         opacity: 0
         scale: 0.94
 
@@ -74,7 +59,7 @@ Item {
             Rectangle {
                 anchors.fill: parent
                 radius: 18
-                color: "#6C63FF"
+                color: loginPage.accentColor
 
                 SequentialAnimation on opacity {
                     running: true
@@ -110,7 +95,7 @@ Item {
                     ctx.closePath()
                     ctx.fill()
 
-                    ctx.fillStyle = "#6C63FF"
+                    ctx.fillStyle = loginPage.accentColor
                     var dotY = h / 2
                     var xs = [w * 0.3, w * 0.5, w * 0.7]
                     for (var i = 0; i < xs.length; i++) {
@@ -130,7 +115,7 @@ Item {
             text: "Welcome Back"
             font.pixelSize: 24
             font.bold: true
-            color: darkMode ? "#F2F2F5" : "#1A1A2E"
+            color: darkMode ? "#F0EAD6" : "#2B2418"
         }
 
         Text {
@@ -140,7 +125,7 @@ Item {
             anchors.horizontalCenter: parent.horizontalCenter
             text: "Sign in to continue to Messenger"
             font.pixelSize: 13
-            color: darkMode ? "#9494AC" : "#6B6B7B"
+            color: darkMode ? "#A39A8A" : "#7A6F5C"
         }
 
         // Form
@@ -163,15 +148,15 @@ Item {
                     text: "Email"
                     font.pixelSize: 13
                     font.weight: Font.Medium
-                    color: darkMode ? "#B8B8CC" : "#4A4A5A"
+                    color: darkMode ? "#A39A8A" : "#7A6F5C"
                 }
 
                 Rectangle {
                     Layout.fillWidth: true
                     height: 46
                     radius: 12
-                    color: darkMode ? Qt.rgba(42/255, 42/255, 74/255, 0.5) : Qt.rgba(240/255, 240/255, 245/255, 1)
-                    border.color: emailField.activeFocus ? "#6C63FF" : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1))
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
+                    border.color: emailField.activeFocus ? loginPage.accentColor : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0")
                     border.width: emailField.activeFocus ? 2 : 1
                     Behavior on border.color { ColorAnimation { duration: 150 } }
 
@@ -183,9 +168,9 @@ Item {
                         verticalAlignment: TextInput.AlignVCenter
                         background: Item {}
                         placeholderText: "you@example.com"
-                        placeholderTextColor: darkMode ? "#5A5A7A" : "#9E9E9E"
+                        placeholderTextColor: darkMode ? "#6B6355" : "#B0A58E"
                         font.pixelSize: 14
-                        color: darkMode ? "#E8E8E8" : "#1A1A2E"
+                        color: darkMode ? "#F0EAD6" : "#2B2418"
                         selectByMouse: true
                         onTextChanged: emailError.text = ""
                         Keys.onReturnPressed: passwordField.forceActiveFocus()
@@ -211,7 +196,7 @@ Item {
                     text: "Password"
                     font.pixelSize: 13
                     font.weight: Font.Medium
-                    color: darkMode ? "#B8B8CC" : "#4A4A5A"
+                    color: darkMode ? "#A39A8A" : "#7A6F5C"
                 }
 
                 Rectangle {
@@ -219,8 +204,8 @@ Item {
                     Layout.fillWidth: true
                     height: 46
                     radius: 12
-                    color: darkMode ? Qt.rgba(42/255, 42/255, 74/255, 0.5) : Qt.rgba(240/255, 240/255, 245/255, 1)
-                    border.color: passwordField.activeFocus ? "#6C63FF" : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1))
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
+                    border.color: passwordField.activeFocus ? loginPage.accentColor : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0")
                     border.width: passwordField.activeFocus ? 2 : 1
                     Behavior on border.color { ColorAnimation { duration: 150 } }
 
@@ -234,10 +219,10 @@ Item {
                         verticalAlignment: TextInput.AlignVCenter
                         background: Item {}
                         placeholderText: "Enter your password"
-                        placeholderTextColor: darkMode ? "#5A5A7A" : "#9E9E9E"
+                        placeholderTextColor: darkMode ? "#6B6355" : "#B0A58E"
                         font.pixelSize: 14
                         echoMode: passwordBg.passwordVisible ? TextInput.Normal : TextInput.Password
-                        color: darkMode ? "#E8E8E8" : "#1A1A2E"
+                        color: darkMode ? "#F0EAD6" : "#2B2418"
                         passwordCharacter: "•"
                         selectByMouse: true
                         onTextChanged: passwordError.text = ""
@@ -261,7 +246,7 @@ Item {
                             onPaint: {
                                 var ctx = getContext("2d")
                                 ctx.reset()
-                                ctx.strokeStyle = darkMode ? "#8B8B9E" : "#6B6B7B"
+                                ctx.strokeStyle = darkMode ? "#A39A8A" : "#7A6F5C"
                                 ctx.lineWidth = 1.6
                                 ctx.beginPath()
                                 ctx.moveTo(2, 10)
@@ -281,7 +266,7 @@ Item {
                             onPaint: {
                                 var ctx = getContext("2d")
                                 ctx.reset()
-                                ctx.strokeStyle = "#6C63FF"
+                                ctx.strokeStyle = loginPage.accentColor
                                 ctx.lineWidth = 1.6
                                 ctx.beginPath()
                                 ctx.moveTo(2, 10)
@@ -324,9 +309,9 @@ Item {
                         width: 18
                         height: 18
                         radius: 5
-                        border.color: rememberCheck.checked ? "#6C63FF" : (darkMode ? "#5A5A7A" : "#9E9E9E")
+                        border.color: rememberCheck.checked ? loginPage.accentColor : (darkMode ? "#6B6355" : "#B0A58E")
                         border.width: 1.5
-                        color: rememberCheck.checked ? "#6C63FF" : "transparent"
+                        color: rememberCheck.checked ? loginPage.accentColor : "transparent"
                         Behavior on color {
                         enabled: !loginPage.instantThemeActive
                         ColorAnimation { duration: 120 }
@@ -355,7 +340,7 @@ Item {
                     text: "Remember me"
                     contentItem: Text {
                         text: rememberCheck.text
-                        color: darkMode ? "#9494AC" : "#6B6B7B"
+                        color: darkMode ? "#A39A8A" : "#7A6F5C"
                         font: rememberCheck.font
                         leftPadding: rememberCheck.indicator.width + 8
                         verticalAlignment: Text.AlignVCenter
@@ -367,7 +352,7 @@ Item {
                 Text {
                     text: "Forgot password?"
                     font.pixelSize: 13
-                    color: forgotArea.containsMouse ? "#8B84FF" : "#6C63FF"
+                    color: forgotArea.containsMouse ? Qt.lighter(loginPage.accentColor, 1.2) : loginPage.accentColor
                     Behavior on color {
                         enabled: !loginPage.instantThemeActive
                         ColorAnimation { duration: 120 }
@@ -406,7 +391,7 @@ Item {
                 background: Rectangle {
                     radius: 13
                     color: !loginButton.enabled ? (darkMode ? "#2A2A4A" : "#E0E0E5")
-                           : loginMouse.pressed ? "#5B52E5" : (loginMouse.containsMouse ? "#7A72FF" : "#6C63FF")
+                           : loginMouse.pressed ? Qt.darker(loginPage.accentColor, 1.15) : (loginMouse.containsMouse ? Qt.lighter(loginPage.accentColor, 1.1) : loginPage.accentColor)
                     Behavior on color {
                         enabled: !loginPage.instantThemeActive
                         ColorAnimation { duration: 120 }
@@ -443,17 +428,17 @@ Item {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 1
-                    color: darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1)
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0"
                 }
                 Text {
                     text: "or"
-                    color: darkMode ? "#5A5A7A" : "#9E9E9E"
+                    color: darkMode ? "#6B6355" : "#B0A58E"
                     font.pixelSize: 12
                 }
                 Rectangle {
                     Layout.fillWidth: true
                     height: 1
-                    color: darkMode ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(224/255, 224/255, 229/255, 1)
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0"
                 }
             }
 
@@ -465,7 +450,7 @@ Item {
 
                 Text {
                     text: "Don't have an account?"
-                    color: darkMode ? "#9494AC" : "#6B6B7B"
+                    color: darkMode ? "#A39A8A" : "#7A6F5C"
                     font.pixelSize: 13
                 }
 
@@ -473,7 +458,7 @@ Item {
                     text: "Sign Up"
                     font.pixelSize: 13
                     font.bold: true
-                    color: signUpArea.containsMouse ? "#8B84FF" : "#6C63FF"
+                    color: signUpArea.containsMouse ? Qt.lighter(loginPage.accentColor, 1.2) : loginPage.accentColor
                     Behavior on color {
                         enabled: !loginPage.instantThemeActive
                         ColorAnimation { duration: 120 }
@@ -503,6 +488,13 @@ Item {
         visible: false
         active: visible
         source: "qrc:/qml/Register.qml"
+    }
+
+    Binding {
+        target: registerPage.item
+        property: "darkMode"
+        value: loginPage.darkMode
+        when: registerPage.status === Loader.Ready
     }
 
     Component.onCompleted: {

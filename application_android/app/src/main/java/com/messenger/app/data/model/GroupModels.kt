@@ -27,6 +27,8 @@ data class GroupMemberDto(
     val username: String = "",
     @SerialName("display_name") val displayName: String? = null,
     @SerialName("avatar_url") val avatarUrl: String? = null,
+    /** E2EE identity key (hex), needed to encrypt this member's copy of a group Sender Key. */
+    @SerialName("public_key") val publicKey: String = "",
     val role: String = GroupRole.MEMBER.id,
     @SerialName("joined_at") val joinedAt: String? = null
 ) {
@@ -48,6 +50,8 @@ data class GroupDto(
     @SerialName("avatar_url") val avatarUrl: String? = null,
     val description: String = "",
     @SerialName("owner_id") val ownerId: String? = null,
+    /** Bumped by the server on every membership change - the Sender Key rotation signal. */
+    @SerialName("key_epoch") val keyEpoch: Int = 0,
     val members: List<GroupMemberDto> = emptyList(),
     @SerialName("member_count") val memberCount: Int = 0,
     @SerialName("unread_count") val unreadCount: Long = 0,
@@ -92,4 +96,35 @@ data class UpdateGroupRequest(
     val name: String? = null,
     val description: String? = null,
     @SerialName("avatar_url") val avatarUrl: String? = null
+)
+
+// ==================== Group "Sender Keys" E2EE ====================
+// Mirrors back-end/handlers/group.go's PublishSenderKeyRequest/GetSenderKeys.
+// Each recipient's copy of a sender's group key is already encrypted
+// client-side (crypto_box, the same pairwise scheme direct chats use) before
+// it reaches the server - the server only stores/relays these opaque blobs.
+
+@Serializable
+data class SenderKeyRecipientDto(
+    @SerialName("user_id") val userId: String,
+    @SerialName("encrypted_key") val encryptedKey: String
+)
+
+@Serializable
+data class PublishSenderKeyRequest(
+    @SerialName("key_version") val keyVersion: Int,
+    val recipients: List<SenderKeyRecipientDto>
+)
+
+@Serializable
+data class GroupSenderKeyEntryDto(
+    @SerialName("sender_id") val senderId: String,
+    @SerialName("sender_public_key") val senderPublicKey: String = "",
+    @SerialName("key_version") val keyVersion: Int = 0,
+    @SerialName("encrypted_key") val encryptedKey: String = ""
+)
+
+@Serializable
+data class SenderKeysResponse(
+    val data: List<GroupSenderKeyEntryDto> = emptyList()
 )

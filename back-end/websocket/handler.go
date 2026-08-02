@@ -35,6 +35,23 @@ type Client struct {
 	Send   chan []byte
 	Rooms  map[string]bool
 	mu     sync.RWMutex
+	// writeMu serializes ALL writes to Conn. A websocket connection permits
+	// only one concurrent writer, and there are two here: writePump's
+	// goroutine, and the read goroutine's control-frame replies (the pong
+	// this sends in answer to a client ping). Without this they interleave
+	// and produce corrupted frames, which clients report as an abnormal
+	// closure (code 1006, "unexpected EOF") seconds into a healthy
+	// connection - and every reconnect drops the user offline long enough
+	// to make an incoming call ring against nobody.
+	writeMu sync.Mutex
+}
+
+// writeMessage is the single serialized path for writing to a client.
+func (c *Client) writeMessage(messageType int, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return c.Conn.WriteMessage(messageType, data)
 }
 
 // Hub manages all connected WebSocket clients
@@ -70,15 +87,25 @@ func (h *Hub) Run() {
 
 		case client := <-h.Unregister:
 			h.mu.Lock()
-			if _, ok := h.Clients[client.UserID]; ok {
+			// Only evict this user's slot if it still holds *this* client.
+			// Clients is keyed by user id alone, so a second connection for
+			// the same account replaces the first; when that second one then
+			// disconnected, an unconditional delete tore out the entry
+			// belonging to the connection that was still live. The surviving
+			// client stayed connected but unregistered - silently receiving
+			// nothing at all, with no error and no reconnect, until it was
+			// restarted.
+			if current, ok := h.Clients[client.UserID]; ok && current == client {
 				delete(h.Clients, client.UserID)
-				close(client.Send)
 				for room := range client.Rooms {
 					if _, ok := h.Rooms[room]; ok {
 						delete(h.Rooms[room], client.UserID)
 					}
 				}
 			}
+			// Closing Send always belongs to the departing client, registered
+			// or not - its writePump is waiting on that channel either way.
+			close(client.Send)
 			h.mu.Unlock()
 			log.Printf("Client %s disconnected", client.ID)
 
@@ -239,6 +266,16 @@ func HandleWebSocket(hub *Hub) fiber.Handler {
 			c.Conn.SetReadDeadline(time.Now().Add(pongWait))
 			return nil
 		})
+		// Clients ping us too (the Windows app every ~12s, to detect a dead
+		// link the OS hasn't noticed). Answer through the same serialized
+		// writer writePump uses - the default handler writes the pong
+		// straight from this read goroutine, racing writePump.
+		// A client ping is also proof the link is alive, so refresh the
+		// read deadline on it rather than waiting for our own ping cycle.
+		c.Conn.SetPingHandler(func(appData string) error {
+			c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+			return client.writeMessage(websocket.PongMessage, []byte(appData))
+		})
 
 		// Handle connection
 		go client.writePump(hub)
@@ -288,6 +325,10 @@ func handleClientMessage(hub *Hub, userID uuid.UUID, message []byte) {
 		broadcastMsg, _ := json.Marshal(wsMsg)
 		hub.Broadcast <- broadcastMsg
 	default:
+		if CallSignalTypes[wsMsg.Type] {
+			handleCallSignal(hub, userID, wsMsg)
+			return
+		}
 		log.Printf("Unknown message type: %s", wsMsg.Type)
 	}
 }
@@ -339,17 +380,15 @@ func (c *Client) writePump(hub *Hub) {
 		select {
 		case message, ok := <-c.Send:
 			if !ok {
-				_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				_ = c.writeMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
-			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			if err := c.writeMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
 		case <-ticker.C:
-			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := c.writeMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}

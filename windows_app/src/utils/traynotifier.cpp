@@ -8,7 +8,11 @@ TrayNotifier::TrayNotifier(QObject* parent)
 {
     m_notificationsEnabled = m_settings.value(QStringLiteral("notifications/enabled"), true).toBool();
 
-    m_trayIcon = new QSystemTrayIcon(QIcon(QStringLiteral(":/icons/tray.png")), this);
+    // The real app icon rather than the old placeholder mark, so the tray
+    // entry matches the taskbar and the window. The .ico is used because it
+    // ships several sizes and Windows can pick the one the notification area
+    // actually asks for.
+    m_trayIcon = new QSystemTrayIcon(QIcon(QStringLiteral(":/icons/app_icon.ico")), this);
     m_trayIcon->setToolTip(QStringLiteral("Messenger"));
 
     m_menu = new QMenu();

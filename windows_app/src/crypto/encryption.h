@@ -96,6 +96,25 @@ public:
                                       const QString& otherPublicHex,
                                       const QString& myPrivateHex);
 
+    // ---- Symmetric secretbox (XSalsa20-Poly1305) for group "Sender Keys" ----
+    // Direct chats use crypto_box (X25519 ECDH) because there are exactly two
+    // parties to derive a shared secret between. A group has no single
+    // "other side" - the WhatsApp/Signal answer is a Sender Key: each member
+    // picks their own random symmetric key for messages *they* send, and
+    // hands a copy to every other member individually (via crypto_box, one
+    // recipient at a time). Everyone else just needs that one key to open
+    // that sender's group messages, with no group-wide shared secret to leak
+    // or agree on. Keys are 32-byte hex strings, same convention as the
+    // crypto_box keys above.
+
+    // Generates a fresh random sender key (crypto_secretbox_KEYBYTES, hex-encoded).
+    static QString secretBoxGenerateKey();
+
+    // Wire format: nonce[24] || ciphertext (raw bytes - group message bodies
+    // travel as binary the same way voice/file attachments already do).
+    static QByteArray secretBoxEncryptBytes(const QByteArray& plain, const QString& keyHex);
+    static QByteArray secretBoxDecryptBytes(const QByteArray& payload, const QString& keyHex);
+
     // Convert bytes to hex for display (inline for convenience)
     static QString bytesToHex(const QByteArray& bytes);
 

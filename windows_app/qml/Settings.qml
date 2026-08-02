@@ -20,14 +20,10 @@ Popup {
     // ivory/bronze palette - this stays in the same warm family instead.
     readonly property color toggleOffColor: darkMode ? "#4A4438" : "#D9CFB8"
 
-    // The shared surfaceColor (#14141F) has a cool, blue-leaning near-black
-    // (its blue channel runs well above red/green) that barely registers as
-    // blue against the smaller surfaces it's normally used on - but filling
-    // this whole panel with it makes that cast obvious. A warmer near-black
-    // (blue channel now the lowest, not the highest) keeps the same depth
-    // without the tint, without touching the shared color everywhere else
-    // in the app still relies on.
-    readonly property color panelSurfaceColor: darkMode ? "#17140F" : surfaceColor
+    // Row hover tint - the panel's own background is GlassPanel now (see
+    // `background:` below), which sidesteps the cool blue-leaning cast the
+    // shared surfaceColor had at full opacity; this only needs to stay in
+    // the same warm family for the smaller hover highlight.
     readonly property color panelHoverColor: darkMode ? "#221E15" : surfaceColorHover
 
     signal darkModeToggled()
@@ -54,11 +50,9 @@ Popup {
                         : (bytes / (1024 * 1024)).toFixed(1) + " MB"
     }
 
-    background: Rectangle {
-        color: settingsRoot.panelSurfaceColor
+    background: GlassPanel {
+        darkMode: settingsRoot.darkMode
         radius: 12
-        border.color: settingsRoot.borderColor
-        border.width: 1
     }
 
     FileDialog {
@@ -222,13 +216,27 @@ Popup {
                         spacing: 14
 
                         ColumnLayout {
+                            // Same reason as the toggle below: unaligned Layout
+                            // children stretch to the row height, which spreads
+                            // the title/subtitle apart instead of keeping the
+                            // pair centred against the control opposite them.
+                            Layout.alignment: Qt.AlignVCenter
                             Layout.fillWidth: true
+                            // Anchor the flex basis at 0 so a long subtitle
+                            // cannot inflate this column and push the control
+                            // beside it out of line (or off the panel).
+                            Layout.preferredWidth: 0
                             spacing: 2
-                            Text { text: "Dark Mode"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
-                            Text { text: settingsRoot.darkMode ? "On" : "Off"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Dark Mode"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
+                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: settingsRoot.darkMode ? "On" : "Off"; font.pixelSize: 12; color: settingsRoot.textSecondary }
                         }
 
                         Rectangle {
+                            // Without an explicit alignment a Layout child is
+                            // stretched to fill its cell, so this 26px track
+                            // grew to the full 60px row height - a tall pill
+                            // with the knob stranded near the top.
+                            Layout.alignment: Qt.AlignVCenter
                             Layout.preferredWidth: 46
                             Layout.preferredHeight: 26
                             radius: 13
@@ -270,13 +278,27 @@ Popup {
                         spacing: 14
 
                         ColumnLayout {
+                            // Same reason as the toggle below: unaligned Layout
+                            // children stretch to the row height, which spreads
+                            // the title/subtitle apart instead of keeping the
+                            // pair centred against the control opposite them.
+                            Layout.alignment: Qt.AlignVCenter
                             Layout.fillWidth: true
+                            // Anchor the flex basis at 0 so a long subtitle
+                            // cannot inflate this column and push the control
+                            // beside it out of line (or off the panel).
+                            Layout.preferredWidth: 0
                             spacing: 2
-                            Text { text: "Notifications"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
-                            Text { text: "Tray pop-ups for new messages"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Notifications"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
+                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Tray pop-ups for new messages"; font.pixelSize: 12; color: settingsRoot.textSecondary }
                         }
 
                         Rectangle {
+                            // Without an explicit alignment a Layout child is
+                            // stretched to fill its cell, so this 26px track
+                            // grew to the full 60px row height - a tall pill
+                            // with the knob stranded near the top.
+                            Layout.alignment: Qt.AlignVCenter
                             Layout.preferredWidth: 46
                             Layout.preferredHeight: 26
                             radius: 13
@@ -318,10 +340,19 @@ Popup {
                         spacing: 14
 
                         ColumnLayout {
+                            // Same reason as the toggle below: unaligned Layout
+                            // children stretch to the row height, which spreads
+                            // the title/subtitle apart instead of keeping the
+                            // pair centred against the control opposite them.
+                            Layout.alignment: Qt.AlignVCenter
                             Layout.fillWidth: true
+                            // Anchor the flex basis at 0 so a long subtitle
+                            // cannot inflate this column and push the control
+                            // beside it out of line (or off the panel).
+                            Layout.preferredWidth: 0
                             spacing: 2
-                            Text { text: "Storage"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
-                            Text { text: settingsRoot.cacheSizeText + " used for cached chats"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Storage"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
+                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: settingsRoot.cacheSizeText + " used for cached chats"; font.pixelSize: 12; color: settingsRoot.textSecondary }
                         }
 
                         Text {
@@ -357,10 +388,19 @@ Popup {
                         spacing: 14
 
                         ColumnLayout {
+                            // Same reason as the toggle below: unaligned Layout
+                            // children stretch to the row height, which spreads
+                            // the title/subtitle apart instead of keeping the
+                            // pair centred against the control opposite them.
+                            Layout.alignment: Qt.AlignVCenter
                             Layout.fillWidth: true
+                            // Anchor the flex basis at 0 so a long subtitle
+                            // cannot inflate this column and push the control
+                            // beside it out of line (or off the panel).
+                            Layout.preferredWidth: 0
                             spacing: 2
-                            Text { text: "About"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
-                            Text { text: "Messenger for Windows — version 1.0.0"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "About"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
+                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Messenger for Windows — version 1.0.0"; font.pixelSize: 12; color: settingsRoot.textSecondary }
                         }
                     }
                 }

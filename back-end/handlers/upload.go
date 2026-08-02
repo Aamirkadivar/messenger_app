@@ -51,6 +51,12 @@ func EnsureUploadDirs() error {
 	if err := os.MkdirAll(filepath.Join(UploadRoot, VoiceDir), 0o755); err != nil {
 		return err
 	}
+	if err := os.MkdirAll(filepath.Join(UploadRoot, VideoNoteDir), 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(UploadRoot, VideoThumbDir), 0o755); err != nil {
+		return err
+	}
 	return os.MkdirAll(filepath.Join(UploadRoot, AttachmentDir), 0o755)
 }
 
@@ -183,6 +189,117 @@ func (h *UploadHandler) UploadVoice(c *fiber.Ctx) error {
 		"message":   "Voice note stored",
 		"file_url":  "/" + UploadRoot + "/" + VoiceDir + "/" + name,
 		"file_size": written,
+	})
+}
+
+// VideoNoteDir holds round video messages; VideoThumbDir their poster frames.
+// Both are relative to UploadRoot.
+const (
+	VideoNoteDir  = "videonotes"
+	VideoThumbDir = "videothumbs"
+)
+
+const (
+	// maxVideoNoteBytes caps one round video. A 60s note at the ~1Mbps this
+	// records at is well under 10MB; the headroom absorbs devices whose
+	// encoder overshoots the requested bitrate. Kept at Fiber's BodyLimit
+	// because a larger cap here could never be reached anyway.
+	maxVideoNoteBytes = 25 * 1024 * 1024
+	// maxVideoThumbBytes caps the poster frame - a single small JPEG.
+	maxVideoThumbBytes = 2 * 1024 * 1024
+)
+
+// storeOpaqueBlob writes an uploaded file verbatim under UploadRoot/dir and
+// returns its root-relative URL and the byte count.
+//
+// "Opaque" is the whole point: for an E2EE chat the client encrypts the
+// payload before upload, so what arrives is indistinguishable from random
+// bytes. Content-sniffing it would reject exactly the case this exists to
+// serve, so the protections are a size cap, a server-generated filename, and
+// serving the bytes back verbatim - never executing or interpreting them.
+//
+// Voice notes, attachments and video notes all want precisely this, so it
+// lives in one place rather than being copied per media type.
+func storeOpaqueBlob(c *fiber.Ctx, dir string, maxBytes int64, label string) (string, int64, error) {
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		return "", 0, c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "invalid request",
+			"message": "Expected a file in the 'file' field",
+		})
+	}
+	if fileHeader.Size > maxBytes {
+		return "", 0, c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "too large",
+			"message": fmt.Sprintf("%s must be %d MB or smaller", label, maxBytes/(1024*1024)),
+		})
+	}
+
+	src, err := fileHeader.Open()
+	if err != nil {
+		return "", 0, c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "invalid request",
+			"message": "Could not read upload",
+		})
+	}
+	defer src.Close()
+
+	// .bin, not a media extension: the stored bytes are usually ciphertext,
+	// and naming them after a type they cannot be decoded as would mislead.
+	name := uuid.New().String() + ".bin"
+	diskPath := filepath.Join(UploadRoot, dir, name)
+
+	dst, err := os.Create(diskPath)
+	if err != nil {
+		return "", 0, c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "internal error",
+			"message": "Could not store " + label,
+		})
+	}
+	defer dst.Close()
+
+	written, err := io.Copy(dst, io.LimitReader(src, maxBytes))
+	if err != nil {
+		os.Remove(diskPath)
+		return "", 0, c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "internal error",
+			"message": "Could not store " + label,
+		})
+	}
+	return "/" + UploadRoot + "/" + dir + "/" + name, written, nil
+}
+
+// UploadVideoNote stores a round video message. Opaque, like voice notes -
+// see storeOpaqueBlob.
+func (h *UploadHandler) UploadVideoNote(c *fiber.Ctx) error {
+	if middleware.GetCurrentUserID(c) == uuid.Nil {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	url, written, err := storeOpaqueBlob(c, VideoNoteDir, maxVideoNoteBytes, "Video message")
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{
+		"message":   "Video message stored",
+		"file_url":  url,
+		"file_size": written,
+	})
+}
+
+// UploadVideoThumb stores a round video's poster frame, so a bubble can be
+// drawn before the (much larger) video itself has been fetched.
+func (h *UploadHandler) UploadVideoThumb(c *fiber.Ctx) error {
+	if middleware.GetCurrentUserID(c) == uuid.Nil {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	url, written, err := storeOpaqueBlob(c, VideoThumbDir, maxVideoThumbBytes, "Video thumbnail")
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{
+		"message":       "Thumbnail stored",
+		"thumbnail_url": url,
+		"file_size":     written,
 	})
 }
 

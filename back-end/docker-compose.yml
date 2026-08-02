@@ -42,6 +42,9 @@ services:
       REFRESH_TOKEN_EXPIRATION: 168
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-your-32-byte-encryption-key-here}
       FIREBASE_SERVICE_ACCOUNT_PATH: /app/firebase/service-account.json
+      TURN_SECRET: ${TURN_SECRET}
+      TURN_HOST: ${TURN_HOST:-localhost}
+      TURN_PORT: ${TURN_PORT:-3478}
     ports:
       - "3000:3000"
     volumes:
@@ -49,6 +52,31 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - messenger_network
+
+  # TURN server for call NAT traversal (see turnserver.conf). The backend
+  # never proxies call media itself - this is the one piece of the calling
+  # feature that isn't pure signaling, because relaying encrypted media
+  # packets when a direct P2P path fails is exactly what a TURN server is
+  # for. It still can't see inside the DTLS-SRTP media it relays.
+  coturn:
+    image: coturn/coturn:4.6.2
+    container_name: messenger_coturn
+    restart: unless-stopped
+    command: >
+      turnserver
+      -c /etc/coturn/turnserver.conf
+      --static-auth-secret=${TURN_SECRET}
+      --external-ip=${TURN_EXTERNAL_IP:-}
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+      - "5349:5349"
+      - "5349:5349/udp"
+      - "49160-49200:49160-49200/udp"
     networks:
       - messenger_network
 

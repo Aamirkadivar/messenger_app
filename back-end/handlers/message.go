@@ -82,6 +82,7 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		SenderID:         userID,
 		EncryptedContent: content,
 		IsEncrypted:      req.Encrypted,
+		KeyVersion:       req.KeyVersion,
 	}
 
 	if req.FileURL != "" {
@@ -90,6 +91,18 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		message.DurationMs = req.DurationMs
 		message.FileName = req.FileName
 		message.FileSize = req.FileSize
+		message.ThumbnailURL = req.ThumbnailURL
+	}
+
+	// A new message brings a direct chat back for anyone who had cleared it
+	// off their list (see DeleteChat) - otherwise the chat stays hidden and
+	// their messages silently disappear. Deliberately direct-only: in a group,
+	// left_at means someone actually left, and a message must not drag them
+	// back in.
+	if chat.Type == "direct" {
+		database.DB.Model(&models.ChatParticipant{}).
+			Where("chat_id = ? AND left_at IS NOT NULL", chatID).
+			Update("left_at", nil)
 	}
 
 	if err := database.DB.Create(&message).Error; err != nil {
@@ -103,18 +116,20 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 	wsMsg := models.WebSocketMessage{
 		Type: "message",
 		Data: map[string]interface{}{
-			"chat_id":     chatID,
-			"chat_type":   chat.Type,
-			"message_id":  messageID.String(),
-			"sender_id":   userID.String(),
-			"content":     content,
-			"encrypted":   req.Encrypted,
-			"file_url":    message.FileURL,
-			"file_type":   message.ContentType,
-			"file_name":   message.FileName,
-			"file_size":   message.FileSize,
-			"duration_ms": message.DurationMs,
-			"timestamp":   message.CreatedAt,
+			"chat_id":       chatID,
+			"chat_type":     chat.Type,
+			"message_id":    messageID.String(),
+			"sender_id":     userID.String(),
+			"content":       content,
+			"encrypted":     req.Encrypted,
+			"file_url":      message.FileURL,
+			"file_type":     message.ContentType,
+			"file_name":     message.FileName,
+			"file_size":     message.FileSize,
+			"duration_ms":   message.DurationMs,
+			"thumbnail_url": message.ThumbnailURL,
+			"key_version":   message.KeyVersion,
+			"timestamp":     message.CreatedAt,
 		},
 		Timestamp: time.Now(),
 	}
@@ -129,20 +144,22 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"message": "Message sent successfully",
 		"data": fiber.Map{
-			"id":           messageID,
-			"chat_id":      chatID,
-			"sender_id":    userID,
-			"encrypted":    req.Encrypted,
-			"content":      content,
-			"file_url":     message.FileURL,
-			"file_type":    message.ContentType,
-			"file_name":    message.FileName,
-			"file_size":    message.FileSize,
-			"duration_ms":  message.DurationMs,
-			"type":         chat.Type,
-			"delivered_at": message.CreatedAt,
-			"created_at":   message.CreatedAt,
-			"updated_at":   message.CreatedAt,
+			"id":            messageID,
+			"chat_id":       chatID,
+			"sender_id":     userID,
+			"encrypted":     req.Encrypted,
+			"content":       content,
+			"file_url":      message.FileURL,
+			"file_type":     message.ContentType,
+			"file_name":     message.FileName,
+			"file_size":     message.FileSize,
+			"duration_ms":   message.DurationMs,
+			"thumbnail_url": message.ThumbnailURL,
+			"key_version":   message.KeyVersion,
+			"type":          chat.Type,
+			"delivered_at":  message.CreatedAt,
+			"created_at":    message.CreatedAt,
+			"updated_at":    message.CreatedAt,
 		},
 	})
 }
@@ -294,22 +311,24 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 
 	// Decrypt messages for response
 	type DecryptedMessage struct {
-		ID          string     `json:"id"`
-		ChatID      string     `json:"chat_id"`
-		SenderID    string     `json:"sender_id"`
-		Sender      fiber.Map  `json:"sender"`
-		Content     string     `json:"content"`
-		Encrypted   bool       `json:"encrypted"`
-		FileURL     *string    `json:"file_url,omitempty"`
-		FileType    *string    `json:"file_type,omitempty"`
-		FileName    *string    `json:"file_name,omitempty"`
-		FileSize    int64      `json:"file_size"`
-		DurationMs  int64      `json:"duration_ms"`
-		Type        string     `json:"type"`
-		DeliveredAt *time.Time `json:"delivered_at"`
-		ReadAt      *time.Time `json:"read_at"`
-		CreatedAt   time.Time  `json:"created_at"`
-		UpdatedAt   time.Time  `json:"updated_at"`
+		ID           string     `json:"id"`
+		ChatID       string     `json:"chat_id"`
+		SenderID     string     `json:"sender_id"`
+		Sender       fiber.Map  `json:"sender"`
+		Content      string     `json:"content"`
+		Encrypted    bool       `json:"encrypted"`
+		FileURL      *string    `json:"file_url,omitempty"`
+		FileType     *string    `json:"file_type,omitempty"`
+		FileName     *string    `json:"file_name,omitempty"`
+		FileSize     int64      `json:"file_size"`
+		DurationMs   int64      `json:"duration_ms"`
+		ThumbnailURL string     `json:"thumbnail_url"`
+		KeyVersion   int        `json:"key_version"`
+		Type         string     `json:"type"`
+		DeliveredAt  *time.Time `json:"delivered_at"`
+		ReadAt       *time.Time `json:"read_at"`
+		CreatedAt    time.Time  `json:"created_at"`
+		UpdatedAt    time.Time  `json:"updated_at"`
 	}
 
 	decryptedMessages := make([]DecryptedMessage, len(messages))
@@ -352,18 +371,20 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 				"username":     sender.Username,
 				"display_name": sender.DisplayName,
 			},
-			Content:     m.EncryptedContent,
-			Encrypted:   m.IsEncrypted,
-			FileURL:     &fileURL,
-			FileType:    &contentType,
-			FileName:    &fileName,
-			FileSize:    m.FileSize,
-			DurationMs:  m.DurationMs,
-			Type:        m.ChatType,
-			DeliveredAt: m.DeliveredAt,
-			ReadAt:      m.ReadAt,
-			CreatedAt:   m.CreatedAt,
-			UpdatedAt:   m.UpdatedAt,
+			Content:      m.EncryptedContent,
+			Encrypted:    m.IsEncrypted,
+			FileURL:      &fileURL,
+			FileType:     &contentType,
+			FileName:     &fileName,
+			FileSize:     m.FileSize,
+			DurationMs:   m.DurationMs,
+			ThumbnailURL: m.ThumbnailURL,
+			KeyVersion:   m.KeyVersion,
+			Type:         m.ChatType,
+			DeliveredAt:  m.DeliveredAt,
+			ReadAt:       m.ReadAt,
+			CreatedAt:    m.CreatedAt,
+			UpdatedAt:    m.UpdatedAt,
 		}
 	}
 
@@ -425,6 +446,50 @@ func (s *MessageService) DeleteMessage(c *fiber.Ctx) error {
 }
 
 // MarkAsRead handles marking messages as read
+// DeleteChat removes a chat from the caller's list, for the caller only.
+//
+// Implemented by stamping left_at on their own chat_participants row rather
+// than deleting anything: GetChatsByUserID already filters on
+// "left_at IS NULL", so the chat vanishes for them while the other
+// participant's view and the message history are untouched. Deleting the chat
+// row outright would destroy both sides' conversation, which is not what
+// "delete this chat" means anywhere else.
+//
+// A later message in a direct chat resurrects it - see SendMessage - so this
+// is "clear it off my list", not "block this person".
+func (s *MessageService) DeleteChat(c *fiber.Ctx) error {
+	chatID := c.Params("chat_id")
+	userID := middleware.GetCurrentUserID(c)
+
+	chatIDParsed, err := uuid.Parse(chatID)
+	if err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "invalid chat ID",
+			"message": "Invalid chat ID format",
+		})
+	}
+
+	result := database.DB.Model(&models.ChatParticipant{}).
+		Where("chat_id = ? AND user_id = ? AND left_at IS NULL",
+			chatIDParsed.String(), userID).
+		Update("left_at", time.Now())
+
+	if result.Error != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "internal error",
+			"message": "Failed to delete chat",
+		})
+	}
+	if result.RowsAffected == 0 {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{
+			"error":   "not found",
+			"message": "You are not a participant of this chat",
+		})
+	}
+
+	return c.JSON(fiber.Map{"message": "Chat deleted"})
+}
+
 func (s *MessageService) MarkAsRead(c *fiber.Ctx) error {
 	chatID := c.Params("chat_id")
 	userID := middleware.GetCurrentUserID(c)
@@ -517,6 +582,7 @@ type ChatListItem struct {
 	Type          string       `json:"type"`
 	Name          string       `json:"name"`
 	AvatarURL     string       `json:"avatar_url"`
+	KeyEpoch      int          `json:"key_epoch"`
 	OtherUserID   *uuid.UUID   `json:"other_user_id,omitempty"`
 	OtherUser     *models.User `json:"other_user,omitempty"`
 	LastMessage   *MessageResp `json:"last_message"`
@@ -534,6 +600,7 @@ type MessageResp struct {
 	ContentType string    `json:"content_type"`
 	FileName    string    `json:"file_name,omitempty"`
 	Encrypted   bool      `json:"encrypted"`
+	KeyVersion  int       `json:"key_version"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -625,6 +692,7 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 			Type:          ch.Type,
 			Name:          ch.Name,
 			AvatarURL:     ch.AvatarURL,
+			KeyEpoch:      ch.KeyEpoch,
 			LastMessageAt: ch.LastMessageAt,
 			LastReadAt:    p.LastReadAt,
 			UpdatedAt:     ch.UpdatedAt,
@@ -657,6 +725,7 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 				ContentType: msg.ContentType,
 				FileName:    msg.FileName,
 				Encrypted:   msg.IsEncrypted,
+				KeyVersion:  msg.KeyVersion,
 				CreatedAt:   msg.CreatedAt,
 			}
 		}

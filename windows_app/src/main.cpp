@@ -23,8 +23,10 @@
 #include "services/chatservice.h"
 #include "services/groupservice.h"
 #include "services/voiceservice.h"
+#include "services/callservice.h"
 
 #ifdef Q_OS_WIN
+#include "utils/win11frameless.h"
 #include <windows.h>
 #include <dwmapi.h>
 
@@ -56,6 +58,9 @@ int main(int argc, char* argv[]) {
     app.setOrganizationName(QStringLiteral("MessengerApp"));
     app.setApplicationName(QStringLiteral("Messenger"));
     app.setApplicationVersion(QStringLiteral("1.0.0"));
+    // Live window / taskbar-button icon. The .rc compiled into the exe covers
+    // how the *file* looks in Explorer; this covers the running window.
+    app.setWindowIcon(QIcon(QStringLiteral(":/icons/app_icon.png")));
 
     // Enable high DPI scaling
     app.setAttribute(Qt::AA_EnableHighDpiScaling, true);
@@ -68,9 +73,12 @@ int main(int argc, char* argv[]) {
     // Create services
     AuthService authService;
     WebSocketService websocketService;
-    ChatService chatService(&authService);
+    // GroupService before ChatService: ChatService needs it (group member
+    // list + public keys) to establish/distribute group Sender Keys.
     GroupService groupService(&authService);
+    ChatService chatService(&authService, &groupService);
     VoiceService voiceService;
+    CallService callService(&authService, &websocketService);
     AppConfig appConfig;
 
     // Connect auth to websocket
@@ -133,6 +141,14 @@ int main(int argc, char* argv[]) {
 
     TrayNotifier trayNotifier;
 
+#ifdef Q_OS_WIN
+    // Must be installed before the window is shown so the very first
+    // WM_NCCALCSIZE is ours - see Win11Frameless for why a frameless window
+    // otherwise loses Aero Snap, snap-to-top-to-maximize and Snap Layouts.
+    static Win11Frameless win11Frameless;
+    app.installNativeEventFilter(&win11Frameless);
+#endif
+
     QQmlApplicationEngine engine;
 
     // Register types
@@ -141,6 +157,7 @@ int main(int argc, char* argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("chatService"), &chatService);
     engine.rootContext()->setContextProperty(QStringLiteral("groupService"), &groupService);
     engine.rootContext()->setContextProperty(QStringLiteral("voiceService"), &voiceService);
+    engine.rootContext()->setContextProperty(QStringLiteral("callService"), &callService);
     engine.rootContext()->setContextProperty(QStringLiteral("appConfig"), &appConfig);
     engine.rootContext()->setContextProperty(QStringLiteral("credentialManager"), &CredentialManager::instance());
     engine.rootContext()->setContextProperty(QStringLiteral("trayNotifier"), &trayNotifier);
@@ -175,6 +192,7 @@ int main(int argc, char* argv[]) {
                 window->requestActivate();
             });
 #ifdef Q_OS_WIN
+            Win11Frameless::applyTo(window);
             applyRoundedCorners(window);
 #endif
         }

@@ -65,6 +65,10 @@ class MessengerApplication : Application() {
                     .isAtLeast(Lifecycle.State.STARTED)
                 if (isForeground) return@collect
 
+                // Muting a chat previously only hid it in Settings - it never
+                // actually silenced anything, so honour it here.
+                if (chatRepository.isChatMuted(message.chatId)) return@collect
+
                 showMessageNotification(message)
             }
         }

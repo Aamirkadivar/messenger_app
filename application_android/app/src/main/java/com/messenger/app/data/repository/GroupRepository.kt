@@ -5,6 +5,9 @@ import com.messenger.app.data.model.AddMembersRequest
 import com.messenger.app.data.model.CreateGroupRequest
 import com.messenger.app.data.model.GroupDto
 import com.messenger.app.data.model.GroupRole
+import com.messenger.app.data.model.GroupSenderKeyEntryDto
+import com.messenger.app.data.model.PublishSenderKeyRequest
+import com.messenger.app.data.model.SenderKeyRecipientDto
 import com.messenger.app.data.model.UpdateGroupRequest
 import com.messenger.app.data.model.UpdateMemberRoleRequest
 import com.messenger.app.data.remote.api.ChatApiService
@@ -19,12 +22,11 @@ import retrofit2.Response
  * (membership, roles, admin permissions) that has nothing to do with the
  * direct-message send/receive path.
  *
- * NOTE ON ENCRYPTION: [ChatRepository]'s E2EE is pairwise X25519 between
- * exactly two participants and does not generalise to N members. Creating and
- * administering groups is safe, but group *messages* have no encryption path
- * yet - see the note at the bottom of back-end/handlers/group.go for the two
- * candidate designs. Nothing here should be wired into message sending until
- * that is decided.
+ * NOTE ON ENCRYPTION: group *messages* use a WhatsApp/Signal-style "Sender
+ * Key" scheme - see [publishSenderKey]/[getSenderKeys] below - because the
+ * pairwise X25519 crypto_box used for direct chats doesn't generalise to N
+ * members. [ChatRepository] owns the actual key generation/rotation/message
+ * encryption logic; this class only carries the wire calls.
  */
 class GroupRepository(
     private val chatApiService: ChatApiService
@@ -224,6 +226,48 @@ class GroupRepository(
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "leaveGroup error", e)
+                Result.failure(e)
+            }
+        }
+
+    /**
+     * Distributes this device's per-recipient encrypted copies of its current
+     * group Sender Key. [recipients] must already be encrypted client-side
+     * (crypto_box, one ciphertext per member) - the server only relays blobs.
+     */
+    suspend fun publishSenderKey(
+        token: String,
+        chatId: String,
+        keyVersion: Int,
+        recipients: List<SenderKeyRecipientDto>
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val response = chatApiService.publishSenderKey(
+                bearer(token), chatId, PublishSenderKeyRequest(keyVersion, recipients)
+            )
+            if (response.isSuccessful) {
+                Result.success(Unit)
+            } else {
+                Result.failure(Exception(response.errorMessage("Failed to publish sender key")))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "publishSenderKey error", e)
+            Result.failure(e)
+        }
+    }
+
+    /** Every Sender Key distributed to the caller across this group's members, still encrypted. */
+    suspend fun getSenderKeys(token: String, chatId: String): Result<List<GroupSenderKeyEntryDto>> =
+        withContext(Dispatchers.IO) {
+            try {
+                val response = chatApiService.getSenderKeys(bearer(token), chatId)
+                if (response.isSuccessful && response.body() != null) {
+                    Result.success(response.body()!!.data)
+                } else {
+                    Result.failure(Exception(response.errorMessage("Failed to fetch sender keys")))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "getSenderKeys error", e)
                 Result.failure(e)
             }
         }

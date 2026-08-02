@@ -32,11 +32,9 @@ Popup {
         emptyState.text = "Start typing to search for people"
     }
 
-    background: Rectangle {
-        color: newChatDialog.surfaceColor
+    background: GlassPanel {
+        darkMode: newChatDialog.darkMode
         radius: 12
-        border.color: newChatDialog.borderColor
-        border.width: 1
     }
 
     Connections {
@@ -157,7 +155,7 @@ Popup {
                     Rectangle {
                         width: parent.width
                         height: 64
-                        color: resultMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.14)
+                        color: resultMouse.pressed ? Qt.rgba(newChatDialog.accentColor.r, newChatDialog.accentColor.g, newChatDialog.accentColor.b, 0.14)
                                : (resultMouse.containsMouse ? newChatDialog.surfaceColorHover : "transparent")
 
                         MouseArea {

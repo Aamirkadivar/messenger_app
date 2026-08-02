@@ -3,7 +3,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 
-Rectangle {
+Item {
     id: chatListRoot
 
     // The Window attached type only attaches to Item-derived elements, so it
@@ -23,9 +23,142 @@ Rectangle {
     property color onlineColor: "#4CAF50"
     property color offlineColor: "#9E9E9E"
 
-    color: bgColor
+    // Sidebar as a glass surface over main.qml's AmbientGlow, rather than a
+    // flat opaque fill - edge-to-edge (no radius/margin) since it docks
+    // directly against the window's left edge and the title bar above it.
+    GlassPanel {
+        anchors.fill: parent
+        radius: 0
+        darkMode: chatListRoot.darkMode
+    }
 
     // Signals
+    // Right-click menu on a chat row, plus the confirmation it opens.
+    Menu {
+        id: chatContextMenu
+        property string chatId: ""
+        property string chatName: ""
+        property bool isGroup: false
+
+        background: GlassPanel {
+            implicitWidth: 180
+            darkMode: chatListRoot.darkMode
+            radius: 8
+            sheen: false
+        }
+
+        MenuItem {
+            text: chatContextMenu.isGroup ? "Delete group chat" : "Delete chat"
+            onTriggered: deleteChatConfirm.open()
+            contentItem: Text {
+                text: parent.text
+                font.pixelSize: 13
+                color: "#FF6B6B"
+                verticalAlignment: Text.AlignVCenter
+                leftPadding: 10
+            }
+            background: Rectangle {
+                implicitHeight: 34
+                color: parent.hovered ? Qt.rgba(1, 0.42, 0.42, 0.12) : "transparent"
+                radius: 6
+            }
+        }
+    }
+
+    Dialog {
+        id: deleteChatConfirm
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 320
+        padding: 20
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+        background: GlassPanel {
+            darkMode: chatListRoot.darkMode
+            radius: 12
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            Text {
+                Layout.fillWidth: true
+                text: "Delete chat?"
+                font.pixelSize: 16
+                font.bold: true
+                color: chatListRoot.textColor
+            }
+
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pixelSize: 13
+                color: chatListRoot.textSecondary
+                // Says plainly what this does and does not do - the backend
+                // only stamps left_at on this user's own participant row.
+                text: "\"" + chatContextMenu.chatName + "\" will be removed from your chat list. "
+                      + (chatContextMenu.isGroup
+                         ? "Other members keep the group and its messages."
+                         : "The other person keeps their copy, and a new message will bring the chat back.")
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                spacing: 10
+
+                Item { Layout.fillWidth: true }
+
+                Text {
+                    text: "Cancel"
+                    font.pixelSize: 13
+                    color: chatListRoot.textSecondary
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -8
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: deleteChatConfirm.close()
+                    }
+                }
+
+                Text {
+                    text: "Delete"
+                    font.pixelSize: 13
+                    font.bold: true
+                    color: "#FF6B6B"
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -8
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            chatService.deleteChat(chatContextMenu.chatId)
+                            deleteChatConfirm.close()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Connections {
+        target: typeof chatService !== "undefined" ? chatService : null
+        function onChatDeleted(chatId) {
+            for (var i = 0; i < chatModel.count; i++) {
+                if (chatModel.get(i).chatId === chatId) {
+                    chatModel.remove(i)
+                    break
+                }
+            }
+            // originalChats backs the search filter; leaving the row there
+            // would resurrect the chat the moment the user typed a query.
+            for (var j = originalChats.length - 1; j >= 0; j--) {
+                if (originalChats[j].chatId === chatId) originalChats.splice(j, 1)
+            }
+            chatListRoot.chatDeleted(chatId)
+        }
+    }
+
+    signal chatDeleted(string chatId)
     signal chatSelected(string chatId, string chatName, string otherUserId, bool online, string chatType, string avatarUrl)
     signal newChatClicked()
     signal newGroupClicked()
@@ -74,8 +207,8 @@ Rectangle {
                 Layout.preferredHeight: 38
                 radius: 11
                 scale: newGroupMouse.pressed ? 0.94 : 1.0
-                color: newGroupMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.22)
-                       : (newGroupMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.12) : "transparent")
+                color: newGroupMouse.pressed ? Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g, chatListRoot.accentColor.b, 0.22)
+                       : (newGroupMouse.containsMouse ? Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g, chatListRoot.accentColor.b, 0.12) : "transparent")
                 Behavior on color {
                     enabled: !chatListRoot.instantThemeActive
                     ColorAnimation { duration: 150; easing.type: Easing.OutCubic }
@@ -127,8 +260,8 @@ Rectangle {
                 Layout.preferredHeight: 38
                 radius: 11
                 scale: searchMouse.pressed ? 0.94 : 1.0
-                color: searchMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.22)
-                       : (searchVisible || searchMouse.containsMouse) ? Qt.rgba(108/255, 99/255, 255/255, 0.12) : "transparent"
+                color: searchMouse.pressed ? Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g, chatListRoot.accentColor.b, 0.22)
+                       : (searchVisible || searchMouse.containsMouse) ? Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g, chatListRoot.accentColor.b, 0.12) : "transparent"
                 Behavior on color {
                     enabled: !chatListRoot.instantThemeActive
                     ColorAnimation { duration: 150; easing.type: Easing.OutCubic }
@@ -456,7 +589,7 @@ Rectangle {
                             anchors.topMargin: 2
                             anchors.bottomMargin: 2
                             radius: 14
-                            color: itemMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.16)
+                            color: itemMouse.pressed ? Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g, chatListRoot.accentColor.b, 0.16)
                                    : (itemMouse.containsMouse ? chatListRoot.surfaceColorHover : "transparent")
                             Behavior on color {
                                 enabled: !chatListRoot.instantThemeActive
@@ -468,7 +601,17 @@ Rectangle {
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: chatListRoot.chatSelected(model.chatId, model.chatName, model.otherUserId, model.online, model.chatType, model.avatarUrl)
+                                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                onClicked: function(mouse) {
+                                    if (mouse.button === Qt.RightButton) {
+                                        chatContextMenu.chatId = model.chatId
+                                        chatContextMenu.chatName = model.chatName
+                                        chatContextMenu.isGroup = model.chatType === "group"
+                                        chatContextMenu.popup()
+                                        return
+                                    }
+                                    chatListRoot.chatSelected(model.chatId, model.chatName, model.otherUserId, model.online, model.chatType, model.avatarUrl)
+                                }
                             }
 
                             RowLayout {
@@ -573,12 +716,12 @@ Rectangle {
                         anchors.centerIn: parent
                         spacing: 14
 
-                        Rectangle {
+                        GlassPanel {
                             Layout.alignment: Qt.AlignHCenter
                             width: 64
                             height: 64
                             radius: 32
-                            color: chatListRoot.surfaceColor
+                            darkMode: chatListRoot.darkMode
 
                             Canvas {
                                 anchors.centerIn: parent
@@ -656,7 +799,12 @@ Rectangle {
         var otherUser = chatData.other_user || {}
         var otherUserId = otherUser.id || ""
         var lastMessageData = chatData.last_message || {}
-        var isOnline = chatData.is_online || false
+        // A group has no presence of its own. The backend fills other_user (and
+        // hence is_online) with an arbitrary member for group rows, so a green
+        // dot on a group avatar was really reporting "one random participant
+        // happens to be online" - which reads as a statement about the group
+        // and means nothing.
+        var isOnline = (chatType === "group") ? false : (chatData.is_online || false)
 
         // For direct chats, always prefer the other user's name - chat.name is
         // just a generic "Direct Chat" placeholder set at creation time, never
@@ -825,10 +973,15 @@ Rectangle {
     // Live-update a contact's online dot the instant they connect/disconnect,
     // instead of only after the next full chat-list refetch.
     function onPresenceChanged(userId, online) {
+        // Group rows are skipped: they carry an arbitrary member in
+        // otherUserId, so without this a presence event for that member would
+        // put the dot back on the group despite parseChat clearing it.
         for (var i = 0; i < originalChats.length; i++) {
+            if (originalChats[i].chatType === "group") continue
             if (originalChats[i].otherUserId === userId) originalChats[i].online = online
         }
         for (var j = 0; j < chatModel.count; j++) {
+            if (chatModel.get(j).chatType === "group") continue
             if (chatModel.get(j).otherUserId === userId) chatModel.setProperty(j, "online", online)
         }
     }

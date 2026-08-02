@@ -56,6 +56,7 @@ func main() {
 	userHandler := handlers.NewUserHandler()
 	cryptoHandler := handlers.NewCryptoHandler()
 	uploadHandler := handlers.NewUploadHandler()
+	callService := handlers.NewCallService(cfg)
 
 	if err := handlers.EnsureUploadDirs(); err != nil {
 		log.Fatalf("Failed to create upload directories: %v", err)
@@ -131,6 +132,8 @@ func main() {
 		return c.JSON(fiber.Map{"error": "Not implemented yet"})
 	})
 	chatRoutes.Post("/:chat_id/read", messageService.MarkAsRead)
+	// Removes the chat from the caller's list only - see DeleteChat.
+	chatRoutes.Delete("/:chat_id", messageService.DeleteChat)
 
 	// Group routes
 	groupRoutes := protected.Group("/groups")
@@ -145,12 +148,22 @@ func main() {
 	groupRoutes.Post("/:chat_id/avatar", uploadHandler.UploadGroupAvatar)
 	groupRoutes.Post("/:chat_id/leave", groupService.LeaveGroup)
 	groupRoutes.Get("/:chat_id/search-users", groupService.SearchUsers)
+	groupRoutes.Post("/:chat_id/sender-key", groupService.PublishSenderKey)
+	groupRoutes.Get("/:chat_id/sender-keys", groupService.GetSenderKeys)
+
+	// Call routes - signaling itself is WS-only (see websocket/calls.go);
+	// these are just history + the ICE server list needed to start one.
+	callRoutes := protected.Group("/calls")
+	callRoutes.Get("/", callService.GetCallHistory)
+	callRoutes.Get("/ice-servers", callService.GetIceServers)
 
 	// Message routes
 	messageRoutes := protected.Group("/messages")
 	messageRoutes.Post("/", messageService.SendMessage)
 	messageRoutes.Post("/voice", uploadHandler.UploadVoice)
 	messageRoutes.Post("/attachment", uploadHandler.UploadAttachment)
+	messageRoutes.Post("/video-note", uploadHandler.UploadVideoNote)
+	messageRoutes.Post("/video-thumb", uploadHandler.UploadVideoThumb)
 	messageRoutes.Get("/:chat_id", messageService.GetMessages)
 	messageRoutes.Delete("/:chat_id/:message_id", messageService.DeleteMessage)
 	messageRoutes.Post("/:chat_id/unread", messageService.GetUnreadCount)

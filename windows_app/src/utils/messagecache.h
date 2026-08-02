@@ -37,6 +37,9 @@ public:
         QString fileName;
         qint64 fileSize = 0;
         qint64 durationMs = 0;
+        // Which of the sender's group Sender Key versions encrypted this
+        // message - 0/unused outside a group chat.
+        int keyVersion = 0;
     };
 
     explicit MessageCache(QObject* parent = nullptr);
@@ -55,6 +58,8 @@ public:
     void saveChats(const QList<QJsonObject>& chats);
     QList<QJsonObject> loadChats() const;
 
+    // Drops one conversation's cached messages and chat row.
+    void deleteChat(const QString& chatId);
     // Wipes every cached message and chat (e.g. a user-triggered "clear
     // cache" in Settings) and reclaims the freed space on disk.
     void clear();

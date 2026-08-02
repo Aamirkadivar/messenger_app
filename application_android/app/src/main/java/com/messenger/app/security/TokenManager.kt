@@ -21,6 +21,19 @@ interface TokenManager {
     suspend fun saveE2EEKeys(userId: String, publicHex: String, privateHex: String): Result<Unit>
     suspend fun getE2EEPrivateKey(userId: String): Result<String?>
     suspend fun getE2EEPublicKey(userId: String): Result<String?>
+
+    /** This device's current group Sender Key for [chatId], as "version:keyHex". */
+    suspend fun saveGroupSenderKey(chatId: String, versionAndKey: String): Result<Unit>
+    suspend fun getGroupSenderKey(chatId: String): Result<String?>
+
+    /**
+     * The last-seen E2EE public key for a direct chat's other participant,
+     * used to detect a WhatsApp-style "security code changed" event when it
+     * differs from what the server now reports.
+     */
+    suspend fun saveKnownPublicKey(chatId: String, publicKeyHex: String): Result<Unit>
+    suspend fun getKnownPublicKey(chatId: String): Result<String?>
+
     suspend fun clearTokens(): Result<Unit>
     suspend fun isAccessTokenExpired(): Result<Boolean>
     fun isAuthenticated(): Boolean
@@ -176,6 +189,48 @@ class TokenManagerImpl(
     override suspend fun getE2EEPublicKey(userId: String): Result<String?> = withContext(Dispatchers.IO) {
         try {
             Result.success(sharedPreferences.getString("e2ee_pub_$userId", null))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun saveGroupSenderKey(chatId: String, versionAndKey: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                with(sharedPreferences.edit()) {
+                    putString("group_senderkey_$chatId", versionAndKey)
+                    apply()
+                }
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun getGroupSenderKey(chatId: String): Result<String?> = withContext(Dispatchers.IO) {
+        try {
+            Result.success(sharedPreferences.getString("group_senderkey_$chatId", null))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun saveKnownPublicKey(chatId: String, publicKeyHex: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                with(sharedPreferences.edit()) {
+                    putString("known_pubkey_$chatId", publicKeyHex)
+                    apply()
+                }
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun getKnownPublicKey(chatId: String): Result<String?> = withContext(Dispatchers.IO) {
+        try {
+            Result.success(sharedPreferences.getString("known_pubkey_$chatId", null))
         } catch (e: Exception) {
             Result.failure(e)
         }

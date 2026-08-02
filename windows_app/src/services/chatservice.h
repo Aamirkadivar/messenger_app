@@ -8,16 +8,20 @@
 #include <QNetworkReply>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <functional>
 #include "../utils/config.h"
 #include "../utils/messagecache.h"
 #include "authservice.h"
+#include "groupservice.h"
 
 class ChatService : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool isLoading READ isLoading NOTIFY isLoadingChanged)
 
 public:
-    explicit ChatService(AuthService* authService, QObject* parent = nullptr);
+    // groupService may be null (falls back to sending groups unencrypted,
+    // same as before group E2EE existed) - always passed in main.cpp.
+    explicit ChatService(AuthService* authService, GroupService* groupService = nullptr, QObject* parent = nullptr);
     ~ChatService();
 
     bool isLoading() const { return m_isLoading; }
@@ -34,6 +38,16 @@ public:
     Q_INVOKABLE void sendMessage(const QString& chatId, const QString& text, const QString& chatType = QStringLiteral("direct"));
     Q_INVOKABLE void markAsRead(const QString& chatId);
 
+    // Removes a chat from THIS user's list only - the other participant keeps
+    // theirs, and no message history is destroyed (see the backend's
+    // DeleteChat). A later message in a direct chat brings it back.
+    Q_INVOKABLE void deleteChat(const QString& chatId);
+
+    // Returns (and clears) a security-code-change notice queued for chatId
+    // while it wasn't the open chat, so it still surfaces the moment the
+    // user opens that chat - empty string if there's nothing pending.
+    Q_INVOKABLE QString takePendingSecurityNotice(const QString& chatId);
+
     // Local on-disk cache (SQLite) - exposed for the Settings screen's
     // "storage used" readout and "clear cache" action.
     Q_INVOKABLE qint64 cacheSizeBytes() const { return m_messageCache ? m_messageCache->sizeBytes() : 0; }
@@ -42,12 +56,21 @@ public:
     // Decrypt an (E2EE) message for a chat. If the message isn't encrypted, or
     // we lack the key, returns the content as-is / a placeholder. Exposed to
     // QML so WebSocket-delivered ciphertext can be decrypted at the display site.
-    Q_INVOKABLE QString decryptMessage(const QString& chatId, const QString& content, bool encrypted) const;
+    // senderId/keyVersion are required for a GROUP message (a group has no
+    // single "other side" key - see the Sender Key scheme on
+    // GroupService::PublishSenderKey) and ignored for a direct chat.
+    Q_INVOKABLE QString decryptMessage(const QString& chatId, const QString& content, bool encrypted,
+                                       const QString& senderId = QString(), int keyVersion = 0) const;
 
     // Whether we currently hold the key needed to encrypt/decrypt for this
     // chat (false for a group, where the pairwise scheme doesn't apply - see
     // the note on encryptBytesForChat below).
     Q_INVOKABLE bool hasKeyForChat(const QString& chatId) const;
+
+    // Whether MY OWN group Sender Key is established and current (matches
+    // the group's latest key_epoch) - false means sendMessage() will need to
+    // generate and distribute one before it can actually send encrypted.
+    Q_INVOKABLE bool hasGroupSenderKey(const QString& chatId) const;
 
     // ---- Voice notes ----
     // Voice is content, so it gets the same E2EE treatment as text. The
@@ -108,6 +131,12 @@ signals:
     // unread_count, is_online, updated_at) - see ChatService::parseChatItem.
     void chatsFetched(const QVariantList& chats);
     void chatError(const QString& error);
+    // Fired when a contact's E2EE public key is observed to be different
+    // from the last one we saw for them - WhatsApp's "security code
+    // changed" notice, same trigger (a re-registered/reinstalled device, a
+    // reset keypair, or - the scenario this exists to catch - a
+    // man-in-the-middle substituting their own key).
+    void securityCodeChanged(const QString& chatId, const QString& contactName);
     void usersFound(const QVariantList& users);
     void searchError(const QString& error);
     void directChatReady(const QString& chatId, const QString& chatName);
@@ -115,6 +144,8 @@ signals:
     void messageSent(const QString& chatId, const QVariantMap& message);
     void messageError(const QString& error);
     void chatRead(const QString& chatId);
+    void chatDeleted(const QString& chatId);
+    void chatDeleteError(const QString& error);
 
     void voiceUploadError(const QString& error);
     void voiceMessageSent(const QString& chatId, const QVariantMap& message);
@@ -137,7 +168,30 @@ private:
                                 const QString& fileUrl, const QString& fileName,
                                 const QString& contentType, qint64 fileSize, bool encrypted);
 
+    // ---- Group Sender Keys (WhatsApp/Signal-style group E2EE) ----
+    // Scoped to text messages only for now - voice/attachment sends in a
+    // group still go out unencrypted (hasKeyForChat/encryptBytesForChat
+    // above are unchanged, direct-chat-only), same as before this existed.
+    // Extending those to groups needs the sender's id and key_version
+    // threaded through preparePlayableVoice/prepareAttachment too, which
+    // this pass doesn't do.
+    void sendGroupTextMessage(const QString& chatId, const QString& text);
+    // Ensures my current Sender Key is generated and distributed to every
+    // current member before calling onReady() - a no-op straight to
+    // onReady() if it's already current for this group's key_epoch.
+    void ensureGroupSenderKeyReady(const QString& chatId, std::function<void()> onReady);
+    // Fetches and decrypts every other member's Sender Key I don't already
+    // have cached, then calls onDone() regardless of outcome (best-effort -
+    // a group message from a sender whose key we couldn't get just shows the
+    // "encrypted" placeholder instead of blocking the whole chat).
+    void fetchGroupSenderKeys(const QString& chatId, std::function<void()> onDone);
+    // Cache-only lookup (no network) - myself or another member, by version.
+    QString groupSenderKeyFor(const QString& chatId, const QString& senderId, int keyVersion) const;
+    void persistMySenderKey(const QString& chatId, int version, const QString& keyHex);
+    void loadMySenderKeyFromDisk(const QString& chatId);
+
     AuthService* m_authService = nullptr;
+    GroupService* m_groupService = nullptr;
     QNetworkAccessManager* m_networkManager = nullptr;
     QNetworkReply* m_currentReply = nullptr;
     bool m_isLoading = false;
@@ -148,6 +202,28 @@ private:
     // messages and decrypts everything in the thread (box is symmetric in the
     // shared-secret sense), so one key per chat is all we need.
     QHash<QString, QString> m_chatOtherPub;
+
+    // chatId -> "direct"/"group", learned from the chat list - lets
+    // decryptMessage() and friends branch to the right scheme without every
+    // caller having to pass the chat type through explicitly.
+    QHash<QString, QString> m_chatType;
+    // chatId -> the group's current key_epoch (bumped server-side on every
+    // membership change - see models.Chat.KeyEpoch).
+    QHash<QString, int> m_groupKeyEpoch;
+
+    struct SenderKeyState {
+        int version = 0;
+        QString keyHex;
+    };
+    // chatId -> my own current Sender Key for that group.
+    QHash<QString, SenderKeyState> m_mySenderKeys;
+    // "chatId|senderId|version" -> that sender's key, decrypted and cached
+    // after fetchGroupSenderKeys().
+    QHash<QString, QString> m_groupOtherKeys;
+
+    // chatId -> contact name, for a security-code-change notice detected
+    // while that chat wasn't the one open - see takePendingSecurityNotice().
+    QHash<QString, QString> m_pendingSecurityNotices;
 
     // Helper: parse a single chat from JSON into a QML-friendly QVariantMap
     QVariantMap parseChatItem(const QJsonObject& obj);

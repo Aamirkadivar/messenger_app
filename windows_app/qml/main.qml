@@ -11,7 +11,18 @@ ApplicationWindow {
     minimumHeight: 600
     visible: true
     title: "Messenger"
-    visibility: "Maximized"
+    // Opens windowed at the width/height above; the user can maximise from
+    // the title bar or by snapping.
+
+    // Treat FullScreen as maximized. Removing the frame via WM_NCCALCSIZE
+    // (see Win11Frameless) leaves the client area spanning the whole screen,
+    // and Qt then reports the window as FullScreen rather than Maximized.
+    // Comparing against Maximized alone made the title-bar button show the
+    // wrong glyph and swallow its first click - showMaximized() on a window
+    // already filling the screen does nothing, so only the second click,
+    // which finally restored it, appeared to work.
+    readonly property bool windowMaximized: appRoot.visibility === Window.Maximized
+                                            || appRoot.visibility === Window.FullScreen
 
     property bool darkMode: true
     // Briefly true right when the theme flips, so every hover Behavior on
@@ -48,9 +59,14 @@ ApplicationWindow {
 
     flags: Qt.FramelessWindowHint | Qt.Window
 
-    Rectangle {
+    // Ambient colour behind every glass surface in the app - see AmbientGlow
+    // for why this is painted rather than a real-time blur of content.
+    AmbientGlow {
         anchors.fill: parent
-        color: appRoot.bgColor
+        baseColor: appRoot.bgColor
+        primaryGlow: appRoot.accentColor
+        secondaryGlow: appRoot.primaryColorDark
+        intensity: appRoot.darkMode ? 1.0 : 0.6
     }
 
     Item {
@@ -61,6 +77,13 @@ ApplicationWindow {
             id: authLoader
             anchors.fill: parent
             source: isLoggedIn ? "" : "qrc:/qml/Login.qml"
+
+            // Login.qml (and Register.qml via its own back-reference) had no
+            // darkMode binding at all before this redesign - every color in
+            // both screens silently evaluated the ternaries against
+            // undefined and fell back to their light-mode branch regardless
+            // of the app's actual theme.
+            Binding { target: authLoader.item; property: "darkMode"; value: appRoot.darkMode; when: authLoader.status === Loader.Ready }
         }
 
         // Main app (when logged in)
@@ -70,10 +93,12 @@ ApplicationWindow {
             visible: isLoggedIn
 
             // Custom title bar
-            Rectangle {
+            GlassPanel {
                 Layout.fillWidth: true
                 height: 44
-                color: appRoot.surfaceColor
+                radius: 0
+                sheen: false
+                darkMode: appRoot.darkMode
                 z: 10
 
                 RowLayout {
@@ -81,30 +106,18 @@ ApplicationWindow {
                     anchors.leftMargin: 16
                     spacing: 8
 
-                    Rectangle {
+                    // The real app icon, not a drawn stand-in - this is the
+                    // same artwork as the executable's icon and the tray, so
+                    // the app looks like itself everywhere it appears.
+                    Image {
                         Layout.preferredWidth: 22
                         Layout.preferredHeight: 22
-                        radius: 6
-                        color: appRoot.primaryColor
-
-                        Canvas {
-                            anchors.centerIn: parent
-                            width: 13
-                            height: 13
-                            onPaint: {
-                                var ctx = getContext("2d")
-                                ctx.reset()
-                                var w = width, h = height * 0.72, r = 3
-                                ctx.fillStyle = "#FFFFFF"
-                                ctx.beginPath()
-                                ctx.moveTo(r, 0); ctx.lineTo(w - r, 0); ctx.arcTo(w, 0, w, r, r)
-                                ctx.lineTo(w, h - r); ctx.arcTo(w, h, w - r, h, r)
-                                ctx.lineTo(w * 0.32, h); ctx.lineTo(w * 0.18, h + height * 0.2); ctx.lineTo(w * 0.22, h)
-                                ctx.lineTo(r, h); ctx.arcTo(0, h, 0, h - r, r)
-                                ctx.lineTo(0, r); ctx.arcTo(0, 0, r, 0, r)
-                                ctx.closePath(); ctx.fill()
-                            }
-                        }
+                        source: "qrc:/icons/app_icon.png"
+                        // Decode above display size so it stays crisp when
+                        // Windows is scaled to 125%/150%.
+                        sourceSize: Qt.size(64, 64)
+                        fillMode: Image.PreserveAspectFit
+                        smooth: true
                     }
 
                     Text {
@@ -114,7 +127,7 @@ ApplicationWindow {
                         color: appRoot.textColor
                     }
 
-                    Item { Layout.fillWidth: true }
+                    Item { id: titleSpacer; Layout.fillWidth: true }
 
                     // Settings
                     Rectangle {
@@ -178,53 +191,10 @@ ApplicationWindow {
                         }
                     }
 
-                    // Logout
-                    Rectangle {
-                        Layout.preferredWidth: 36
-                        Layout.preferredHeight: 36
-                        radius: 8
-                        visible: appRoot.isLoggedIn
-                        color: logoutMouse.containsPress ? appRoot.borderColor : (logoutMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
-                        Behavior on color {
-                            enabled: !appRoot.instantTheme
-                            ColorAnimation { duration: 100 }
-                        }
-
-                        Canvas {
-                            anchors.centerIn: parent
-                            width: 16
-                            height: 16
-                            onPaint: {
-                                var ctx = getContext("2d")
-                                ctx.reset()
-                                ctx.strokeStyle = logoutMouse.containsMouse ? "#E74C3C" : appRoot.textSecondary
-                                ctx.lineWidth = 1.5
-                                ctx.lineCap = "round"
-                                ctx.lineJoin = "round"
-                                // door / frame
-                                ctx.beginPath()
-                                ctx.moveTo(8.5, 2); ctx.lineTo(3, 2); ctx.lineTo(3, 14); ctx.lineTo(8.5, 14)
-                                ctx.stroke()
-                                // arrow out
-                                ctx.beginPath(); ctx.moveTo(7, 8); ctx.lineTo(15, 8); ctx.stroke()
-                                ctx.beginPath()
-                                ctx.moveTo(12, 5); ctx.lineTo(15, 8); ctx.lineTo(12, 11)
-                                ctx.stroke()
-                            }
-                        }
-
-                        ToolTip.visible: logoutMouse.containsMouse
-                        ToolTip.text: "Log out"
-                        ToolTip.delay: 400
-
-                        MouseArea {
-                            id: logoutMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: logoutDialog.open()
-                        }
-                    }
+                    // Logout lives in Settings only now (with its own confirm
+                    // dialog) - having a second, unconfirmed logout icon
+                    // sitting directly beside the window's Close button was
+                    // one accidental misclick away from signing the user out.
 
                     // Theme toggle
                     Rectangle {
@@ -323,7 +293,7 @@ ApplicationWindow {
                             anchors.centerIn: parent
                             width: 12
                             height: 12
-                            property bool maximized: appRoot.visibility === Window.Maximized
+                            property bool maximized: appRoot.windowMaximized
                             onMaximizedChanged: requestPaint()
                             onPaint: {
                                 var ctx = getContext("2d")
@@ -382,21 +352,20 @@ ApplicationWindow {
                     }
                 }
 
-                // Drag region: the title bar minus the button cluster on the right
+                // Drag region: the title bar minus the button cluster on the
+                // right. Bound to the fill spacer's own position rather than
+                // a hardcoded width - the last version of that number went
+                // stale the moment a button was added/removed from the
+                // cluster and silently ate into (or left a gap before) the
+                // window controls.
                 MouseArea {
                     anchors.left: parent.left
                     anchors.top: parent.top
                     anchors.bottom: parent.bottom
-                    width: parent.width - 186
+                    width: 16 + titleSpacer.x + titleSpacer.width // 16 = the row's own anchors.leftMargin
                     onPressed: appRoot.startSystemMove()
                     onDoubleClicked: appRoot.toggleMaximize()
                 }
-            }
-
-            Rectangle {
-                Layout.fillWidth: true
-                height: 1
-                color: appRoot.borderColor
             }
 
             RowLayout {
@@ -420,6 +389,15 @@ ApplicationWindow {
                     onlineColor: appRoot.onlineColor
                     offlineColor: appRoot.offlineColor
                     activeChatId: chatViewLoader.item ? chatViewLoader.item.currentChatId : ""
+
+                    // Close the thread if the chat being deleted is the open
+                    // one, otherwise it lingers showing a conversation that
+                    // is no longer in the list.
+                    onChatDeleted: (chatId) => {
+                        if (chatViewLoader.item && chatViewLoader.item.currentChatId === chatId) {
+                            chatViewLoader.source = ""
+                        }
+                    }
 
                     onChatSelected: (chatId, chatName, otherUserId, online, chatType, avatarUrl) => {
                         chatViewLoader.source = "qrc:/qml/ChatView.qml"
@@ -479,6 +457,13 @@ ApplicationWindow {
                             groupInfoPanel.chatId = chatId
                             groupInfoPanel.open()
                         }
+                        // The header's back button emitted this into the
+                        // void until now - closes the open chat and returns
+                        // focus to the sidebar (found while auditing every
+                        // button's wiring, not just its look).
+                        function onBackClicked() {
+                            chatViewLoader.source = ""
+                        }
                     }
 
                     Rectangle {
@@ -490,12 +475,12 @@ ApplicationWindow {
                             anchors.centerIn: parent
                             spacing: 10
 
-                            Rectangle {
+                            GlassPanel {
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 width: 64
                                 height: 64
                                 radius: 32
-                                color: appRoot.surfaceColor
+                                darkMode: appRoot.darkMode
 
                                 Canvas {
                                     anchors.centerIn: parent
@@ -664,11 +649,9 @@ ApplicationWindow {
             closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
             padding: 0
 
-            background: Rectangle {
-                color: appRoot.surfaceColor
+            background: GlassPanel {
+                darkMode: appRoot.darkMode
                 radius: 14
-                border.color: appRoot.borderColor
-                border.width: 1
             }
 
             contentItem: ColumnLayout {
@@ -774,7 +757,7 @@ ApplicationWindow {
     Item {
         anchors.fill: parent
         z: 1000
-        visible: appRoot.visibility !== Window.Maximized
+        visible: !appRoot.windowMaximized
         enabled: visible
 
         property int edgeSize: 6
@@ -838,7 +821,30 @@ ApplicationWindow {
         }
     }
 
+    // Full-window call overlay - sits above everything (including the resize
+    // handles) whenever a call is ringing/active, matching how a call
+    // interrupts the whole app rather than living inside chat navigation.
+    Loader {
+        anchors.fill: parent
+        z: 2000
+        active: typeof callService !== "undefined" && callService.isActive
+        sourceComponent: CallOverlay {
+            darkMode: appRoot.darkMode
+            accentColor: appRoot.accentColor
+        }
+    }
+
     function toggleMaximize() {
-        appRoot.visibility = (appRoot.visibility === Window.Maximized) ? Window.Windowed : Window.Maximized
+        // showMaximized()/showNormal() rather than assigning `visibility`.
+        // Assigning the property is a no-op when Qt already believes the
+        // window is in that state, which is exactly what happens if its idea
+        // of the state has drifted from the real one - the click then appears
+        // to do nothing (bar the icon flipping) and a second click is needed.
+        // These call through to the platform window every time.
+        if (appRoot.windowMaximized) {
+            appRoot.showNormal()
+        } else {
+            appRoot.showMaximized()
+        }
     }
 }

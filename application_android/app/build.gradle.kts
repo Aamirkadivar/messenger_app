@@ -173,6 +173,23 @@ dependencies {
     // Swipe to Refresh
     implementation(libs.androidx.swiperefreshlayout)
 
+    // WebRTC (audio calling)
+    implementation(libs.webrtc)
+
+    // CameraX (round video message capture)
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.video)
+    implementation(libs.androidx.camera.view)
+
+    // Media3 - ExoPlayer for round-video playback. Note: media3-transformer is
+    // NOT available offline here, so compression uses MediaCodec/MediaMuxer
+    // from the platform SDK instead (see VideoCompressor).
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.ui)
+    implementation(libs.androidx.media3.common)
+
     // Work Manager
     implementation(libs.androidx.work.runtime)
 

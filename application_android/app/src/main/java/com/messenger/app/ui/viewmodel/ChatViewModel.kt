@@ -1,11 +1,13 @@
 package com.messenger.app.ui.viewmodel
 
+import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.messenger.app.data.model.ChatListItemDto
 import com.messenger.app.data.model.MessageDto
 import com.messenger.app.data.model.UserSearchResult
+import com.messenger.app.data.repository.AttachmentRepository
 import com.messenger.app.data.repository.ChatRepository
 import com.messenger.app.data.repository.SessionExpiredException
 import com.messenger.app.data.repository.VoiceRepository
@@ -23,6 +25,7 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
@@ -39,12 +42,22 @@ data class ChatMessageUi(
     val timestamp: Long,
     val isMine: Boolean,
     val isRead: Boolean = false,
+    /** "message" for a normal bubble, "system" for a centered notice (e.g. security code changed). */
+    val messageKind: String = "message",
     /** Non-null for voice notes; the bubble renders a player instead of text. */
     val voiceUrl: String? = null,
     val voiceDurationMs: Long = 0,
-    val voiceEncrypted: Boolean = false
+    val voiceEncrypted: Boolean = false,
+    /** Non-null for a file/image attachment; the bubble renders a preview/file row instead of text. */
+    val attachmentUrl: String? = null,
+    val attachmentName: String = "",
+    val attachmentSize: Long = 0,
+    val attachmentEncrypted: Boolean = false,
+    val isImageAttachment: Boolean = false
 ) {
     val isVoice: Boolean get() = !voiceUrl.isNullOrBlank()
+    val isAttachment: Boolean get() = !attachmentUrl.isNullOrBlank()
+    val isSystem: Boolean get() = messageKind == "system"
 }
 
 data class ChatUiState(
@@ -52,6 +65,8 @@ data class ChatUiState(
     val chatName: String = "",
     val chatAvatarUrl: String? = null,
     val chatType: String = "direct",
+    /** The other participant's user id - only meaningful for a direct chat; empty for a group. Needed to place a call. */
+    val otherUserId: String = "",
     val messages: List<ChatMessageUi> = emptyList(),
     val isSending: Boolean = false,
     val error: String? = null
@@ -72,6 +87,8 @@ data class ChatListItemUi(
     val unreadCount: Long,
     val isOnline: Boolean,
     val isGroup: Boolean = false,
+    /** Local-only: mute lives in the Room row, not on the server. */
+    val isMuted: Boolean = false,
     /** Group picture for groups, the other person's picture for direct chats. */
     val avatarUrl: String? = null
 )
@@ -93,6 +110,7 @@ data class ChatListUiState(
 class ChatViewModel @Inject constructor(
     private val chatRepository: ChatRepository,
     private val voiceRepository: VoiceRepository,
+    private val attachmentRepository: AttachmentRepository,
     private val voiceRecorder: VoiceRecorder,
     private val voicePlayer: VoicePlayer,
     private val tokenManager: TokenManager
@@ -146,6 +164,10 @@ class ChatViewModel @Inject constructor(
         viewModelScope.launch {
             _chatListState.update { it.copy(isLoading = true, error = null) }
 
+            // Mute is a local-only flag on the Room conversation row, so it has
+            // to be merged in by hand - the server DTO knows nothing about it.
+            val mutedIds = chatRepository.mutedChatIds()
+
             // Show cached chats immediately (works offline too), then refresh
             // from the network below - mirrors the windows_app cache-first
             // pattern so a cold start with no connectivity still shows something.
@@ -155,9 +177,11 @@ class ChatViewModel @Inject constructor(
                     val preview = chatRepository.decryptFor(
                         dto.id,
                         dto.lastMessage?.content ?: "",
-                        dto.lastMessage?.encrypted ?: false
+                        dto.lastMessage?.encrypted ?: false,
+                        dto.lastMessage?.senderId ?: "",
+                        dto.lastMessage?.keyVersion ?: 0
                     )
-                    toChatListItemUi(dto, preview)
+                    toChatListItemUi(dto, preview, mutedIds)
                 }
                 _chatListState.update { it.copy(chats = cachedUiChats) }
             }
@@ -180,9 +204,11 @@ class ChatViewModel @Inject constructor(
                         val preview = chatRepository.decryptFor(
                             dto.id,
                             dto.lastMessage?.content ?: "",
-                            dto.lastMessage?.encrypted ?: false
+                            dto.lastMessage?.encrypted ?: false,
+                            dto.lastMessage?.senderId ?: "",
+                            dto.lastMessage?.keyVersion ?: 0
                         )
-                        toChatListItemUi(dto, preview)
+                        toChatListItemUi(dto, preview, mutedIds)
                     }
                     _chatListState.update { it.copy(isLoading = false, chats = uiChats) }
                     // Join every known chat's WebSocket room so real-time pushes (and
@@ -201,7 +227,11 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    private fun toChatListItemUi(dto: ChatListItemDto, lastMessage: String): ChatListItemUi {
+    private fun toChatListItemUi(
+        dto: ChatListItemDto,
+        lastMessage: String,
+        mutedIds: Set<String> = emptySet()
+    ): ChatListItemUi {
         // A group is named by the group, not by whichever member the server
         // happened to put in other_user - for group chats the backend fills that
         // field with an arbitrary participant, so preferring it here labelled
@@ -226,6 +256,7 @@ class ChatViewModel @Inject constructor(
             // report one arbitrary member as "the group being online".
             isOnline = if (isGroup) false else (dto.otherUser?.isOnline ?: dto.isOnline),
             isGroup = isGroup,
+            isMuted = mutedIds.contains(dto.id),
             avatarUrl = if (isGroup) dto.avatarUrl else dto.otherUser?.avatarUrl
         )
     }
@@ -256,7 +287,27 @@ class ChatViewModel @Inject constructor(
                 val myId = resolveCurrentUserId()
                 if (incoming.senderId == myId) return@onEach // our own echo, already shown optimistically
 
-                val text = chatRepository.decryptFor(incoming.chatId, incoming.content, incoming.encrypted)
+                val isVoice = incoming.contentType == ChatRepository.VOICE_CONTENT_TYPE && !incoming.fileUrl.isNullOrBlank()
+                val isAttachment = !isVoice &&
+                    (incoming.contentType == ChatRepository.IMAGE_CONTENT_TYPE || incoming.contentType == ChatRepository.FILE_CONTENT_TYPE) &&
+                    !incoming.fileUrl.isNullOrBlank()
+
+                var text = if (isVoice || isAttachment) {
+                    ""
+                } else {
+                    chatRepository.decryptFor(incoming.chatId, incoming.content, incoming.encrypted, incoming.senderId, incoming.keyVersion)
+                }
+                // A group message can arrive for a Sender Key we haven't fetched yet
+                // (e.g. it rotated after we last synced) - one retry after a refetch
+                // covers that without hammering the server on every message.
+                if (!isVoice && !isAttachment && incoming.encrypted && text == ChatRepository.ENCRYPTED_PLACEHOLDER &&
+                    chatRepository.chatTypeFor(incoming.chatId).equals("group", ignoreCase = true)
+                ) {
+                    tokenManager.getAccessToken().getOrNull()?.let { token ->
+                        chatRepository.fetchGroupSenderKeys(token, incoming.chatId)
+                        text = chatRepository.decryptFor(incoming.chatId, incoming.content, incoming.encrypted, incoming.senderId, incoming.keyVersion)
+                    }
+                }
 
                 val state = _chatState.value
                 if (incoming.chatId == state.chatId) {
@@ -267,7 +318,15 @@ class ChatViewModel @Inject constructor(
                         senderName = state.chatName,
                         content = text,
                         timestamp = System.currentTimeMillis(),
-                        isMine = false
+                        isMine = false,
+                        voiceUrl = if (isVoice) incoming.fileUrl else null,
+                        voiceDurationMs = incoming.durationMs,
+                        voiceEncrypted = isVoice && incoming.encrypted,
+                        attachmentUrl = if (isAttachment) incoming.fileUrl else null,
+                        attachmentName = if (isAttachment) incoming.fileName ?: "" else "",
+                        attachmentSize = incoming.fileSize,
+                        attachmentEncrypted = isAttachment && incoming.encrypted,
+                        isImageAttachment = isAttachment && incoming.contentType == ChatRepository.IMAGE_CONTENT_TYPE
                     )
                     _chatState.update { it.copy(messages = it.messages + message) }
                 } else {
@@ -317,13 +376,19 @@ class ChatViewModel @Inject constructor(
             .launchIn(viewModelScope)
     }
 
-    fun openChat(chatId: String, chatName: String) {
+    fun openChat(chatId: String, chatName: String, isGroupHint: Boolean = false) {
         // Deliberately not leaving the previous chat's room here: loadChats()
         // joins every known chat's room up front precisely so notifications and
         // live badge/preview updates keep arriving for chats that aren't the
         // one currently open. Leaving on switch would undo that the moment you
         // navigate away from a chat.
-        _chatState.update { ChatUiState(chatId = chatId, chatName = chatName) }
+        // isGroupHint (from the nav route) sets chatType immediately, so a
+        // freshly created group's very first message - opened before the chat
+        // list cache even has this chat yet - still picks Sender Key
+        // encryption instead of silently falling back to a pairwise scheme
+        // that has no key for a group and would send in the clear.
+        val initialType = if (isGroupHint) "group" else "direct"
+        _chatState.update { ChatUiState(chatId = chatId, chatName = chatName, chatType = initialType) }
         chatRepository.joinChatRoom(chatId)
 
         viewModelScope.launch {
@@ -334,16 +399,37 @@ class ChatViewModel @Inject constructor(
             // pattern for message history.
             // Header picture: look it up locally instead of passing an encoded
             // URL through the nav route.
+            var isGroupChat = isGroupHint
             runCatching {
                 chatRepository.loadCachedChats().firstOrNull { it.id == chatId }
             }.getOrNull()?.let { dto ->
-                val isGroupChat = dto.type.equals("group", true)
+                isGroupChat = dto.type.equals("group", true)
                 val url = if (isGroupChat) dto.avatarUrl else dto.otherUser?.avatarUrl
+                val otherId = if (isGroupChat) "" else (dto.otherUser?.id ?: dto.otherUserId ?: "")
                 if (_chatState.value.chatId == chatId) {
                     _chatState.update {
-                        it.copy(chatAvatarUrl = url, chatType = dto.type.ifBlank { "direct" })
+                        it.copy(chatAvatarUrl = url, chatType = dto.type.ifBlank { "direct" }, otherUserId = otherId)
                     }
                 }
+            }
+
+            val token = tokenManager.getAccessToken().getOrNull()
+            if (token.isNullOrEmpty()) {
+                _chatState.update { it.copy(error = "Not signed in") }
+                return@launch
+            }
+
+            // A group's history can't be decrypted until we've fetched every
+            // member's Sender Key - do that before touching any group message.
+            if (isGroupChat) {
+                chatRepository.fetchGroupSenderKeys(token, chatId)
+            }
+
+            // A direct chat's security code may have changed since we last saw
+            // it (learned while loading the chat list) - surface it as a
+            // system message the first time this chat is opened afterwards.
+            if (chatRepository.takePendingSecurityNotice(chatId)) {
+                addSecurityNoticeMessage(chatId)
             }
 
             val cachedMessages = chatRepository.loadCachedMessages(chatId)
@@ -354,12 +440,6 @@ class ChatViewModel @Inject constructor(
                 if (_chatState.value.chatId == chatId) {
                     _chatState.update { it.copy(messages = cachedHistory) }
                 }
-            }
-
-            val token = tokenManager.getAccessToken().getOrNull()
-            if (token.isNullOrEmpty()) {
-                _chatState.update { it.copy(error = "Not signed in") }
-                return@launch
             }
 
             chatRepository.getMessages(token, chatId)
@@ -379,26 +459,48 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    /** Appends a small centered system notice - doesn't touch cache/server, display-only. */
+    private fun addSecurityNoticeMessage(chatId: String) {
+        if (_chatState.value.chatId != chatId) return
+        val notice = ChatMessageUi(
+            id = "system-${System.currentTimeMillis()}",
+            senderId = "",
+            senderName = "",
+            content = "🔒 Your security code with ${_chatState.value.chatName} changed.",
+            timestamp = System.currentTimeMillis(),
+            isMine = false,
+            messageKind = "system"
+        )
+        _chatState.update { it.copy(messages = it.messages + notice) }
+    }
+
     private suspend fun toChatMessageUi(chatId: String, dto: MessageDto, myId: String): ChatMessageUi {
         val isMine = dto.senderId == myId
-        val isVoice = dto.fileType == ChatRepository.VOICE_CONTENT_TYPE &&
+        val isVoice = dto.fileType == ChatRepository.VOICE_CONTENT_TYPE && !dto.fileUrl.isNullOrBlank()
+        val isAttachment = !isVoice &&
+            (dto.fileType == ChatRepository.IMAGE_CONTENT_TYPE || dto.fileType == ChatRepository.FILE_CONTENT_TYPE) &&
             !dto.fileUrl.isNullOrBlank()
         return ChatMessageUi(
             id = dto.id,
             senderId = dto.senderId,
             senderName = dto.sender?.displayName?.takeIf { it.isNotBlank() }
                 ?: dto.sender?.username ?: "",
-            // A voice note has no text body; decrypting the empty content would
-            // just yield the "encrypted" placeholder.
-            content = if (isVoice) "" else {
-                chatRepository.decryptFor(chatId, dto.content, dto.encrypted)
+            // A voice note/attachment has no text body; decrypting the empty
+            // content would just yield the "encrypted" placeholder.
+            content = if (isVoice || isAttachment) "" else {
+                chatRepository.decryptFor(chatId, dto.content, dto.encrypted, dto.senderId, dto.keyVersion)
             },
             timestamp = parseMessageTimestamp(dto.createdAt),
             isMine = isMine,
             isRead = isMine && !dto.readAt.isNullOrEmpty(),
             voiceUrl = if (isVoice) dto.fileUrl else null,
             voiceDurationMs = dto.durationMs,
-            voiceEncrypted = isVoice && dto.encrypted
+            voiceEncrypted = isVoice && dto.encrypted,
+            attachmentUrl = if (isAttachment) dto.fileUrl else null,
+            attachmentName = if (isAttachment) dto.fileName ?: "" else "",
+            attachmentSize = dto.fileSize,
+            attachmentEncrypted = isAttachment && dto.encrypted,
+            isImageAttachment = isAttachment && dto.fileType == ChatRepository.IMAGE_CONTENT_TYPE
         )
     }
 
@@ -457,7 +559,7 @@ class ChatViewModel @Inject constructor(
             )
             _chatState.update { it.copy(messages = it.messages + optimistic) }
 
-            chatRepository.sendMessage(token = token, chatId = chatId, chatType = "direct", plaintext = content)
+            chatRepository.sendMessage(token = token, chatId = chatId, chatType = _chatState.value.chatType, plaintext = content)
                 .onSuccess {
                     _chatState.update { it.copy(isSending = false) }
                 }
@@ -466,6 +568,129 @@ class ChatViewModel @Inject constructor(
                     _chatState.update { it.copy(isSending = false, error = e.message ?: "Failed to send") }
                 }
         }
+    }
+
+    /**
+     * Flips a chat's mute flag (long-press menu). Mute is local-only - it lives
+     * in the Room conversation row, so nothing is sent to the server and the
+     * new value is reflected in the list right away.
+     */
+    fun toggleMute(chatId: String) {
+        viewModelScope.launch {
+            val muted = _chatListState.value.chats.firstOrNull { it.id == chatId }?.isMuted ?: false
+            chatRepository.setChatMuted(chatId, !muted)
+            _chatListState.update { state ->
+                state.copy(chats = state.chats.map { if (it.id == chatId) it.copy(isMuted = !muted) else it })
+            }
+        }
+    }
+
+    /** Clears a chat's unread badge without opening it (long-press menu). */
+    fun markChatRead(chatId: String) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            chatRepository.markAsRead(token, chatId)
+                .onSuccess {
+                    _chatListState.update { state ->
+                        state.copy(chats = state.chats.map { if (it.id == chatId) it.copy(unreadCount = 0) else it })
+                    }
+                }
+                .onFailure { e ->
+                    Log.e(TAG, "markChatRead failed", e)
+                    if (e is SessionExpiredException) _sessionExpired.value = true
+                }
+        }
+    }
+
+    /**
+     * Removes a chat from this user's list (long-press on a chat row).
+     *
+     * The row is dropped from the list immediately on success rather than
+     * waiting for a refetch, so the gesture feels like it took effect.
+     */
+    fun deleteChat(chatId: String) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull()
+            if (token.isNullOrEmpty()) {
+                _chatListState.update { it.copy(error = "Not signed in") }
+                return@launch
+            }
+            chatRepository.deleteChat(token, chatId)
+                .onSuccess {
+                    _chatListState.update { state ->
+                        state.copy(chats = state.chats.filterNot { it.id == chatId })
+                    }
+                    // Close the thread if it is the one being removed.
+                    if (_chatState.value.chatId == chatId) {
+                        _chatState.update { ChatUiState() }
+                    }
+                }
+                .onFailure { e ->
+                    Log.e(TAG, "deleteChat failed", e)
+                    if (e is SessionExpiredException) _sessionExpired.value = true
+                    _chatListState.update { it.copy(error = e.message ?: "Failed to delete chat") }
+                }
+        }
+    }
+
+    // ==================== Attachments ====================
+
+    /** Reads, encrypts (when possible), uploads and posts a picked file/image. */
+    fun sendAttachment(uri: Uri) {
+        val chatId = _chatState.value.chatId ?: return
+
+        viewModelScope.launch {
+            _chatState.update { it.copy(isSending = true) }
+            val token = tokenManager.getAccessToken().getOrNull()
+            if (token.isNullOrEmpty()) {
+                _chatState.update { it.copy(isSending = false, error = "Not signed in") }
+                return@launch
+            }
+
+            val picked = attachmentRepository.readPickedFile(uri).getOrElse { e ->
+                _chatState.update { it.copy(isSending = false, error = e.message ?: "Could not read file") }
+                return@launch
+            }
+            val contentType = attachmentRepository.classify(picked.name)
+
+            attachmentRepository.upload(token, chatId, picked)
+                .onSuccess { uploaded ->
+                    chatRepository.sendAttachmentMessage(
+                        token = token,
+                        chatId = chatId,
+                        chatType = _chatState.value.chatType,
+                        fileUrl = uploaded.fileUrl,
+                        fileName = picked.name,
+                        fileSize = uploaded.fileSize,
+                        contentType = contentType,
+                        encrypted = uploaded.encrypted
+                    )
+                        .onSuccess {
+                            _chatState.update { it.copy(isSending = false) }
+                            openChat(chatId, _chatState.value.chatName)
+                        }
+                        .onFailure { e ->
+                            _chatState.update {
+                                it.copy(isSending = false, error = e.message ?: "Failed to send")
+                            }
+                        }
+                }
+                .onFailure { e ->
+                    Log.e(TAG, "attachment upload failed", e)
+                    _chatState.update {
+                        it.copy(isSending = false, error = e.message ?: "Failed to send attachment")
+                    }
+                }
+        }
+    }
+
+    /** Downloads (if needed) and decrypts an attachment for viewing/opening. Suspends - call from a coroutine scope. */
+    suspend fun fetchAttachmentFile(message: ChatMessageUi): File? {
+        val chatId = _chatState.value.chatId ?: return null
+        val url = message.attachmentUrl ?: return null
+        return attachmentRepository.fetchForView(
+            chatId, message.id, url, message.attachmentName, message.attachmentEncrypted
+        ).getOrNull()
     }
 
     // ==================== Voice notes ====================

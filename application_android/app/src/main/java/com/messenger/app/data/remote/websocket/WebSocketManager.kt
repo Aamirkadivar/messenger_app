@@ -24,7 +24,15 @@ data class IncomingChatMessage(
     val senderId: String,
     val content: String,
     val encrypted: Boolean,
-    val timestamp: String
+    val timestamp: String,
+    val contentType: String = "text",
+    val fileUrl: String? = null,
+    val fileType: String? = null,
+    val fileName: String? = null,
+    val fileSize: Long = 0,
+    val durationMs: Long = 0,
+    /** Which of the sender's group Sender Key versions encrypted this message. */
+    val keyVersion: Int = 0
 )
 
 data class IncomingTyping(
@@ -39,6 +47,27 @@ data class IncomingReadReceipt(
     val chatId: String,
     val readerId: String,
     val readAt: String
+)
+
+/**
+ * One call-signaling event (see back-end/websocket/calls.go). Only SDP
+ * offer/answer and ICE candidates ever cross the server - the fields present
+ * depend on [type]: "call:invite" carries sdp+chatId+fromName, "call:answer"
+ * carries sdp, "call:ice_candidate" carries candidate/sdpMid/sdpMLineIndex,
+ * "call:reject"/"call:end" carry reason. The server fills in call_id for a
+ * fresh invite if the caller didn't set one, so it's always present here.
+ */
+data class IncomingCallSignal(
+    val type: String,
+    val callId: String,
+    val fromUserId: String,
+    val chatId: String = "",
+    val fromName: String = "",
+    val sdp: String = "",
+    val candidate: String = "",
+    val sdpMid: String = "",
+    val sdpMLineIndex: Int = 0,
+    val reason: String = ""
 )
 
 // Pushed whenever any user connects/disconnects - not scoped to a chat room,
@@ -56,7 +85,6 @@ class WebSocketManager private constructor(
         private const val TAG = "WebSocketManager"
         private const val RECONNECT_DELAY = 3000L
         private const val MAX_RECONNECT_DELAY = 30000L
-        private const val MAX_RECONNECT_ATTEMPTS = 10
 
         @Volatile
         private var instance: WebSocketManager? = null
@@ -96,6 +124,9 @@ class WebSocketManager private constructor(
 
     private val _presenceUpdates = MutableSharedFlow<IncomingPresence>(replay = 0, extraBufferCapacity = 16)
     val presenceUpdates: SharedFlow<IncomingPresence> = _presenceUpdates.asSharedFlow()
+
+    private val _callSignals = MutableSharedFlow<IncomingCallSignal>(replay = 0, extraBufferCapacity = 16)
+    val callSignals: SharedFlow<IncomingCallSignal> = _callSignals.asSharedFlow()
 
     fun connect() {
         if (isConnected || isConnecting) {
@@ -185,6 +216,11 @@ class WebSocketManager private constructor(
         sendEnvelope("typing", mapOf("chat_id" to chatId, "user_id" to userId, "typing" to isTyping))
     }
 
+    /** Sends a call:* signaling message - see [IncomingCallSignal] for the field contract. */
+    fun sendCallSignal(type: String, data: Map<String, Any>) {
+        sendEnvelope(type, data)
+    }
+
     fun isHealthy(): Boolean = isConnected
 
     /**
@@ -223,13 +259,24 @@ class WebSocketManager private constructor(
             when (obj.optString("type")) {
                 "message" -> {
                     val data = obj.optJSONObject("data") ?: return
+                    // NOTE: the server's "file_type" key actually carries the message's
+                    // content_type ("text"/"audio"/"image"/"file") - see back-end's
+                    // handlers/message.go SendMessage, which sets it from
+                    // message.ContentType rather than a real MIME/file type.
                     val message = IncomingChatMessage(
                         chatId = data.optString("chat_id"),
                         messageId = data.optString("message_id"),
                         senderId = data.optString("sender_id"),
                         content = data.optString("content"),
                         encrypted = data.optBoolean("encrypted", false),
-                        timestamp = data.optString("timestamp")
+                        timestamp = data.optString("timestamp"),
+                        contentType = data.optString("file_type", "text").ifBlank { "text" },
+                        fileUrl = data.optString("file_url").takeIf { it.isNotBlank() },
+                        fileType = data.optString("file_type").takeIf { it.isNotBlank() },
+                        fileName = data.optString("file_name").takeIf { it.isNotBlank() },
+                        fileSize = data.optLong("file_size", 0),
+                        durationMs = data.optLong("duration_ms", 0),
+                        keyVersion = data.optInt("key_version", 0)
                     )
                     CoroutineScope(Dispatchers.Main).launch { _incomingMessages.emit(message) }
                 }
@@ -263,6 +310,22 @@ class WebSocketManager private constructor(
                     val data = obj.optJSONObject("data")
                     Log.e(TAG, "Server error: ${data?.optString("error")}")
                 }
+                "call:invite", "call:answer", "call:ice_candidate", "call:reject", "call:end" -> {
+                    val data = obj.optJSONObject("data") ?: return
+                    val signal = IncomingCallSignal(
+                        type = obj.optString("type"),
+                        callId = data.optString("call_id"),
+                        fromUserId = data.optString("from_user_id"),
+                        chatId = data.optString("chat_id"),
+                        fromName = data.optString("from_name"),
+                        sdp = data.optString("sdp"),
+                        candidate = data.optString("candidate"),
+                        sdpMid = data.optString("sdp_mid"),
+                        sdpMLineIndex = data.optInt("sdp_mline_index", 0),
+                        reason = data.optString("reason")
+                    )
+                    CoroutineScope(Dispatchers.Main).launch { _callSignals.emit(signal) }
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error handling message: ${e.message}")
@@ -271,14 +334,19 @@ class WebSocketManager private constructor(
 
     private fun scheduleReconnect() {
         reconnectAttempts++
-        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-            Log.w(TAG, "Max reconnect attempts reached")
-            _connectionState.value = ConnectionState.DISCONNECTED
-            return
-        }
-
         _connectionState.value = ConnectionState.RECONNECTING
-        val delay = minOf(MAX_RECONNECT_DELAY, RECONNECT_DELAY * (1L shl (reconnectAttempts - 1)))
+
+        // Back off exponentially up to MAX_RECONNECT_DELAY, then keep retrying
+        // at that interval forever. This deliberately never gives up: it used
+        // to stop after 10 attempts (~2.5 min), and since reconnectAttempts
+        // only resets on a successful connect, any outage longer than that
+        // left the app silently offline until it was manually restarted -
+        // messages stopped arriving and incoming calls rang against nobody,
+        // with nothing in the UI saying so.
+        // The shift is clamped separately from the minOf: at ~63 attempts
+        // 1L shl n overflows to a negative delay, which would busy-loop.
+        val exponent = (reconnectAttempts - 1).coerceIn(0, 20)
+        val delay = minOf(MAX_RECONNECT_DELAY, RECONNECT_DELAY * (1L shl exponent))
         val jitter = (Math.random() * 0.25 * delay).toLong()
 
         CoroutineScope(Dispatchers.IO).launch {

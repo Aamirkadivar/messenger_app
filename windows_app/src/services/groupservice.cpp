@@ -50,6 +50,8 @@ QVariantMap GroupService::parseGroup(const QJsonObject& obj) {
     // owner_id may come back as a bare UUID string.
     group["ownerId"] = obj["owner_id"].toVariant().toString();
     group["memberCount"] = obj["member_count"].toInt(obj["members"].toArray().size());
+    // Sender Key rotation signal - see models.Chat.KeyEpoch server-side.
+    group["keyEpoch"] = obj["key_epoch"].toInt();
 
     QVariantList members;
     for (const QJsonValue& v : obj["members"].toArray()) {
@@ -61,6 +63,8 @@ QVariantMap GroupService::parseGroup(const QJsonObject& obj) {
         member["username"] = m["username"].toString();
         member["displayName"] = m["display_name"].toString();
         member["avatarUrl"] = m["avatar_url"].toString();
+        // Needed to encrypt this member's copy of our group Sender Key.
+        member["publicKey"] = m["public_key"].toString();
         member["role"] = m["role"].toString("member");
         QString name = member["displayName"].toString();
         if (name.isEmpty()) name = member["username"].toString();

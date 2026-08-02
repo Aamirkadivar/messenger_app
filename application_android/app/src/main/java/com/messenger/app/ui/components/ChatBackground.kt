@@ -21,9 +21,11 @@ import com.messenger.app.ui.theme.MessengerExtendedColors
 @Composable
 fun ChatBackground(
     modifier: Modifier = Modifier,
-    tileSize: Dp = 48.dp
+    tileSize: Dp = 48.dp,
+    /** 0f lets an [AmbientGlow] layered behind this show through instead of a flat fill. */
+    baseOpacity: Float = 1f
 ) {
-    val baseColor = MaterialTheme.colorScheme.background
+    val baseColor = MaterialTheme.colorScheme.background.copy(alpha = baseOpacity)
     val patternColor = MaterialTheme.colorScheme.primary
     // The same alpha reads much fainter against a pale background than a
     // near-black one, so light mode needs a bit more to land at the same

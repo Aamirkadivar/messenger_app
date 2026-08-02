@@ -69,6 +69,17 @@ interface ChatApiService {
         @Path("contactId") contactId: String
     ): Response<DirectChatResponse>
 
+    /**
+     * Removes a chat from the caller's list only - the backend stamps left_at
+     * on their own participant row rather than deleting anything, so the other
+     * participant and the message history are untouched.
+     */
+    @DELETE("chats/{chatId}")
+    suspend fun deleteChat(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String
+    ): Response<Unit>
+
     @POST("chats/{chatId}/read")
     suspend fun markAsRead(
         @Header("Authorization") token: String,
@@ -85,6 +96,14 @@ interface ChatApiService {
     @Multipart
     @POST("messages/voice")
     suspend fun uploadVoice(
+        @Header("Authorization") token: String,
+        @Part file: MultipartBody.Part
+    ): Response<Map<String, kotlinx.serialization.json.JsonElement>>
+
+    /** Opaque (usually encrypted) file/image attachment. Returns {"file_url": ..., "file_size": ...}. */
+    @Multipart
+    @POST("messages/attachment")
+    suspend fun uploadAttachment(
         @Header("Authorization") token: String,
         @Part file: MultipartBody.Part
     ): Response<Map<String, kotlinx.serialization.json.JsonElement>>
@@ -161,6 +180,21 @@ interface ChatApiService {
         @Path("chatId") chatId: String
     ): Response<Unit>
 
+    /** Distributes this device's encrypted-per-recipient copies of its current group Sender Key. */
+    @POST("groups/{chatId}/sender-key")
+    suspend fun publishSenderKey(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Body request: PublishSenderKeyRequest
+    ): Response<Unit>
+
+    /** Every Sender Key distributed to the caller across this group's members. */
+    @GET("groups/{chatId}/sender-keys")
+    suspend fun getSenderKeys(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String
+    ): Response<SenderKeysResponse>
+
     @POST("crypto/public-key")
     suspend fun savePublicKey(
         @Header("Authorization") token: String,
@@ -181,4 +215,20 @@ interface ChatApiService {
     suspend fun getMyPublicKey(
         @Header("Authorization") token: String
     ): Response<Map<String, String>>
+
+    // ==================== Calls ====================
+    // Signaling itself (invite/answer/ICE/end) is WS-only (see
+    // WebSocketManager.sendCallSignal/callSignals) - these are just history
+    // and the ICE server list needed to start a call.
+
+    @GET("calls/ice-servers")
+    suspend fun getIceServers(
+        @Header("Authorization") token: String
+    ): Response<IceServersResponse>
+
+    @GET("calls/")
+    suspend fun getCallHistory(
+        @Header("Authorization") token: String,
+        @Query("limit") limit: Int = 50
+    ): Response<CallHistoryResponse>
 }

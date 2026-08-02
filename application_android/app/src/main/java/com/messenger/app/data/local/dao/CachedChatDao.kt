@@ -14,4 +14,12 @@ interface CachedChatDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(chats: List<CachedChatEntity>)
+
+    /**
+     * Drops one chat's cached list entry. Without this a deleted chat would
+     * reappear from the cache on the next cold start, before the network
+     * refresh had a chance to correct it.
+     */
+    @Query("DELETE FROM cached_chats WHERE id = :chatId")
+    suspend fun deleteCached(chatId: String)
 }

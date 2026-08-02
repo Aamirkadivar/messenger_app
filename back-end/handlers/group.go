@@ -36,6 +36,16 @@ func NewGroupService(hub *websocket.Hub) *GroupService {
 // specific to groups - but it does mean group membership changes are visible to
 // clients outside the group. Fixing it properly means adding room-scoped
 // delivery to the hub and moving all senders over at once.
+// bumpKeyEpoch signals to clients that this group's Sender Keys need to be
+// rotated (see models.Chat.KeyEpoch) - called after any membership change.
+// Errors are swallowed: a missed epoch bump just means members redistribute
+// their sender key on the next send instead of the very next one, not a
+// correctness issue worth failing the request over.
+func (s *GroupService) bumpKeyEpoch(chatID string) {
+	database.DB.Model(&models.Chat{}).Where("id = ?", chatID).
+		UpdateColumn("key_epoch", gorm.Expr("key_epoch + 1"))
+}
+
 func (s *GroupService) notify(eventType string, data fiber.Map) {
 	if s.hub == nil {
 		return
@@ -243,6 +253,7 @@ func (s *GroupService) GetGroupInfo(c *fiber.Ctx) error {
 			"username":     user.Username,
 			"display_name": user.DisplayName,
 			"avatar_url":   user.AvatarURL,
+			"public_key":   user.PublicKey,
 			"role":         p.Role,
 			"joined_at":    p.JoinedAt,
 		}
@@ -265,9 +276,131 @@ func (s *GroupService) GetGroupInfo(c *fiber.Ctx) error {
 			"members":      members,
 			"member_count": len(members),
 			"unread_count": unreadCount,
+			"key_epoch":    chat.KeyEpoch,
 			"created_at":   chat.CreatedAt,
 			"updated_at":   chat.UpdatedAt,
 		},
+	})
+}
+
+// SenderKeyRecipient is one recipient's encrypted copy of the caller's
+// current group Sender Key.
+type SenderKeyRecipient struct {
+	UserID       uuid.UUID `json:"user_id" binding:"required"`
+	EncryptedKey string    `json:"encrypted_key" binding:"required"`
+}
+
+// PublishSenderKeyRequest is the body for distributing a Sender Key.
+type PublishSenderKeyRequest struct {
+	KeyVersion int                  `json:"key_version"`
+	Recipients []SenderKeyRecipient `json:"recipients" binding:"required"`
+}
+
+// PublishSenderKey stores the caller's encrypted-per-recipient copies of
+// their current group Sender Key (see models.Chat.KeyEpoch / GroupSenderKey).
+// Each recipient's copy was already encrypted client-side via crypto_box
+// (the same pairwise scheme direct chats use) before it ever reaches here -
+// the server only stores and later relays these opaque blobs.
+func (s *GroupService) PublishSenderKey(c *fiber.Ctx) error {
+	chatID := c.Params("chat_id")
+	userID := middleware.GetCurrentUserID(c)
+
+	var participant models.ChatParticipant
+	if err := database.DB.Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, userID).
+		First(&participant).Error; err != nil {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "You are not a member of this group",
+		})
+	}
+
+	var req PublishSenderKeyRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "invalid request body",
+			"message": "Failed to parse request body",
+		})
+	}
+	if len(req.Recipients) == 0 {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "validation error",
+			"message": "At least one recipient is required",
+		})
+	}
+
+	for _, r := range req.Recipients {
+		key := models.GroupSenderKey{
+			ChatID:       chatID,
+			SenderID:     userID,
+			RecipientID:  r.UserID,
+			KeyVersion:   req.KeyVersion,
+			EncryptedKey: r.EncryptedKey,
+		}
+		// One row per (chat, sender, recipient, version) - re-publishing the
+		// same version (e.g. a new member's initial catch-up distribution
+		// naturally reuses the sender's current version) just overwrites.
+		database.DB.Where(models.GroupSenderKey{
+			ChatID: chatID, SenderID: userID, RecipientID: r.UserID, KeyVersion: req.KeyVersion,
+		}).Assign(models.GroupSenderKey{EncryptedKey: r.EncryptedKey}).FirstOrCreate(&key)
+	}
+
+	return c.JSON(fiber.Map{
+		"message": "Sender key published",
+	})
+}
+
+// GetSenderKeys returns every Sender Key distributed to the caller across
+// this group's members (i.e. rows where the caller is the recipient) -
+// each client decrypts them locally (crypto_box, using that sender's public
+// key) and caches the result keyed by (sender, key_version).
+func (s *GroupService) GetSenderKeys(c *fiber.Ctx) error {
+	chatID := c.Params("chat_id")
+	userID := middleware.GetCurrentUserID(c)
+
+	var participant models.ChatParticipant
+	if err := database.DB.Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, userID).
+		First(&participant).Error; err != nil {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "You are not a member of this group",
+		})
+	}
+
+	var keys []models.GroupSenderKey
+	database.DB.Where("chat_id = ? AND recipient_id = ?", chatID, userID).Find(&keys)
+
+	// The recipient needs each sender's public key to open the crypto_box
+	// the key was encrypted with - look them all up in one query rather
+	// than one per row.
+	senderIDs := make(map[string]bool)
+	for _, k := range keys {
+		senderIDs[k.SenderID.String()] = true
+	}
+	ids := make([]string, 0, len(senderIDs))
+	for id := range senderIDs {
+		ids = append(ids, id)
+	}
+	var senders []models.User
+	if len(ids) > 0 {
+		database.DB.Find(&senders, ids)
+	}
+	senderPubKeys := make(map[string]string, len(senders))
+	for _, u := range senders {
+		senderPubKeys[u.ID.String()] = u.PublicKey
+	}
+
+	result := make([]fiber.Map, len(keys))
+	for i, k := range keys {
+		result[i] = fiber.Map{
+			"sender_id":         k.SenderID,
+			"sender_public_key": senderPubKeys[k.SenderID.String()],
+			"key_version":       k.KeyVersion,
+			"encrypted_key":     k.EncryptedKey,
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"data": result,
 	})
 }
 
@@ -393,6 +526,10 @@ func (s *GroupService) AddMembers(c *fiber.Ctx) error {
 		})
 	}
 
+	if len(addedMembers) > 0 {
+		s.bumpKeyEpoch(chatID)
+	}
+
 	return c.JSON(fiber.Map{
 		"message": "Members added successfully",
 		"data":    addedMembers,
@@ -438,6 +575,8 @@ func (s *GroupService) RemoveMember(c *fiber.Ctx) error {
 			Where("chat_id = ? AND user_id = ?", chatID, memberID).
 			Update("left_at", time.Now())
 	}
+
+	s.bumpKeyEpoch(chatID)
 
 	s.notify("member_removed", fiber.Map{
 		"chat_id":   chatID,
@@ -633,6 +772,8 @@ func (s *GroupService) LeaveGroup(c *fiber.Ctx) error {
 	database.DB.Model(&models.ChatParticipant{}).
 		Where("chat_id = ? AND user_id = ?", chatID, userID).
 		Update("left_at", time.Now())
+
+	s.bumpKeyEpoch(chatID)
 
 	s.notify("user_left", fiber.Map{
 		"chat_id": chatID,

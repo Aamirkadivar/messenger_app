@@ -55,11 +55,9 @@ Popup {
         if (chatId.length > 0) groupService.getGroupInfo(chatId)
     }
 
-    background: Rectangle {
-        color: panel.surfaceColor
+    background: GlassPanel {
+        darkMode: panel.darkMode
         radius: 12
-        border.color: panel.borderColor
-        border.width: 1
     }
 
     FileDialog {
@@ -351,7 +349,7 @@ Popup {
                         Layout.preferredWidth: 34
                         Layout.preferredHeight: 34
                         radius: 17
-                        color: Qt.rgba(108/255, 99/255, 255/255, 0.16)
+                        color: Qt.rgba(panel.accentColor.r, panel.accentColor.g, panel.accentColor.b, 0.16)
                         Text { anchors.centerIn: parent; text: "+"; font.pixelSize: 18; color: panel.accentColor }
                     }
                     Text {
@@ -631,11 +629,9 @@ Popup {
         padding: 0
         closePolicy: Popup.CloseOnEscape
 
-        background: Rectangle {
-            color: panel.surfaceColor
+        background: GlassPanel {
+            darkMode: panel.darkMode
             radius: 14
-            border.color: panel.borderColor
-            border.width: 1
         }
 
         contentItem: ColumnLayout {

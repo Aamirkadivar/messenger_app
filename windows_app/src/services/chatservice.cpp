@@ -1,5 +1,6 @@
 #include "chatservice.h"
 #include "../crypto/encryption.h"
+#include "../utils/credentialmanager.h"
 #include <QNetworkRequest>
 #include <QUrl>
 #include <QUrlQuery>
@@ -15,9 +16,10 @@
 #include <QDir>
 #include <QStandardPaths>
 
-ChatService::ChatService(AuthService* authService, QObject* parent)
+ChatService::ChatService(AuthService* authService, GroupService* groupService, QObject* parent)
     : QObject(parent)
     , m_authService(authService)
+    , m_groupService(groupService)
 {
     setupNetworkManager();
     m_messageCache = new MessageCache(this);
@@ -253,130 +255,158 @@ void ChatService::startDirectChat(const QString& userId, const QString& userName
 }
 
 void ChatService::fetchMessages(const QString& chatId) {
-    // Show cached history immediately - works offline, and avoids a blank
-    // chat while waiting on the network even when we're online.
-    const QList<MessageCache::Entry> cached = m_messageCache->loadMessages(chatId);
-    if (!cached.isEmpty()) {
-        QVariantList cachedResult;
-        for (const auto& e : cached) {
-            bool hasFile = !e.fileUrl.isEmpty()
-                           && (e.fileType == QStringLiteral("audio") || e.fileType == QStringLiteral("image")
-                               || e.fileType == QStringLiteral("file"));
-            QVariantMap item;
-            item["id"] = e.id;
-            item["senderId"] = e.senderId;
-            item["senderName"] = e.senderName;
-            // A file/voice message has no text body - decrypting empty
-            // content would just yield the "encrypted" placeholder for no reason.
-            item["content"] = hasFile ? QString() : decryptMessage(chatId, e.content, e.encrypted);
-            item["createdAt"] = e.createdAt;
-            item["readAt"] = e.readAt;
-            item["fileUrl"] = hasFile ? e.fileUrl : QString();
-            item["fileType"] = e.fileType;
-            item["fileName"] = e.fileName;
-            item["fileSize"] = e.fileSize;
-            item["durationMs"] = e.durationMs;
-            item["voiceEncrypted"] = hasFile && e.encrypted;
-            cachedResult.append(item);
+    // A group message's decryptMessage() needs that sender's Sender Key,
+    // which (unlike a direct chat's pairwise key, learned for free from the
+    // chat list) has to be explicitly fetched and unwrapped first - so for a
+    // group, do that before decrypting anything, cached copy included.
+    // This costs the "instant cached paint" a direct chat gets - acceptable
+    // since it's one extra local-network round trip, not a real delay, and
+    // getting it wrong would mean showing stale placeholders that never
+    // resolve until the next fetchMessages() call.
+    bool isGroup = m_chatType.value(chatId) == QStringLiteral("group");
+
+    auto doFetch = [this, chatId]() {
+        // Show cached history immediately - works offline, and avoids a blank
+        // chat while waiting on the network even when we're online.
+        const QList<MessageCache::Entry> cached = m_messageCache->loadMessages(chatId);
+        if (!cached.isEmpty()) {
+            QVariantList cachedResult;
+            for (const auto& e : cached) {
+                bool hasFile = !e.fileUrl.isEmpty()
+                               && (e.fileType == QStringLiteral("audio") || e.fileType == QStringLiteral("image")
+                                   || e.fileType == QStringLiteral("file"));
+                QVariantMap item;
+                item["id"] = e.id;
+                item["senderId"] = e.senderId;
+                item["senderName"] = e.senderName;
+                // A file/voice message has no text body - decrypting empty
+                // content would just yield the "encrypted" placeholder for no reason.
+                item["content"] = hasFile ? QString()
+                                           : decryptMessage(chatId, e.content, e.encrypted, e.senderId, e.keyVersion);
+                item["createdAt"] = e.createdAt;
+                item["readAt"] = e.readAt;
+                item["fileUrl"] = hasFile ? e.fileUrl : QString();
+                item["fileType"] = e.fileType;
+                item["fileName"] = e.fileName;
+                item["fileSize"] = e.fileSize;
+                item["durationMs"] = e.durationMs;
+                item["voiceEncrypted"] = hasFile && e.encrypted;
+                cachedResult.append(item);
+            }
+            emit messagesFetched(chatId, cachedResult);
         }
-        emit messagesFetched(chatId, cachedResult);
+
+        QString authToken = buildAuthHeader();
+        if (authToken.isEmpty()) {
+            emit messageError("Not authenticated. Please login first.");
+            return;
+        }
+
+        QUrl url(Config::apiBaseUrl() + "/messages/" + chatId);
+        QNetworkRequest request(url);
+        request.setRawHeader("Authorization", authToken.toUtf8());
+
+        QNetworkReply* reply = m_networkManager->get(request);
+        connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
+            reply->deleteLater();
+
+            if (reply->error() != QNetworkReply::NoError) {
+                emit messageError(reply->errorString());
+                return;
+            }
+
+            QJsonParseError parseError;
+            QJsonDocument doc = QJsonDocument::fromJson(reply->readAll(), &parseError);
+            if (parseError.error != QJsonParseError::NoError) {
+                emit messageError("Failed to parse messages: " + parseError.errorString());
+                return;
+            }
+
+            QJsonObject root = doc.object();
+            if (root.contains("error")) {
+                emit messageError(root["error"].toString());
+                return;
+            }
+
+            // Server returns newest-first; reverse so oldest is first for display
+            QJsonArray messagesArray = root["data"].toArray();
+            QVariantList result;
+            QList<MessageCache::Entry> toCache;
+            for (int i = messagesArray.size() - 1; i >= 0; --i) {
+                if (!messagesArray[i].isObject()) continue;
+                QJsonObject m = messagesArray[i].toObject();
+                QJsonObject sender = m["sender"].toObject();
+
+                QString senderName = sender["display_name"].toString().isEmpty()
+                                          ? sender["username"].toString()
+                                          : sender["display_name"].toString();
+                QString rawContent = m["content"].toString();
+                bool encrypted = m["encrypted"].toBool(false);
+                QString readAt = m["read_at"].isString() ? m["read_at"].toString() : QString();
+                QString createdAt = m["created_at"].toString();
+                QString fileUrl = m["file_url"].toString();
+                QString fileType = m["file_type"].toString();
+                QString fileName = m["file_name"].toString();
+                qint64 fileSize = static_cast<qint64>(m["file_size"].toDouble(0));
+                qint64 durationMs = static_cast<qint64>(m["duration_ms"].toDouble(0));
+                QString senderId = m["sender_id"].toString();
+                int keyVersion = m["key_version"].toInt();
+                bool hasFile = !fileUrl.isEmpty()
+                               && (fileType == QStringLiteral("audio") || fileType == QStringLiteral("image")
+                                   || fileType == QStringLiteral("file"));
+
+                QVariantMap item;
+                item["id"] = m["id"].toString();
+                item["senderId"] = senderId;
+                item["senderName"] = senderName;
+                item["content"] = hasFile ? QString()
+                                           : decryptMessage(chatId, rawContent, encrypted, senderId, keyVersion);
+                item["createdAt"] = createdAt;
+                item["readAt"] = readAt;
+                item["fileUrl"] = hasFile ? fileUrl : QString();
+                item["fileType"] = fileType;
+                item["fileName"] = fileName;
+                item["fileSize"] = fileSize;
+                item["durationMs"] = durationMs;
+                item["voiceEncrypted"] = hasFile && encrypted;
+                result.append(item);
+
+                MessageCache::Entry cacheEntry;
+                cacheEntry.id = m["id"].toString();
+                cacheEntry.senderId = senderId;
+                cacheEntry.senderName = senderName;
+                cacheEntry.content = rawContent;
+                cacheEntry.encrypted = encrypted;
+                cacheEntry.readAt = readAt;
+                cacheEntry.createdAt = createdAt;
+                cacheEntry.fileUrl = fileUrl;
+                cacheEntry.fileType = fileType;
+                cacheEntry.fileName = fileName;
+                cacheEntry.fileSize = fileSize;
+                cacheEntry.durationMs = durationMs;
+                cacheEntry.keyVersion = keyVersion;
+                toCache.append(cacheEntry);
+            }
+
+            m_messageCache->saveMessages(chatId, toCache);
+
+            emit messagesFetched(chatId, result);
+        });
+    };
+
+    if (isGroup) {
+        fetchGroupSenderKeys(chatId, doFetch);
+    } else {
+        doFetch();
     }
-
-    QString authToken = buildAuthHeader();
-    if (authToken.isEmpty()) {
-        emit messageError("Not authenticated. Please login first.");
-        return;
-    }
-
-    QUrl url(Config::apiBaseUrl() + "/messages/" + chatId);
-    QNetworkRequest request(url);
-    request.setRawHeader("Authorization", authToken.toUtf8());
-
-    QNetworkReply* reply = m_networkManager->get(request);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
-        reply->deleteLater();
-
-        if (reply->error() != QNetworkReply::NoError) {
-            emit messageError(reply->errorString());
-            return;
-        }
-
-        QJsonParseError parseError;
-        QJsonDocument doc = QJsonDocument::fromJson(reply->readAll(), &parseError);
-        if (parseError.error != QJsonParseError::NoError) {
-            emit messageError("Failed to parse messages: " + parseError.errorString());
-            return;
-        }
-
-        QJsonObject root = doc.object();
-        if (root.contains("error")) {
-            emit messageError(root["error"].toString());
-            return;
-        }
-
-        // Server returns newest-first; reverse so oldest is first for display
-        QJsonArray messagesArray = root["data"].toArray();
-        QVariantList result;
-        QList<MessageCache::Entry> toCache;
-        for (int i = messagesArray.size() - 1; i >= 0; --i) {
-            if (!messagesArray[i].isObject()) continue;
-            QJsonObject m = messagesArray[i].toObject();
-            QJsonObject sender = m["sender"].toObject();
-
-            QString senderName = sender["display_name"].toString().isEmpty()
-                                      ? sender["username"].toString()
-                                      : sender["display_name"].toString();
-            QString rawContent = m["content"].toString();
-            bool encrypted = m["encrypted"].toBool(false);
-            QString readAt = m["read_at"].isString() ? m["read_at"].toString() : QString();
-            QString createdAt = m["created_at"].toString();
-            QString fileUrl = m["file_url"].toString();
-            QString fileType = m["file_type"].toString();
-            QString fileName = m["file_name"].toString();
-            qint64 fileSize = static_cast<qint64>(m["file_size"].toDouble(0));
-            qint64 durationMs = static_cast<qint64>(m["duration_ms"].toDouble(0));
-            bool hasFile = !fileUrl.isEmpty()
-                           && (fileType == QStringLiteral("audio") || fileType == QStringLiteral("image")
-                               || fileType == QStringLiteral("file"));
-
-            QVariantMap item;
-            item["id"] = m["id"].toString();
-            item["senderId"] = m["sender_id"].toString();
-            item["senderName"] = senderName;
-            item["content"] = hasFile ? QString() : decryptMessage(chatId, rawContent, encrypted);
-            item["createdAt"] = createdAt;
-            item["readAt"] = readAt;
-            item["fileUrl"] = hasFile ? fileUrl : QString();
-            item["fileType"] = fileType;
-            item["fileName"] = fileName;
-            item["fileSize"] = fileSize;
-            item["durationMs"] = durationMs;
-            item["voiceEncrypted"] = hasFile && encrypted;
-            result.append(item);
-
-            MessageCache::Entry cacheEntry;
-            cacheEntry.id = m["id"].toString();
-            cacheEntry.senderId = m["sender_id"].toString();
-            cacheEntry.senderName = senderName;
-            cacheEntry.content = rawContent;
-            cacheEntry.encrypted = encrypted;
-            cacheEntry.readAt = readAt;
-            cacheEntry.createdAt = createdAt;
-            cacheEntry.fileUrl = fileUrl;
-            cacheEntry.fileType = fileType;
-            cacheEntry.fileName = fileName;
-            cacheEntry.fileSize = fileSize;
-            cacheEntry.durationMs = durationMs;
-            toCache.append(cacheEntry);
-        }
-
-        m_messageCache->saveMessages(chatId, toCache);
-
-        emit messagesFetched(chatId, result);
-    });
 }
 
 void ChatService::sendMessage(const QString& chatId, const QString& text, const QString& chatType) {
+    if (chatType == QStringLiteral("group")) {
+        sendGroupTextMessage(chatId, text);
+        return;
+    }
+
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit messageError("Not authenticated. Please login first.");
@@ -443,8 +473,22 @@ void ChatService::sendMessage(const QString& chatId, const QString& text, const 
     });
 }
 
-QString ChatService::decryptMessage(const QString& chatId, const QString& content, bool encrypted) const {
+QString ChatService::decryptMessage(const QString& chatId, const QString& content, bool encrypted,
+                                     const QString& senderId, int keyVersion) const {
     if (!encrypted) return content;
+
+    if (m_chatType.value(chatId) == QStringLiteral("group")) {
+        QString key = groupSenderKeyFor(chatId, senderId, keyVersion);
+        if (key.isEmpty()) {
+            return QString::fromUtf8("\xF0\x9F\x94\x92 Encrypted message"); // 🔒 - don't have this sender's key yet
+        }
+        QByteArray cipher = QByteArray::fromHex(content.toUtf8());
+        QByteArray plain = Encryption::secretBoxDecryptBytes(cipher, key);
+        if (plain.isEmpty()) {
+            return QString::fromUtf8("\xF0\x9F\x94\x92 Encrypted message");
+        }
+        return QString::fromUtf8(plain);
+    }
 
     QString otherPub = m_chatOtherPub.value(chatId);
     QString myPriv = m_authService ? m_authService->e2eePrivateKey() : QString();
@@ -459,9 +503,242 @@ QString ChatService::decryptMessage(const QString& chatId, const QString& conten
     return plain;
 }
 
+QString ChatService::takePendingSecurityNotice(const QString& chatId) {
+    return m_pendingSecurityNotices.take(chatId);
+}
+
 bool ChatService::hasKeyForChat(const QString& chatId) const {
     QString myPriv = m_authService ? m_authService->e2eePrivateKey() : QString();
     return !m_chatOtherPub.value(chatId).isEmpty() && !myPriv.isEmpty();
+}
+
+bool ChatService::hasGroupSenderKey(const QString& chatId) const {
+    auto it = m_mySenderKeys.find(chatId);
+    if (it == m_mySenderKeys.end() || it->keyHex.isEmpty()) return false;
+    return it->version >= m_groupKeyEpoch.value(chatId, 0);
+}
+
+QString ChatService::groupSenderKeyFor(const QString& chatId, const QString& senderId, int keyVersion) const {
+    QString myId = m_authService ? m_authService->currentUserId() : QString();
+    if (!myId.isEmpty() && senderId == myId) {
+        auto it = m_mySenderKeys.find(chatId);
+        if (it != m_mySenderKeys.end() && it->version == keyVersion) return it->keyHex;
+        return QString();
+    }
+    return m_groupOtherKeys.value(QStringLiteral("%1|%2|%3").arg(chatId, senderId).arg(keyVersion));
+}
+
+void ChatService::persistMySenderKey(const QString& chatId, int version, const QString& keyHex) {
+    CredentialManager::instance().saveToken(QStringLiteral("group_senderkey_%1").arg(chatId),
+                                             QString::number(version) + ":" + keyHex);
+}
+
+void ChatService::loadMySenderKeyFromDisk(const QString& chatId) {
+    if (m_mySenderKeys.contains(chatId)) return; // already loaded this run
+    QString stored = CredentialManager::instance().getToken(QStringLiteral("group_senderkey_%1").arg(chatId));
+    if (stored.isEmpty()) return;
+    int sep = stored.indexOf(':');
+    if (sep <= 0) return;
+    bool ok = false;
+    int version = stored.left(sep).toInt(&ok);
+    if (!ok) return;
+    SenderKeyState state;
+    state.version = version;
+    state.keyHex = stored.mid(sep + 1);
+    m_mySenderKeys.insert(chatId, state);
+}
+
+void ChatService::ensureGroupSenderKeyReady(const QString& chatId, std::function<void()> onReady) {
+    loadMySenderKeyFromDisk(chatId);
+
+    int serverEpoch = m_groupKeyEpoch.value(chatId, 0);
+    auto existing = m_mySenderKeys.find(chatId);
+    if (existing != m_mySenderKeys.end() && !existing->keyHex.isEmpty() && existing->version >= serverEpoch) {
+        onReady();
+        return;
+    }
+
+    if (!m_groupService || !m_authService) {
+        onReady();
+        return;
+    }
+
+    // Fetch fresh group info (current members + the authoritative key_epoch)
+    // before generating a new key - membership may have changed since the
+    // cached epoch was learned, and generating against a stale member list
+    // would leave a just-added member without a copy.
+    auto conn = std::make_shared<QMetaObject::Connection>();
+    *conn = connect(m_groupService, &GroupService::groupInfoFetched, this,
+        [this, chatId, onReady, conn](const QVariantMap& group) {
+            if (group.value("id").toString() != chatId) return;
+            QObject::disconnect(*conn);
+
+            int epoch = group.value("keyEpoch").toInt();
+            QString newKey = Encryption::secretBoxGenerateKey();
+            if (newKey.isEmpty()) {
+                onReady();
+                return;
+            }
+
+            QString myId = m_authService->currentUserId();
+            QString myPriv = m_authService->e2eePrivateKey();
+            QByteArray keyBytes = QByteArray::fromHex(newKey.toUtf8());
+
+            QJsonArray recipients;
+            const QVariantList members = group.value("members").toList();
+            for (const QVariant& mv : members) {
+                QVariantMap member = mv.toMap();
+                QString uid = member.value("id").toString();
+                if (uid.isEmpty() || uid == myId) continue;
+                QString pub = member.value("publicKey").toString();
+                // A member with no published key yet simply won't get this
+                // version - they'll be included next time the key rotates
+                // (e.g. the next membership change) once they have one.
+                if (pub.isEmpty()) continue;
+                QByteArray encKey = Encryption::boxEncryptBytes(keyBytes, pub, myPriv);
+                if (encKey.isEmpty()) continue;
+                QJsonObject r;
+                r["user_id"] = uid;
+                r["encrypted_key"] = QString::fromUtf8(encKey.toHex());
+                recipients.append(r);
+            }
+
+            m_mySenderKeys.insert(chatId, SenderKeyState{epoch, newKey});
+            m_groupKeyEpoch.insert(chatId, epoch);
+            persistMySenderKey(chatId, epoch, newKey);
+
+            if (recipients.isEmpty()) {
+                // Nothing to distribute to yet (solo group, or no member has
+                // published a key) - the key is adopted locally so sending
+                // is consistent; nobody can read it until this gets
+                // redistributed on a future rotation.
+                onReady();
+                return;
+            }
+
+            QString authToken = buildAuthHeader();
+            if (authToken.isEmpty()) {
+                onReady();
+                return;
+            }
+
+            QJsonObject body;
+            body["key_version"] = epoch;
+            body["recipients"] = recipients;
+
+            QUrl url(Config::apiBaseUrl() + "/groups/" + chatId + "/sender-key");
+            QNetworkRequest request(url);
+            request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+            request.setRawHeader("Authorization", authToken.toUtf8());
+
+            QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+            connect(reply, &QNetworkReply::finished, this, [reply, onReady]() {
+                reply->deleteLater();
+                // Best-effort either way: the key is already adopted locally
+                // and the caller is waiting to send - a failed publish just
+                // means recipients won't have this version yet.
+                onReady();
+            });
+        });
+    m_groupService->getGroupInfo(chatId);
+}
+
+void ChatService::fetchGroupSenderKeys(const QString& chatId, std::function<void()> onDone) {
+    QString authToken = buildAuthHeader();
+    if (authToken.isEmpty() || !m_authService) {
+        onDone();
+        return;
+    }
+
+    QUrl url(Config::apiBaseUrl() + "/groups/" + chatId + "/sender-keys");
+    QNetworkRequest request(url);
+    request.setRawHeader("Authorization", authToken.toUtf8());
+
+    QNetworkReply* reply = m_networkManager->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId, onDone]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            onDone();
+            return;
+        }
+        QJsonObject root = QJsonDocument::fromJson(reply->readAll()).object();
+        QJsonArray arr = root["data"].toArray();
+        QString myPriv = m_authService->e2eePrivateKey();
+
+        for (const QJsonValue& v : arr) {
+            QJsonObject entry = v.toObject();
+            QString senderId = entry["sender_id"].toString();
+            QString senderPub = entry["sender_public_key"].toString();
+            int version = entry["key_version"].toInt();
+            QString cacheKey = QStringLiteral("%1|%2|%3").arg(chatId, senderId).arg(version);
+            if (m_groupOtherKeys.contains(cacheKey)) continue; // already have it
+            if (senderPub.isEmpty() || myPriv.isEmpty()) continue;
+
+            QByteArray encKeyBytes = QByteArray::fromHex(entry["encrypted_key"].toString().toUtf8());
+            QByteArray keyBytes = Encryption::boxDecryptBytes(encKeyBytes, senderPub, myPriv);
+            if (keyBytes.isEmpty()) continue; // corrupt/foreign entry - skip, not fatal
+
+            m_groupOtherKeys.insert(cacheKey, QString::fromUtf8(keyBytes.toHex()));
+        }
+        onDone();
+    });
+}
+
+void ChatService::sendGroupTextMessage(const QString& chatId, const QString& text) {
+    ensureGroupSenderKeyReady(chatId, [this, chatId, text]() {
+        QString authToken = buildAuthHeader();
+        if (authToken.isEmpty()) {
+            emit messageError("Not authenticated. Please login first.");
+            return;
+        }
+
+        QString outContent = text;
+        bool encrypted = false;
+        int keyVersion = 0;
+        auto it = m_mySenderKeys.find(chatId);
+        if (it != m_mySenderKeys.end() && !it->keyHex.isEmpty()) {
+            QByteArray cipher = Encryption::secretBoxEncryptBytes(text.toUtf8(), it->keyHex);
+            if (!cipher.isEmpty()) {
+                outContent = QString::fromUtf8(cipher.toHex());
+                encrypted = true;
+                keyVersion = it->version;
+            }
+        }
+
+        QUrl url(Config::apiBaseUrl() + "/messages");
+        QNetworkRequest request(url);
+        request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        request.setRawHeader("Authorization", authToken.toUtf8());
+
+        QJsonObject body;
+        body["chat_id"] = chatId;
+        body["chat_type"] = "group";
+        body["content"] = outContent;
+        body["encrypted"] = encrypted;
+        body["key_version"] = keyVersion;
+
+        QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+        connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
+            reply->deleteLater();
+            if (reply->error() != QNetworkReply::NoError) {
+                emit messageError(reply->errorString());
+                return;
+            }
+            QJsonObject root = QJsonDocument::fromJson(reply->readAll()).object();
+            if (root.contains("error")) {
+                emit messageError(root["error"].toString());
+                return;
+            }
+            QJsonObject data = root["data"].toObject();
+            QVariantMap item;
+            item["id"] = data["id"].toString();
+            item["senderId"] = data["sender_id"].toString();
+            item["content"] = decryptMessage(chatId, data["content"].toString(), data["encrypted"].toBool(false),
+                                              data["sender_id"].toString(), data["key_version"].toInt());
+            item["createdAt"] = data["created_at"].toString();
+            emit messageSent(chatId, item);
+        });
+    });
 }
 
 QByteArray ChatService::encryptBytesForChat(const QString& chatId, const QByteArray& plain) const {
@@ -802,6 +1079,38 @@ void ChatService::markAsRead(const QString& chatId) {
     });
 }
 
+void ChatService::deleteChat(const QString& chatId) {
+    QString authToken = buildAuthHeader();
+    if (authToken.isEmpty()) return;
+
+    QUrl url(Config::apiBaseUrl() + "/chats/" + chatId);
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", authToken.toUtf8());
+
+    QNetworkReply* reply = m_networkManager->deleteResource(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            emit chatDeleteError(reply->errorString());
+            return;
+        }
+
+        // Drop the local copy too. Left behind, its messages keep counting
+        // towards Settings' storage figure and would repopulate the thread
+        // from cache if the chat ever came back.
+        if (m_messageCache) m_messageCache->deleteChat(chatId);
+
+        m_chatOtherPub.remove(chatId);
+        m_chatType.remove(chatId);
+        m_groupKeyEpoch.remove(chatId);
+        m_mySenderKeys.remove(chatId);
+        m_pendingSecurityNotices.remove(chatId);
+
+        emit chatDeleted(chatId);
+    });
+}
+
 QVariantMap ChatService::parseChatItem(const QJsonObject& obj) {
     QVariantMap item;
     item["id"] = obj["id"].toString();
@@ -815,6 +1124,12 @@ QVariantMap ChatService::parseChatItem(const QJsonObject& obj) {
     item["updated_at"] = obj["updated_at"].isString() ? obj["updated_at"].toString() : QString();
 
     const QString chatId = obj["id"].toString();
+
+    QString chatType = obj["type"].toString();
+    if (!chatType.isEmpty()) m_chatType.insert(chatId, chatType);
+    if (chatType == QStringLiteral("group")) {
+        m_groupKeyEpoch.insert(chatId, obj["key_epoch"].toInt(0));
+    }
 
     if (obj.contains("other_user") && obj["other_user"].isObject()) {
         QJsonObject userObj = obj["other_user"].toObject();
@@ -830,7 +1145,28 @@ QVariantMap ChatService::parseChatItem(const QJsonObject& obj) {
         // Remember the other participant's public key so we can encrypt to /
         // decrypt from this chat.
         QString pub = userObj["public_key"].toString();
-        if (!pub.isEmpty()) m_chatOtherPub.insert(chatId, pub);
+        if (!pub.isEmpty()) {
+            m_chatOtherPub.insert(chatId, pub);
+
+            // WhatsApp-style security notice: a contact's public key only
+            // ever changes if they reinstalled/reset the app (new keypair
+            // generated) or someone is intercepting the connection - either
+            // way the user should see it happened, the same reason WhatsApp
+            // surfaces "security code changed" instead of silently
+            // re-encrypting to the new key. Nothing is flagged the first
+            // time a key is ever seen for this chat - only on a genuine change.
+            QString knownKeyToken = QStringLiteral("known_pubkey_%1").arg(chatId);
+            QString knownPub = CredentialManager::instance().getToken(knownKeyToken);
+            if (!knownPub.isEmpty() && knownPub != pub) {
+                QString name = userObj["display_name"].toString();
+                if (name.isEmpty()) name = userObj["username"].toString();
+                m_pendingSecurityNotices.insert(chatId, name);
+                emit securityCodeChanged(chatId, name);
+            }
+            if (knownPub != pub) {
+                CredentialManager::instance().saveToken(knownKeyToken, pub);
+            }
+        }
     }
 
     if (obj.contains("last_message") && obj["last_message"].isObject()) {
@@ -847,7 +1183,8 @@ QVariantMap ChatService::parseChatItem(const QJsonObject& obj) {
             ? QString::fromUtf8("\xF0\x9F\x93\xB7 Photo") // 📷
             : contentType == QStringLiteral("file")
             ? QString::fromUtf8("\xF0\x9F\x93\x8E ") + (msgObj["file_name"].toString().isEmpty() ? QStringLiteral("File") : msgObj["file_name"].toString()) // 📎
-            : decryptMessage(chatId, msgObj["content"].toString(), msgObj["encrypted"].toBool(false));
+            : decryptMessage(chatId, msgObj["content"].toString(), msgObj["encrypted"].toBool(false),
+                              msgObj["sender_id"].toString(), msgObj["key_version"].toInt());
         lastMessage["sender_id"] = msgObj["sender_id"].toString();
         lastMessage["content_type"] = contentType;
         lastMessage["created_at"] = msgObj["created_at"].toString();

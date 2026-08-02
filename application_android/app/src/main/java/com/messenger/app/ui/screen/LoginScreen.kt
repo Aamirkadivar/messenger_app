@@ -15,7 +15,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -25,26 +24,33 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.messenger.app.ui.components.AmbientGlow
+import com.messenger.app.ui.components.GlassSurface
 import com.messenger.app.ui.theme.AccentGreen
 import com.messenger.app.ui.theme.CardShape
+import com.messenger.app.ui.theme.MessengerExtendedColors
 import com.messenger.app.ui.viewmodel.AuthViewModel
 
 @Composable
 private fun AuthBackground(content: @Composable BoxScope.() -> Unit) {
+    val dark = MessengerExtendedColors.isDark
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(MaterialTheme.colorScheme.background, MaterialTheme.colorScheme.surface)
-                )
-            )
             .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(24.dp),
-        contentAlignment = Alignment.Center,
-        content = content
-    )
+        contentAlignment = Alignment.Center
+    ) {
+        AmbientGlow(
+            modifier = Modifier.matchParentSize(),
+            baseColor = MaterialTheme.colorScheme.background,
+            primaryGlow = MaterialTheme.colorScheme.primary,
+            secondaryGlow = if (dark) Color(0xFFA6863F) else Color(0xFF8A6A2E),
+            intensity = if (dark) 1f else 0.6f
+        )
+        content()
+    }
 }
 
 @Composable
@@ -107,10 +113,8 @@ fun LoginScreen(
     }
 
     AuthBackground {
-        Card(
+        GlassSurface(
             shape = CardShape,
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(
@@ -208,10 +212,8 @@ fun RegisterScreen(
     }
 
     AuthBackground {
-        Card(
+        GlassSurface(
             shape = CardShape,
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(

@@ -16,6 +16,7 @@ import com.messenger.app.ui.screen.LoginScreen
 import com.messenger.app.ui.screen.RegisterScreen
 import com.messenger.app.ui.screen.SettingsScreen
 import com.messenger.app.ui.viewmodel.AuthViewModel
+import com.messenger.app.ui.viewmodel.CallViewModel
 import com.messenger.app.ui.viewmodel.ChatViewModel
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -43,6 +44,7 @@ object Routes {
 @Composable
 fun MainNavGraph(
     navController: NavHostController,
+    callViewModel: CallViewModel,
     startDestination: String = Routes.LOGIN,
     modifier: Modifier = Modifier
 ) {
@@ -165,13 +167,17 @@ fun MainNavGraph(
             ChatScreen(
                 chatId = chatId,
                 chatName = chatName,
+                isGroup = isGroup,
                 viewModel = chatViewModel,
                 onOpenGroupInfo = if (isGroup) {
                     { navController.navigate(Routes.groupInfo(chatId)) }
                 } else {
                     null
                 },
-                onNavigateBack = { navController.popBackStack() }
+                onNavigateBack = { navController.popBackStack() },
+                onStartCall = if (isGroup) null else { calleeId, calleeName ->
+                    callViewModel.startCall(chatId, calleeId, calleeName)
+                }
             )
         }
     }

@@ -36,9 +36,17 @@ type Message struct {
 	FileName         string    `json:"file_name" gorm:"size:255"`
 	FileURL          string    `json:"file_url" gorm:"size:512"`
 	FileSize         int64     `json:"file_size"`
-	// DurationMs is the length of an audio message, so clients can show it
-	// before downloading and decrypting the (opaque) payload.
-	DurationMs        int64       `json:"duration_ms"`
+	// DurationMs is the length of an audio or round-video message, so clients
+	// can show it before downloading and decrypting the (opaque) payload.
+	DurationMs int64 `json:"duration_ms"`
+	// ThumbnailURL is a round video's poster frame. The bubble is drawn from
+	// this while the video itself is still downloading, so a chat never shows
+	// an empty circle waiting on a multi-megabyte fetch.
+	ThumbnailURL string `json:"thumbnail_url" gorm:"size:512"`
+	// KeyVersion identifies which of the sender's group Sender Key versions
+	// (see Chat.KeyEpoch) encrypted this message - meaningless/0 outside a
+	// group chat, where the pairwise crypto_box scheme needs no versioning.
+	KeyVersion        int         `json:"key_version"`
 	IsEncrypted       bool        `json:"is_encrypted" gorm:"default:true"`
 	EncryptionVersion int         `json:"encryption_version" gorm:"default:1"`
 	DeliveredTo       []uuid.UUID `json:"delivered_to" gorm:"type:uuid[]"`
@@ -68,16 +76,41 @@ type ChatParticipant struct {
 
 // Chat represents a conversation (direct or group)
 type Chat struct {
-	ID            string     `json:"id" gorm:"primaryKey"`
-	Type          string     `json:"type" gorm:"index"`
-	Name          string     `json:"name" gorm:"size:255"`
-	AvatarURL     string     `json:"avatar_url" gorm:"size:512"`
-	Description   string     `json:"description"`
-	OwnerID       uuid.UUID  `json:"owner_id" gorm:"type:uuid"`
+	ID          string    `json:"id" gorm:"primaryKey"`
+	Type        string    `json:"type" gorm:"index"`
+	Name        string    `json:"name" gorm:"size:255"`
+	AvatarURL   string    `json:"avatar_url" gorm:"size:512"`
+	Description string    `json:"description"`
+	OwnerID     uuid.UUID `json:"owner_id" gorm:"type:uuid"`
+	// KeyEpoch increments every time a group's membership changes (add or
+	// remove a member). It's the group E2EE "Sender Key" rotation signal:
+	// a client compares this to the epoch its own currently-distributed
+	// sender key was issued for, and if this is higher, generates a new
+	// sender key and redistributes it to the current membership only -
+	// this is what keeps a removed member from reading messages sent after
+	// they left, the same guarantee WhatsApp/Signal's Sender Keys give.
+	// Meaningless for a direct chat (always 0).
+	KeyEpoch      int        `json:"key_epoch" gorm:"default:0"`
 	LastMessage   *Message   `json:"last_message"`
 	LastMessageAt *time.Time `json:"last_message_at"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+// GroupSenderKey stores one member's encrypted copy of another member's
+// current group "Sender Key" - see the WhatsApp/Signal-style scheme
+// described on Chat.KeyEpoch. EncryptedKey is hex(nonce||crypto_box(...)),
+// encrypted by SenderID for RecipientID specifically (the same pairwise
+// crypto_box direct chats already use) - the server only ever stores and
+// relays these opaque blobs, never the key itself.
+type GroupSenderKey struct {
+	ID           uuid.UUID `json:"id" gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
+	ChatID       string    `json:"chat_id" gorm:"index:idx_gsk_lookup"`
+	SenderID     uuid.UUID `json:"sender_id" gorm:"type:uuid"`
+	RecipientID  uuid.UUID `json:"recipient_id" gorm:"type:uuid;index:idx_gsk_lookup"`
+	KeyVersion   int       `json:"key_version"`
+	EncryptedKey string    `json:"encrypted_key" gorm:"type:text"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // GroupMember represents a member of a group chat (legacy, use ChatParticipant)
@@ -89,6 +122,26 @@ type GroupMember struct {
 	JoinedAt  time.Time  `json:"joined_at"`
 	LeftAt    *time.Time `json:"left_at"`
 	CreatedAt time.Time  `json:"created_at"`
+}
+
+// CallLog records a 1:1 audio call's lifecycle for call history (WhatsApp-style
+// "Missed call"/"Answered" entries). The server never sees call media or its
+// keys - libdatachannel negotiates DTLS-SRTP directly between the two peers
+// via ICE, and this table only tracks who called whom, when, and how it ended.
+// Only SDP offer/answer and ICE candidates are relayed through the server
+// (see websocket/calls.go), the same "opaque blob" principle as E2EE messages.
+type CallLog struct {
+	ID       uuid.UUID `json:"id" gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
+	ChatID   string    `json:"chat_id" gorm:"index"`
+	CallerID uuid.UUID `json:"caller_id" gorm:"type:uuid;index"`
+	CalleeID uuid.UUID `json:"callee_id" gorm:"type:uuid;index"`
+	// "ringing" | "answered" | "missed" | "rejected" | "ended" | "failed"
+	Status      string     `json:"status" gorm:"size:20;default:'ringing'"`
+	StartedAt   time.Time  `json:"started_at"`
+	ConnectedAt *time.Time `json:"connected_at"`
+	EndedAt     *time.Time `json:"ended_at"`
+	DurationSec int        `json:"duration_sec"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
 
 // Presence represents user presence status
@@ -143,8 +196,13 @@ type MessageCreateRequest struct {
 	// same reasoning as DurationMs for voice notes.
 	FileName string `json:"file_name"`
 	FileSize int64  `json:"file_size"`
-	// DurationMs is the length of a voice note in milliseconds.
-	DurationMs int64       `json:"duration_ms"`
+	// DurationMs is the length of a voice note or round video in milliseconds.
+	DurationMs int64 `json:"duration_ms"`
+	// ThumbnailURL points at a round video's already-uploaded poster frame.
+	ThumbnailURL string `json:"thumbnail_url"`
+	// KeyVersion: see Message.KeyVersion. Only meaningful (and only ever
+	// non-zero) for a group message.
+	KeyVersion int         `json:"key_version"`
 	ReplyToID  *uuid.UUID  `json:"reply_to_id"`
 	MentionIDs []uuid.UUID `json:"mention_ids"`
 }
@@ -278,5 +336,7 @@ func MigrateDB(db *gorm.DB) error {
 		&GroupMember{},
 		&Presence{},
 		&TypingIndicator{},
+		&GroupSenderKey{},
+		&CallLog{},
 	)
 }

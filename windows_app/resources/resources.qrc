@@ -12,9 +12,16 @@
         <file>../qml/MessageBubble.qml</file>
         <file>../qml/Settings.qml</file>
         <file>../qml/Avatar.qml</file>
+        <file>../qml/GlassPanel.qml</file>
+        <file>../qml/AmbientGlow.qml</file>
+        <file>../qml/CallOverlay.qml</file>
+        <file>../qml/CallActionButton.qml</file>
     </qresource>
     <qresource prefix="/icons">
         <file alias="send.svg">icons/send.svg</file>
-        <file alias="tray.png">icons/tray.png</file>
+        <file alias="app_icon.png">icons/app_icon.png</file>
+        <!-- The .ico carries several sizes, so Windows picks the right one for
+             the notification area rather than downscaling a 256px PNG. -->
+        <file alias="app_icon.ico">icons/app_icon.ico</file>
     </qresource>
 </RCC>

@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <background android:drawable="@drawable/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <!--
+      Foreground is the badge artwork drawn at ~66% of the 108dp canvas: the
+      launcher masks this layer to its own shape and may parallax it, so only
+      the centre is guaranteed visible. Full-bleed would clip the gold tabs.
+    -->
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
 </adaptive-icon>

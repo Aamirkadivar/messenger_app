@@ -34,6 +34,10 @@ public:
     Q_INVOKABLE void joinChat(const QString& chatId);
     Q_INVOKABLE void leaveChat(const QString& chatId);
     Q_INVOKABLE void sendTypingIndicator(const QString& chatId, const QString& userId, bool typing);
+    // Sends a call:* signaling message - see back-end/websocket/calls.go for
+    // the field contract (to_user_id/from_user_id/call_id + type-specific
+    // fields like sdp/candidate/reason).
+    Q_INVOKABLE void sendCallSignal(const QString& type, const QVariantMap& data);
 
 signals:
     void connectedChanged();
@@ -56,6 +60,10 @@ signals:
     // hand the socket a fresh one instead of retrying the same dead one
     // forever.
     void connectionAttemptFailed();
+    // One call:* signaling event, forwarded to CallService. type is
+    // "call:invite"/"call:answer"/"call:ice_candidate"/"call:reject"/"call:end";
+    // data carries whatever fields that type needs (see back-end/websocket/calls.go).
+    void callSignalReceived(const QString& type, const QVariantMap& data);
 
 private slots:
     void onConnected();

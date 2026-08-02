@@ -80,10 +80,14 @@ set(PROJECT_SOURCES
     src/services/groupservice.h
     src/services/voiceservice.cpp
     src/services/voiceservice.h
+    src/services/callservice.cpp
+    src/services/callservice.h
     src/utils/config.h
     src/utils/appconfig.h
     src/utils/credentialmanager.cpp
     src/utils/credentialmanager.h
+    src/utils/win11frameless.cpp
+    src/utils/win11frameless.h
     src/utils/traynotifier.cpp
     src/utils/traynotifier.h
     src/utils/messagecache.cpp
@@ -104,13 +108,26 @@ set(PROJECT_QML
     qml/MessageBubble.qml
     qml/Settings.qml
     qml/Avatar.qml
+    qml/GlassPanel.qml
+    qml/AmbientGlow.qml
+    qml/CallOverlay.qml
+    qml/CallActionButton.qml
     resources/resources.qrc
 )
+
+# ---- Application icon (Windows) ----
+# The .rc is compiled into the exe so Explorer/taskbar/Alt-Tab show the icon.
+# Qt's setWindowIcon() in main.cpp covers the live window separately.
+set(APP_ICON_RESOURCE "")
+if(WIN32)
+    set(APP_ICON_RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/resources/app_icon.rc")
+endif()
 
 # ---- Executable ----
 qt_add_executable(${PROJECT_NAME}
     ${PROJECT_SOURCES}
     ${PROJECT_QML}
+    ${APP_ICON_RESOURCE}
 )
 
 # ---- Link Libraries ----
@@ -193,6 +210,50 @@ if(SODIUM_FOUND)
     endif()
 else()
     message(WARNING "libsodium not found in vcpkg_installed. Encryption features disabled.")
+endif()
+
+# ---- Calling (libdatachannel + opus, audio-only WebRTC) ----
+# Linked directly by static archive path, same manual (non-find_package)
+# approach as libsodium above - this project doesn't use vcpkg's CMake
+# toolchain file, just its x64-mingw-static output directory. Order matters
+# for MinGW/GNU ld's single left-to-right archive resolution pass: each lib
+# must come before the archives that satisfy its undefined symbols.
+set(CALLING_LIB_DIR "${VCPKG_INSTALLED_DIR}/x64-mingw-static/lib")
+set(CALLING_INCLUDE_DIR "${VCPKG_INSTALLED_DIR}/x64-mingw-static/include")
+set(CALLING_LIBS
+    "${CALLING_LIB_DIR}/libdatachannel.a"
+    # libSRTP is what actually encrypts the media. Without it libdatachannel
+    # still negotiates ICE and emits audio SDP, so a call looks fine right up
+    # until the DTLS-SRTP handshake - then the peer connection drops straight
+    # to Failed the instant ICE succeeds. Must come after libdatachannel.a:
+    # MinGW ld resolves archives in a single left-to-right pass.
+    "${CALLING_LIB_DIR}/libsrtp2.a"
+    "${CALLING_LIB_DIR}/libjuice.a"
+    "${CALLING_LIB_DIR}/libusrsctp.a"
+    "${CALLING_LIB_DIR}/libssl.a"
+    "${CALLING_LIB_DIR}/libcrypto.a"
+    "${CALLING_LIB_DIR}/libopus.a"
+)
+set(CALLING_FOUND ON)
+foreach(lib ${CALLING_LIBS})
+    if(NOT EXISTS "${lib}")
+        set(CALLING_FOUND OFF)
+        message(WARNING "Calling: missing ${lib}")
+    endif()
+endforeach()
+
+if(CALLING_FOUND)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${CALLING_LIBS})
+    target_include_directories(${PROJECT_NAME} PRIVATE "${CALLING_INCLUDE_DIR}")
+    add_definitions(-DHAVE_CALLING)
+    if(WIN32)
+        # libjuice/usrsctp/OpenSSL need these on Windows for sockets, crypto
+        # RNG, and adapter enumeration respectively.
+        target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 bcrypt iphlpapi)
+    endif()
+    message(STATUS "Calling (libdatachannel + opus) enabled")
+else()
+    message(WARNING "Calling libraries not found in vcpkg_installed/x64-mingw-static - run vcpkg install in windows_app/. Calling disabled.")
 endif()
 
 # ---- Windows-specific linking ----

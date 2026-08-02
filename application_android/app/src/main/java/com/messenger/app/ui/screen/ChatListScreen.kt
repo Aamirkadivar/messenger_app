@@ -1,7 +1,9 @@
 package com.messenger.app.ui.screen
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -12,14 +14,20 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.GroupAdd
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.MarkChatRead
+import androidx.compose.material.icons.outlined.NotificationsActive
+import androidx.compose.material.icons.outlined.NotificationsOff
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -27,7 +35,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.messenger.app.ui.components.AmbientGlow
 import com.messenger.app.ui.components.Avatar
+import com.messenger.app.ui.components.GlassSurface
+import com.messenger.app.ui.theme.MessengerExtendedColors
 import com.messenger.app.ui.theme.OnlineColor
 import com.messenger.app.ui.theme.ThemeState
 import com.messenger.app.ui.viewmodel.ChatListItemUi
@@ -44,6 +55,10 @@ fun ChatListScreen(
     onLogout: () -> Unit
 ) {
     var showNewChat by remember { mutableStateOf(false) }
+    // Non-null while the delete confirmation for that chat is showing.
+    // Long-press opens an action sheet; Delete from there raises the confirm dialog.
+    var menuChat by remember { mutableStateOf<ChatListItemUi?>(null) }
+    var pendingDelete by remember { mutableStateOf<ChatListItemUi?>(null) }
     val listState by chatViewModel.chatListState.collectAsStateWithLifecycle()
     val sessionExpired by chatViewModel.sessionExpired.collectAsStateWithLifecycle()
     val keyTakeover by chatViewModel.keyTakeover.collectAsStateWithLifecycle()
@@ -64,36 +79,47 @@ fun ChatListScreen(
         chatViewModel.loadChats()
     }
 
+    val dark = MessengerExtendedColors.isDark
+    Box(modifier = Modifier.fillMaxSize()) {
+    AmbientGlow(
+        modifier = Modifier.fillMaxSize(),
+        baseColor = MaterialTheme.colorScheme.background,
+        primaryGlow = MaterialTheme.colorScheme.primary,
+        secondaryGlow = if (dark) Color(0xFFA6863F) else Color(0xFF8A6A2E),
+        intensity = if (dark) 1f else 0.6f
+    )
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Chats", fontWeight = FontWeight.Bold) },
-                actions = {
-                    IconButton(onClick = { ThemeState.isDarkMode = !ThemeState.isDarkMode }) {
-                        Icon(
-                            if (ThemeState.isDarkMode) Icons.Default.LightMode else Icons.Default.DarkMode,
-                            contentDescription = if (ThemeState.isDarkMode) "Switch to light mode" else "Switch to dark mode"
-                        )
-                    }
-                    IconButton(onClick = onCreateGroup) {
-                        Icon(Icons.Outlined.GroupAdd, contentDescription = "New group")
-                    }
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Outlined.Settings, contentDescription = "Settings")
-                    }
-                    IconButton(onClick = onLogout) {
-                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Logout")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
-            )
+            GlassSurface(modifier = Modifier.fillMaxWidth(), shape = androidx.compose.ui.graphics.RectangleShape, sheen = false) {
+                TopAppBar(
+                    title = { Text("Chats", fontWeight = FontWeight.Bold) },
+                    actions = {
+                        IconButton(onClick = { ThemeState.isDarkMode = !ThemeState.isDarkMode }) {
+                            Icon(
+                                if (ThemeState.isDarkMode) Icons.Default.LightMode else Icons.Default.DarkMode,
+                                contentDescription = if (ThemeState.isDarkMode) "Switch to light mode" else "Switch to dark mode"
+                            )
+                        }
+                        IconButton(onClick = onCreateGroup) {
+                            Icon(Icons.Outlined.GroupAdd, contentDescription = "New group")
+                        }
+                        IconButton(onClick = onOpenSettings) {
+                            Icon(Icons.Outlined.Settings, contentDescription = "Settings")
+                        }
+                        IconButton(onClick = onLogout) {
+                            Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Logout")
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
+                )
+            }
         },
         floatingActionButton = {
             FloatingActionButton(onClick = { showNewChat = true }, containerColor = MaterialTheme.colorScheme.primary) {
                 Icon(Icons.Default.Add, contentDescription = "New chat", tint = Color.White)
             }
         },
-        containerColor = MaterialTheme.colorScheme.background
+        containerColor = Color.Transparent
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
         if (keyTakeover) {
@@ -114,13 +140,67 @@ fun ChatListScreen(
                 else -> {
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
                         items(listState.chats, key = { it.id }) { chat ->
-                            ChatRow(chat, onClick = { onChatClick(chat.id, chat.name, chat.isGroup) })
+                            ChatRow(
+                                chat,
+                                onClick = { onChatClick(chat.id, chat.name, chat.isGroup) },
+                                onLongClick = { menuChat = chat }
+                            )
                         }
                     }
                 }
             }
         }
         }
+    }
+    }
+
+    menuChat?.let { chat ->
+        ChatActionsSheet(
+            chat = chat,
+            onDismiss = { menuChat = null },
+            onMarkRead = {
+                chatViewModel.markChatRead(chat.id)
+                menuChat = null
+            },
+            onToggleMute = {
+                chatViewModel.toggleMute(chat.id)
+                menuChat = null
+            },
+            onDelete = {
+                menuChat = null
+                pendingDelete = chat
+            }
+        )
+    }
+
+    pendingDelete?.let { chat ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Delete chat?") },
+            text = {
+                // States plainly what this does and does not do - the server
+                // only marks this user as having left the chat.
+                Text(
+                    "\"${chat.name}\" will be removed from your chat list. " +
+                        if (chat.isGroup) {
+                            "Other members keep the group and its messages."
+                        } else {
+                            "The other person keeps their copy, and a new message will bring the chat back."
+                        }
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    chatViewModel.deleteChat(chat.id)
+                    pendingDelete = null
+                }) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) { Text("Cancel") }
+            }
+        )
     }
 
     if (showNewChat) {
@@ -186,12 +266,22 @@ private fun KeyTakeoverBanner(onDismiss: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ChatRow(chat: ChatListItemUi, onClick: () -> Unit) {
+private fun ChatRow(chat: ChatListItemUi, onClick: () -> Unit, onLongClick: () -> Unit) {
+    val haptics = LocalHapticFeedback.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = {
+                    // A long-press has no visual affordance, so confirm it
+                    // registered before the dialog appears.
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onLongClick()
+                }
+            )
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -247,6 +337,90 @@ private fun ChatRow(chat: ChatListItemUi, onClick: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+/**
+ * Long-press action menu for a chat row - the mobile equivalent of the Windows
+ * client's right-click context menu. Delete is listed last and coloured as the
+ * destructive action so it isn't hit by accident.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChatActionsSheet(
+    chat: ChatListItemUi,
+    onDismiss: () -> Unit,
+    onMarkRead: () -> Unit,
+    onToggleMute: () -> Unit,
+    onDelete: () -> Unit
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Avatar(name = chat.name, avatarUrl = chat.avatarUrl, size = 40.dp)
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        chat.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        if (chat.isGroup) "Group" else "Direct chat",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+            // Only offered when there is actually something unread to clear.
+            if (chat.unreadCount > 0) {
+                ChatActionItem(
+                    icon = Icons.Outlined.MarkChatRead,
+                    label = "Mark as read",
+                    onClick = onMarkRead
+                )
+            }
+            ChatActionItem(
+                icon = if (chat.isMuted) Icons.Outlined.NotificationsActive else Icons.Outlined.NotificationsOff,
+                label = if (chat.isMuted) "Unmute notifications" else "Mute notifications",
+                onClick = onToggleMute
+            )
+            ChatActionItem(
+                icon = Icons.Outlined.Delete,
+                label = "Delete chat",
+                tint = MaterialTheme.colorScheme.error,
+                onClick = onDelete
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChatActionItem(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    tint: Color = MaterialTheme.colorScheme.onSurface,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            // 56dp keeps every row well past the 48dp touch-target minimum.
+            .heightIn(min = 56.dp)
+            .padding(horizontal = 20.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, contentDescription = null, tint = tint)
+        Spacer(Modifier.width(20.dp))
+        Text(label, style = MaterialTheme.typography.bodyLarge, color = tint)
     }
 }
 

@@ -11,6 +11,7 @@ import com.messenger.app.data.local.dao.UserDao
 import com.messenger.app.data.remote.api.AuthApiService
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.data.remote.websocket.WebSocketManager
+import com.messenger.app.data.repository.AttachmentRepository
 import com.messenger.app.data.repository.AuthRepository
 import com.messenger.app.data.repository.ChatRepository
 import com.messenger.app.data.repository.AvatarRepository
@@ -202,8 +203,19 @@ object AppModule {
         cachedChatDao: CachedChatDao,
         webSocketManager: WebSocketManager,
         tokenManager: TokenManager,
+        groupRepository: GroupRepository,
         json: Json
     ): ChatRepository = ChatRepository(
-        chatApiService, messageDao, conversationDao, cachedChatDao, webSocketManager, tokenManager, json
+        chatApiService, messageDao, conversationDao, cachedChatDao, webSocketManager, tokenManager,
+        groupRepository, json
     )
+
+    @Provides
+    @Singleton
+    fun provideAttachmentRepository(
+        @ApplicationContext context: Context,
+        chatApiService: ChatApiService,
+        chatRepository: ChatRepository,
+        okHttpClient: OkHttpClient
+    ): AttachmentRepository = AttachmentRepository(context, chatApiService, chatRepository, okHttpClient)
 }

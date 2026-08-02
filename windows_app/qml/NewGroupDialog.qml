@@ -40,11 +40,9 @@ Popup {
 
     property bool creating: false
 
-    background: Rectangle {
-        color: newGroupDialog.surfaceColor
+    background: GlassPanel {
+        darkMode: newGroupDialog.darkMode
         radius: 12
-        border.color: newGroupDialog.borderColor
-        border.width: 1
     }
 
     Connections {
@@ -173,7 +171,7 @@ Popup {
                     height: 28
                     width: chipText.implicitWidth + 30
                     radius: 14
-                    color: Qt.rgba(108/255, 99/255, 255/255, 0.16)
+                    color: Qt.rgba(newGroupDialog.accentColor.r, newGroupDialog.accentColor.g, newGroupDialog.accentColor.b, 0.16)
 
                     RowLayout {
                         anchors.fill: parent
@@ -262,7 +260,7 @@ Popup {
                     Rectangle {
                         width: parent.width
                         height: 60
-                        color: resultMouse.pressed ? Qt.rgba(108/255, 99/255, 255/255, 0.14)
+                        color: resultMouse.pressed ? Qt.rgba(newGroupDialog.accentColor.r, newGroupDialog.accentColor.g, newGroupDialog.accentColor.b, 0.14)
                                : (resultMouse.containsMouse ? newGroupDialog.surfaceColorHover : "transparent")
 
                         MouseArea {

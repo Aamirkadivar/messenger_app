@@ -22,6 +22,12 @@ type Config struct {
 	EncryptionKey              string `mapstructure:"ENCRYPTION_KEY"`
 	FirebaseServiceAccount     string `mapstructure:"FIREBASE_SERVICE_ACCOUNT"`
 	FirebaseServiceAccountPath string `mapstructure:"FIREBASE_SERVICE_ACCOUNT_PATH"`
+	// TURN (coturn) config for call NAT traversal - see back-end/turnserver.conf.
+	// TURNSecret must match coturn's static-auth-secret so the time-limited
+	// REST-API-style credentials this server hands out are ones coturn accepts.
+	TURNSecret string `mapstructure:"TURN_SECRET"`
+	TURNHost   string `mapstructure:"TURN_HOST"`
+	TURNPort   string `mapstructure:"TURN_PORT"`
 }
 
 // LoadConfig loads configuration from environment variables
@@ -42,6 +48,9 @@ func LoadConfig() *Config {
 		EncryptionKey:              getEnv("ENCRYPTION_KEY", "default-encryption-key"),
 		FirebaseServiceAccount:     getEnv("FIREBASE_SERVICE_ACCOUNT", ""),
 		FirebaseServiceAccountPath: getEnv("FIREBASE_SERVICE_ACCOUNT_PATH", ""),
+		TURNSecret:                 getEnv("TURN_SECRET", ""),
+		TURNHost:                   getEnv("TURN_HOST", "localhost"),
+		TURNPort:                   getEnv("TURN_PORT", "3478"),
 	}
 	return config
 }

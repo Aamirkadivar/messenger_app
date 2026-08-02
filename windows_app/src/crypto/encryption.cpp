@@ -337,6 +337,66 @@ QByteArray Encryption::boxDecryptBytes(const QByteArray& payload,
     return plain;
 }
 
+QString Encryption::secretBoxGenerateKey() {
+    if (!init()) return QString();
+    QByteArray key(crypto_secretbox_KEYBYTES, '\0');
+    randombytes_buf(key.data(), key.size());
+    return QString::fromUtf8(key.toHex());
+}
+
+QByteArray Encryption::secretBoxEncryptBytes(const QByteArray& plain, const QString& keyHex) {
+    if (!init()) return QByteArray();
+
+    QByteArray key = QByteArray::fromHex(keyHex.toUtf8());
+    if (key.size() != crypto_secretbox_KEYBYTES) {
+        qWarning() << "secretBoxEncryptBytes: invalid key size" << key.size();
+        return QByteArray();
+    }
+
+    QByteArray nonce(crypto_secretbox_NONCEBYTES, '\0');
+    randombytes_buf(nonce.data(), nonce.size());
+
+    QByteArray cipher(plain.size() + crypto_secretbox_MACBYTES, '\0');
+    if (crypto_secretbox_easy(
+            reinterpret_cast<unsigned char*>(cipher.data()),
+            reinterpret_cast<const unsigned char*>(plain.constData()),
+            static_cast<unsigned long long>(plain.size()),
+            reinterpret_cast<const unsigned char*>(nonce.constData()),
+            reinterpret_cast<const unsigned char*>(key.constData())) != 0) {
+        qWarning() << "secretBoxEncryptBytes: crypto_secretbox_easy failed";
+        return QByteArray();
+    }
+
+    return nonce + cipher;
+}
+
+QByteArray Encryption::secretBoxDecryptBytes(const QByteArray& payload, const QString& keyHex) {
+    if (!init()) return QByteArray();
+
+    QByteArray key = QByteArray::fromHex(keyHex.toUtf8());
+    if (key.size() != crypto_secretbox_KEYBYTES) {
+        return QByteArray();
+    }
+    if (payload.size() < crypto_secretbox_NONCEBYTES + crypto_secretbox_MACBYTES) {
+        return QByteArray();
+    }
+
+    QByteArray nonce = payload.left(crypto_secretbox_NONCEBYTES);
+    QByteArray cipher = payload.mid(crypto_secretbox_NONCEBYTES);
+    QByteArray plain(cipher.size() - crypto_secretbox_MACBYTES, '\0');
+
+    if (crypto_secretbox_open_easy(
+            reinterpret_cast<unsigned char*>(plain.data()),
+            reinterpret_cast<const unsigned char*>(cipher.constData()),
+            static_cast<unsigned long long>(cipher.size()),
+            reinterpret_cast<const unsigned char*>(nonce.constData()),
+            reinterpret_cast<const unsigned char*>(key.constData())) != 0) {
+        return QByteArray();
+    }
+
+    return plain;
+}
+
 QString Encryption::bytesToHex(const QByteArray& bytes) {
     return QString::fromUtf8(bytes.toHex());
 }

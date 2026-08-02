@@ -36,5 +36,16 @@ data class MessageEntity(
     val mentions: String? = null, // JSON serialized
     val attachments: String? = null, // JSON serialized
     val isEncrypted: Boolean = false,
-    val readAt: String? = null
+    val readAt: String? = null,
+    // Voice note / generic file attachment. fileType carries the kind
+    // ("audio", "image", "file"); fileName/fileSize are display metadata for
+    // attachments, meaningless for voice.
+    val fileUrl: String? = null,
+    val fileType: String? = null,
+    val fileName: String? = null,
+    val fileSize: Long = 0,
+    val durationMs: Long = 0,
+    // Which of the sender's group Sender Key versions encrypted this message
+    // (see ChatRepository's group E2EE). 0 outside a group chat.
+    val keyVersion: Int = 0
 )

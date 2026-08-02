@@ -1,0 +1,6 @@
+// Embeds the application icon into the executable itself, which is what
+// Explorer, the taskbar and Alt-Tab read. Qt's setWindowIcon() only affects
+// the running window, so both are needed.
+// ID 1 (IDI_ICON1): Windows shows the numerically lowest icon resource as the
+// file's icon, so this must stay the first one declared.
+1 ICON "icons/app_icon.ico"

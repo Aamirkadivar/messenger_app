@@ -53,6 +53,7 @@ void MessageCache::ensureSchema() {
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0"));
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN file_name TEXT"));
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0"));
+    query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0"));
     query.exec(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS chats ("
         "  id TEXT PRIMARY KEY,"
@@ -69,8 +70,8 @@ void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entri
     query.prepare(QStringLiteral(
         "INSERT OR REPLACE INTO messages "
         "(id, chat_id, sender_id, sender_name, content, encrypted, read_at, created_at, "
-        " file_url, file_type, duration_ms, file_name, file_size) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " file_url, file_type, duration_ms, file_name, file_size, key_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ));
 
     m_db.transaction();
@@ -88,6 +89,7 @@ void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entri
         query.addBindValue(e.durationMs);
         query.addBindValue(e.fileName);
         query.addBindValue(e.fileSize);
+        query.addBindValue(e.keyVersion);
         if (!query.exec()) {
             qWarning() << "[MessageCache] Failed to save message:" << query.lastError().text();
         }
@@ -102,7 +104,7 @@ QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int
     QSqlQuery query(m_db);
     query.prepare(QStringLiteral(
         "SELECT id, sender_id, sender_name, content, encrypted, read_at, created_at, "
-        "       file_url, file_type, duration_ms, file_name, file_size "
+        "       file_url, file_type, duration_ms, file_name, file_size, key_version "
         "FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?"
     ));
     query.addBindValue(chatId);
@@ -127,6 +129,7 @@ QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int
         e.durationMs = query.value(9).toLongLong();
         e.fileName = query.value(10).toString();
         e.fileSize = query.value(11).toLongLong();
+        e.keyVersion = query.value(12).toInt();
         result.prepend(e); // rows came back newest-first; flip to oldest-first
     }
     return result;
@@ -169,6 +172,20 @@ QList<QJsonObject> MessageCache::loadChats() const {
         if (doc.isObject()) result.append(doc.object());
     }
     return result;
+}
+
+void MessageCache::deleteChat(const QString& chatId) {
+    if (!m_db.isOpen()) return;
+    QSqlQuery query(m_db);
+    query.prepare(QStringLiteral("DELETE FROM messages WHERE chat_id = ?"));
+    query.addBindValue(chatId);
+    query.exec();
+
+    query.prepare(QStringLiteral("DELETE FROM chats WHERE chat_id = ?"));
+    query.addBindValue(chatId);
+    query.exec();
+    // No VACUUM, unlike clear() below: reclaiming pages rewrites the entire
+    // database file, which is far too heavy for dropping one conversation.
 }
 
 void MessageCache::clear() {

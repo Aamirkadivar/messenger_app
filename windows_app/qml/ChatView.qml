@@ -4,7 +4,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import QtQuick.Dialogs
 
-Rectangle {
+Item {
     id: chatViewRoot
 
     // The Window attached type only attaches to Item-derived elements, so it
@@ -42,8 +42,6 @@ Rectangle {
     property bool typingVisible: false
     property bool isLoadingMore: false
 
-    color: bgColor
-
     onCurrentChatIdChanged: {
         // Deliberately not leaving the previous chat's room here: ChatList.qml
         // joins every known chat's room up front precisely so notifications and
@@ -78,6 +76,13 @@ Rectangle {
                 if (firstUnreadIndex === -1 && !isMine && (!m.readAt || m.readAt.length === 0)) {
                     firstUnreadIndex = i
                 }
+            }
+            // A security-code change detected while this chat wasn't open
+            // still needs to surface - append it at the end of history now
+            // that it's being opened.
+            var pendingNotice = chatService.takePendingSecurityNotice(chatId)
+            if (pendingNotice.length > 0) {
+                chatViewRoot.addSystemMessage("🔒 Your security code with " + pendingNotice + " changed.")
             }
             chatViewRoot.isLoadingMore = false
             chatViewRoot.scrollToUnreadOrEnd(firstUnreadIndex)
@@ -119,6 +124,15 @@ Rectangle {
         function onAttachmentUploadError(error) {
             console.log("[ChatView] Attachment upload error:", error)
         }
+
+        function onSecurityCodeChanged(chatId, contactName) {
+            if (chatId !== chatViewRoot.currentChatId) return
+            // Consume the same pending entry onMessagesFetched would
+            // otherwise replay later (e.g. navigating away and back) -
+            // it's being shown right now instead.
+            chatService.takePendingSecurityNotice(chatId)
+            chatViewRoot.addSystemMessage("🔒 Your security code with " + contactName + " changed.")
+        }
     }
 
     Connections {
@@ -150,7 +164,8 @@ Rectangle {
             if (message.senderId === authService.currentUserId) return
             var hasFile = (message.fileType === "audio" || message.fileType === "image" || message.fileType === "file")
                           && message.fileUrl && message.fileUrl.length > 0
-            var text = hasFile ? "" : chatService.decryptMessage(chatId, message.content, message.encrypted === true)
+            var text = hasFile ? "" : chatService.decryptMessage(chatId, message.content, message.encrypted === true,
+                                                                  message.senderId, message.keyVersion || 0)
             chatViewRoot.addMessage(message.senderId, chatViewRoot.currentChatName, text,
                                      chatViewRoot.formatTime(message.createdAt), false, false,
                                      hasFile ? message.fileUrl : "", message.durationMs,
@@ -219,10 +234,12 @@ Rectangle {
         spacing: 0
 
         // Chat header
-        Rectangle {
+        GlassPanel {
             Layout.fillWidth: true
             height: 60
-            color: chatViewRoot.surfaceColor
+            radius: 0
+            sheen: false
+            darkMode: chatViewRoot.darkMode
 
             RowLayout {
                 anchors.fill: parent
@@ -230,12 +247,16 @@ Rectangle {
                 anchors.rightMargin: 12
                 spacing: 12
 
-                // Back button
+                // Back button - closes the open chat and returns focus to the
+                // sidebar. Previously wired to a signal nothing ever
+                // listened for (a dead click, found while auditing every
+                // button's placement) - main.qml now clears chatViewLoader
+                // on it.
                 Rectangle {
                     Layout.preferredWidth: 36
                     Layout.preferredHeight: 36
                     radius: 9
-                    color: backMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (backMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
+                    color: backMouse.containsPress ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.2) : (backMouse.containsMouse ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.1) : "transparent")
                     Behavior on color {
                         enabled: !chatViewRoot.instantThemeActive
                         ColorAnimation { duration: 100 }
@@ -339,6 +360,32 @@ Rectangle {
                     }
                 }
 
+                // Call - direct chats only (group calling isn't supported yet).
+                Rectangle {
+                    Layout.preferredWidth: 36
+                    Layout.preferredHeight: 36
+                    radius: 9
+                    visible: !chatViewRoot.isGroupChat && chatViewRoot.currentChatId.length > 0
+                    color: callMouse.containsPress ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.2) : (callMouse.containsMouse ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.1) : "transparent")
+                    Behavior on color {
+                        enabled: !chatViewRoot.instantThemeActive
+                        ColorAnimation { duration: 100 }
+                    }
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "📞"
+                        font.pixelSize: 16
+                    }
+                    MouseArea {
+                        id: callMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: callService.startOutgoingCall(chatViewRoot.currentChatId, chatViewRoot.otherUserId, chatViewRoot.currentChatName)
+                    }
+                }
+
                 // More options - group info panel. Direct chats have nothing
                 // here yet (no contact-info screen has been built), so the
                 // button is only shown when there's somewhere for it to go.
@@ -347,7 +394,7 @@ Rectangle {
                     Layout.preferredHeight: 36
                     radius: 9
                     visible: chatViewRoot.isGroupChat
-                    color: moreMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (moreMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
+                    color: moreMouse.containsPress ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.2) : (moreMouse.containsMouse ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.1) : "transparent")
                     Behavior on color {
                         enabled: !chatViewRoot.instantThemeActive
                         ColorAnimation { duration: 100 }
@@ -379,20 +426,23 @@ Rectangle {
             }
         }
 
-        Rectangle {
-            Layout.fillWidth: true
-            height: 1
-            color: chatViewRoot.borderColor
-        }
-
         // Messages area
         Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
 
+            AmbientGlow {
+                anchors.fill: parent
+                baseColor: chatViewRoot.bgColor
+                primaryGlow: chatViewRoot.accentColor
+                secondaryGlow: Qt.darker(chatViewRoot.accentColor, 1.6)
+                intensity: chatViewRoot.darkMode ? 0.7 : 0.4
+            }
+
             ChatBackground {
                 anchors.fill: parent
                 baseColor: chatViewRoot.bgColor
+                baseOpacity: 0
                 patternColor: chatViewRoot.accentColor
                 // The same alpha reads much fainter against a pale background
                 // than a near-black one, so light mode needs a bit more to
@@ -424,10 +474,31 @@ Rectangle {
 
             delegate: Item {
                 width: messagesListView.width
-                height: bubbleItem.height + (model.showSender ? 10 : 2)
+                height: model.messageKind === "system"
+                        ? systemNotice.implicitHeight + 16
+                        : bubbleItem.height + (model.showSender ? 10 : 2)
+
+                // A tiny centered line, not a real bubble - matches how
+                // WhatsApp shows "security code changed" and similar events
+                // inline without making them look like something either
+                // person actually sent.
+                Text {
+                    id: systemNotice
+                    visible: model.messageKind === "system"
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.top: parent.top
+                    anchors.topMargin: 8
+                    width: parent.width - 64
+                    text: model.messageText
+                    font.pixelSize: 12
+                    color: chatViewRoot.textSecondary
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.Wrap
+                }
 
                 MessageBubble {
                     id: bubbleItem
+                    visible: model.messageKind !== "system"
                     x: 16
                     y: model.showSender ? 10 : 2
                     width: parent.width - 32
@@ -485,17 +556,13 @@ Rectangle {
         }
         }
 
-        Rectangle {
-            Layout.fillWidth: true
-            height: 1
-            color: chatViewRoot.borderColor
-        }
-
         // Message input area
-        Rectangle {
+        GlassPanel {
             Layout.fillWidth: true
             height: 68
-            color: chatViewRoot.surfaceColor
+            radius: 0
+            sheen: false
+            darkMode: chatViewRoot.darkMode
 
             RowLayout {
                 anchors.fill: parent
@@ -508,7 +575,7 @@ Rectangle {
                     Layout.preferredHeight: 40
                     radius: 10
                     visible: !voiceService.isRecording
-                    color: attMouse.containsPress ? Qt.rgba(108/255, 99/255, 255/255, 0.2) : (attMouse.containsMouse ? Qt.rgba(108/255, 99/255, 255/255, 0.1) : "transparent")
+                    color: attMouse.containsPress ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.2) : (attMouse.containsMouse ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.1) : "transparent")
                     Behavior on color {
                         enabled: !chatViewRoot.instantThemeActive
                         ColorAnimation { duration: 100 }
@@ -771,6 +838,7 @@ Rectangle {
         const prev = messagesModel.count > 0 ? messagesModel.get(messagesModel.count - 1) : null
         const showSender = !isMine && (!prev || prev.senderId !== senderId)
         messagesModel.append({
+            messageKind: "message",
             messageId: messageId || "",
             senderId: senderId,
             senderName: senderName,
@@ -785,6 +853,28 @@ Rectangle {
             contentType: contentType || "",
             fileName: fileName || "",
             fileSize: fileSize || 0
+        })
+    }
+
+    // A small non-bubble line inline in the thread (e.g. a security code
+    // change notice) - never sent anywhere, never cached, purely local.
+    function addSystemMessage(text) {
+        messagesModel.append({
+            messageKind: "system",
+            messageId: "",
+            senderId: "",
+            senderName: "",
+            messageText: text,
+            messageTime: "",
+            isMine: false,
+            isRead: false,
+            showSender: false,
+            voiceUrl: "",
+            voiceDurationMs: 0,
+            voiceEncrypted: false,
+            contentType: "",
+            fileName: "",
+            fileSize: 0
         })
     }
 

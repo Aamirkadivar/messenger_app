@@ -4,6 +4,7 @@ import android.util.Log
 import com.goterl.lazysodium.LazySodiumAndroid
 import com.goterl.lazysodium.SodiumAndroid
 import com.goterl.lazysodium.interfaces.Box
+import com.goterl.lazysodium.interfaces.SecretBox
 
 /**
  * Real end-to-end encryption using NaCl crypto_box (X25519 + XSalsa20-Poly1305)
@@ -138,13 +139,76 @@ object E2ECrypto {
         }
     }
 
-    private fun toHex(bytes: ByteArray): String {
+    // ==================== Group "Sender Keys" (crypto_secretbox) ====================
+    //
+    // WhatsApp/Signal-style group E2EE: each sender generates one symmetric key
+    // for messages they send, distributes it pairwise (via encrypt/encryptBytes
+    // above) to every other member, then encrypts their own messages with it
+    // directly - one encryption per message regardless of group size, instead
+    // of once per recipient. Byte-for-byte compatible with the Windows client's
+    // Encryption::secretBox* (crypto_secretbox_easy). Wire format: nonce[24] ||
+    // ciphertext, hex-encoded when embedded in a JSON string field (group text),
+    // raw bytes otherwise (would apply to group voice/attachments, not yet wired).
+
+    /** Generates a new random Sender Key. Returns its 32-byte hex encoding. */
+    fun secretBoxGenerateKey(): String? {
+        return try {
+            val key = ByteArray(SecretBox.KEYBYTES)
+            sodium.cryptoSecretBoxKeygen(key)
+            toHex(key)
+        } catch (e: Exception) {
+            Log.e(TAG, "secretBoxGenerateKey error", e)
+            null
+        }
+    }
+
+    /** Returns nonce||ciphertext, or null on failure. */
+    fun secretBoxEncryptBytes(plain: ByteArray, keyHex: String): ByteArray? {
+        return try {
+            val key = fromHex(keyHex) ?: return null
+            if (key.size != SecretBox.KEYBYTES) return null
+
+            val nonce = sodium.randomBytesBuf(SecretBox.NONCEBYTES)
+            val cipher = ByteArray(plain.size + SecretBox.MACBYTES)
+            if (!sodium.cryptoSecretBoxEasy(cipher, plain, plain.size.toLong(), nonce, key)) {
+                Log.e(TAG, "cryptoSecretBoxEasy failed")
+                return null
+            }
+            nonce + cipher
+        } catch (e: Exception) {
+            Log.e(TAG, "secretBoxEncryptBytes error", e)
+            null
+        }
+    }
+
+    /** Decrypts a payload produced by [secretBoxEncryptBytes]. Null on failure. */
+    fun secretBoxDecryptBytes(payload: ByteArray, keyHex: String): ByteArray? {
+        return try {
+            val key = fromHex(keyHex) ?: return null
+            if (key.size != SecretBox.KEYBYTES) return null
+            if (payload.size < SecretBox.NONCEBYTES + SecretBox.MACBYTES) return null
+
+            val nonce = payload.copyOfRange(0, SecretBox.NONCEBYTES)
+            val cipher = payload.copyOfRange(SecretBox.NONCEBYTES, payload.size)
+            val plain = ByteArray(cipher.size - SecretBox.MACBYTES)
+            if (!sodium.cryptoSecretBoxOpenEasy(plain, cipher, cipher.size.toLong(), nonce, key)) {
+                return null
+            }
+            plain
+        } catch (e: Exception) {
+            Log.e(TAG, "secretBoxDecryptBytes error", e)
+            null
+        }
+    }
+
+    /** Public so callers can hex-encode/decode a Sender Key for storage or pairwise wrapping. */
+    fun toHex(bytes: ByteArray): String {
         val sb = StringBuilder(bytes.size * 2)
         for (b in bytes) sb.append("%02x".format(b.toInt() and 0xFF))
         return sb.toString()
     }
 
-    private fun fromHex(hex: String): ByteArray? {
+    fun fromHex(hex: String): ByteArray? {
         if (hex.length % 2 != 0) return null
         return try {
             ByteArray(hex.length / 2) { i ->

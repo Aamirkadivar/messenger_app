@@ -10,10 +10,15 @@ Item {
     property color patternColor: "#C9A961"
     property real patternOpacity: 0.05
     property real tileSize: 48
+    // Lets a caller layer this over something else (e.g. AmbientGlow) instead
+    // of a fully opaque base - defaults to fully opaque so every existing
+    // usage is unaffected.
+    property real baseOpacity: 1.0
 
     Rectangle {
         anchors.fill: parent
         color: root.baseColor
+        opacity: root.baseOpacity
     }
 
     Canvas {

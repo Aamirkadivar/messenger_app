@@ -74,6 +74,12 @@ Item {
     property color theirMessageBg: darkMode ? "#26264A" : "#EDEDF2"
     property color myTextColor: "#FFFFFF"
     property color theirTextColor: darkMode ? "#EDEDF2" : "#1A1A2E"
+    // "Their" bubbles are glass (translucent, over ChatView's AmbientGlow);
+    // "my" bubbles stay solid gold - keeps the one clear visual hierarchy a
+    // chat thread needs (which side is mine) instead of two competing glass
+    // surfaces that would blur together.
+    readonly property color theirGlassFill: Qt.rgba(theirMessageBg.r, theirMessageBg.g, theirMessageBg.b, darkMode ? 0.5 : 0.72)
+    readonly property color theirGlassBorder: darkMode ? Qt.rgba(1, 1, 1, 0.09) : Qt.rgba(43 / 255, 36 / 255, 24 / 255, 0.10)
 
     property real maxWidth: parent ? parent.width * 0.68 : 400
     property real minContentWidth: 68
@@ -139,7 +145,10 @@ Item {
                  )
         height: contentColumn.implicitHeight + 20
         radius: 16
-        color: isMine ? bubbleRoot.myMessageBg : bubbleRoot.theirMessageBg
+        color: isMine ? bubbleRoot.myMessageBg : bubbleRoot.theirGlassFill
+        border.width: isMine ? 0 : 1
+        border.color: bubbleRoot.theirGlassBorder
+        antialiasing: true
 
         Column {
             id: contentColumn
@@ -154,7 +163,7 @@ Item {
                 text: bubbleRoot.senderName
                 font.pixelSize: 12
                 font.bold: true
-                color: "#8B84FF"
+                color: bubbleRoot.accentColor
                 elide: Text.ElideRight
                 width: parent.width
             }
@@ -229,15 +238,22 @@ Item {
                 }
             }
 
-            Row {
+            // A plain Item, not a Row - Row explicitly forbids vertical/fill
+            // anchors on its children (Qt Quick warns "Row will not function"
+            // and the layout breaks down, which is exactly what was making
+            // the icon and text overlap instead of sitting side by side).
+            // fileIconBg/the text Column/the MouseArea below all needed
+            // anchors Row can't host, so this is an Item with an explicit
+            // left-to-right anchor chain instead.
+            Item {
                 id: fileRow
                 visible: bubbleRoot.isFileMessage
                 width: bubbleRoot.voiceContentWidth
                 height: 44
-                spacing: 10
 
                 Rectangle {
                     id: fileIconBg
+                    anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
                     width: 36
                     height: 36
@@ -275,8 +291,10 @@ Item {
                 }
 
                 Column {
+                    anchors.left: fileIconBg.right
+                    anchors.leftMargin: 10
+                    anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    width: parent.width - fileIconBg.width - parent.spacing
                     spacing: 2
 
                     Text {
@@ -306,15 +324,16 @@ Item {
                 }
             }
 
-            Row {
+            // Same fix as fileRow above - Item instead of Row, explicit anchor chain.
+            Item {
                 id: voiceRow
                 visible: bubbleRoot.isVoiceMessage
                 width: bubbleRoot.voiceContentWidth
                 height: 36
-                spacing: 10
 
                 Rectangle {
                     id: playButton
+                    anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
                     width: 32
                     height: 32
@@ -371,8 +390,10 @@ Item {
                 }
 
                 Column {
+                    anchors.left: playButton.right
+                    anchors.leftMargin: 10
+                    anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    width: parent.width - playButton.width - parent.spacing
                     spacing: 4
 
                     Rectangle {
@@ -405,45 +426,62 @@ Item {
                 }
             }
 
-            Row {
-                id: timeRow
-                anchors.right: parent.right
-                spacing: 4
-                topPadding: 2
+            // A plain Item wrapper, not a Row/Column child anchored directly -
+            // Column is a positioner and silently breaks (or ignores) anchors
+            // on its direct children, same class of bug as Layout-managed
+            // children ignoring anchors.fill elsewhere in this app. Anchoring
+            // timeRow straight to contentColumn (a Column) is what left the
+            // timestamp floating disconnected from the file/voice row instead
+            // of sitting right-aligned under it.
+            Item {
+                width: parent.width
+                height: timeRow.implicitHeight
 
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: bubbleRoot.messageTime
-                    font.pixelSize: 11
-                    color: isMine ? Qt.rgba(1, 1, 1, 0.65) : (darkMode ? "#8B8B9E" : "#6B6B7B")
-                }
+                Row {
+                    id: timeRow
+                    anchors.right: parent.right
+                    spacing: 4
+                    topPadding: 2
 
-                Canvas {
-                    id: checkmarkCanvas
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: 14
-                    height: 10
-                    visible: bubbleRoot.isMine
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.reset()
-                        // Grey = sent but not yet seen; gold = the other
-                        // person has read it (matches the accent in both themes).
-                        ctx.strokeStyle = bubbleRoot.isRead ? (darkMode ? "#C9A961" : "#A6803A") : "rgba(255,255,255,0.75)"
-                        ctx.lineWidth = 1.4
-                        ctx.lineCap = "round"
-                        ctx.lineJoin = "round"
-                        ctx.beginPath()
-                        ctx.moveTo(0, 5); ctx.lineTo(3, 8); ctx.lineTo(8, 2)
-                        ctx.stroke()
-                        ctx.beginPath()
-                        ctx.moveTo(5, 5); ctx.lineTo(8, 8); ctx.lineTo(14, 1)
-                        ctx.stroke()
+                    // y bindings instead of anchors.verticalCenter: Row (like
+                    // Column) forbids anchors that touch the axis it manages
+                    // itself - for Row that's vertical anchors, and using one
+                    // anyway is what broke this row's layout the same way the
+                    // fileRow/voiceRow ones above did.
+                    Text {
+                        y: (parent.height - height) / 2
+                        text: bubbleRoot.messageTime
+                        font.pixelSize: 11
+                        color: isMine ? Qt.rgba(1, 1, 1, 0.65) : (darkMode ? "#8B8B9E" : "#6B6B7B")
                     }
 
-                    Connections {
-                        target: bubbleRoot
-                        function onIsReadChanged() { checkmarkCanvas.requestPaint() }
+                    Canvas {
+                        id: checkmarkCanvas
+                        y: (parent.height - height) / 2
+                        width: 14
+                        height: 10
+                        visible: bubbleRoot.isMine
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            // Grey = sent but not yet seen; gold = the other
+                            // person has read it (matches the accent in both themes).
+                            ctx.strokeStyle = bubbleRoot.isRead ? (darkMode ? "#C9A961" : "#A6803A") : "rgba(255,255,255,0.75)"
+                            ctx.lineWidth = 1.4
+                            ctx.lineCap = "round"
+                            ctx.lineJoin = "round"
+                            ctx.beginPath()
+                            ctx.moveTo(0, 5); ctx.lineTo(3, 8); ctx.lineTo(8, 2)
+                            ctx.stroke()
+                            ctx.beginPath()
+                            ctx.moveTo(5, 5); ctx.lineTo(8, 8); ctx.lineTo(14, 1)
+                            ctx.stroke()
+                        }
+
+                        Connections {
+                            target: bubbleRoot
+                            function onIsReadChanged() { checkmarkCanvas.requestPaint() }
+                        }
                     }
                 }
             }

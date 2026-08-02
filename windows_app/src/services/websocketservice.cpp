@@ -107,6 +107,15 @@ void WebSocketService::sendTypingIndicator(const QString& chatId, const QString&
     sendJson(obj);
 }
 
+void WebSocketService::sendCallSignal(const QString& type, const QVariantMap& data) {
+    if (!isConnected()) return;
+
+    QJsonObject obj;
+    obj[QStringLiteral("type")] = type;
+    obj[QStringLiteral("data")] = QJsonObject::fromVariantMap(data);
+    sendJson(obj);
+}
+
 void WebSocketService::sendJson(const QJsonObject& obj) {
     if (m_webSocket && m_webSocket->isValid()) {
         m_webSocket->sendTextMessage(QJsonDocument(obj).toJson(QJsonDocument::Compact));
@@ -169,6 +178,7 @@ void WebSocketService::onTextMessageReceived(const QString& message) {
         m["fileName"] = data[QStringLiteral("file_name")].toString();
         m["fileSize"] = static_cast<qint64>(data[QStringLiteral("file_size")].toDouble(0));
         m["durationMs"] = static_cast<qint64>(data[QStringLiteral("duration_ms")].toDouble(0));
+        m["keyVersion"] = data[QStringLiteral("key_version")].toInt(0);
 
         emit messageReceived(chatId, m);
     } else if (type == QStringLiteral("typing")) {
@@ -187,6 +197,10 @@ void WebSocketService::onTextMessageReceived(const QString& message) {
         emit presenceChanged(userId, online);
     } else if (type == QStringLiteral("error")) {
         emit errorOccurred(data[QStringLiteral("error")].toString());
+    } else if (type == QStringLiteral("call:invite") || type == QStringLiteral("call:answer") ||
+               type == QStringLiteral("call:ice_candidate") || type == QStringLiteral("call:reject") ||
+               type == QStringLiteral("call:end")) {
+        emit callSignalReceived(type, data.toVariantMap());
     }
 }
 
