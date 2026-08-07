@@ -216,29 +216,90 @@ Item {
                 Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
 
                 Canvas {
+                    id: newGroupIcon
                     anchors.centerIn: parent
-                    width: 17
-                    height: 14
+                    // 24x24 Material viewBox, scaled to toolbar size.
+                    width: 20
+                    height: 20
+                    // Canvas does not repaint when a colour binding changes.
+                    Connections {
+                        target: chatListRoot
+                        function onTextSecondaryChanged() { newGroupIcon.requestPaint() }
+                    }
                     onPaint: {
+                        // Faithful Material Icons Outlined "group_add" (the
+                        // same glyph Android uses via Icons.Outlined.GroupAdd):
+                        // two people on the left, a bare plus on the right,
+                        // all one tint. Drawn from the 24x24 SVG paths.
                         var ctx = getContext("2d")
                         ctx.reset()
-                        ctx.strokeStyle = chatListRoot.textSecondary
+                        var s = width / 24
+                        ctx.scale(s, s)
                         ctx.fillStyle = chatListRoot.textSecondary
-                        ctx.lineWidth = 1.5
-                        // Two overlapping person glyphs to read as "group"
-                        ctx.beginPath(); ctx.arc(5.5, 3.5, 2.6, 0, Math.PI * 2); ctx.fill()
-                        ctx.beginPath(); ctx.arc(11, 4.2, 2.1, 0, Math.PI * 2); ctx.fill()
+
+                        // Plus
                         ctx.beginPath()
-                        ctx.moveTo(0.5, 13.5); ctx.arcTo(0.5, 8, 5.5, 7, 5); ctx.arcTo(10.5, 8, 10.5, 13.5, 5)
+                        ctx.moveTo(22, 9)
+                        ctx.lineTo(22, 7)
+                        ctx.lineTo(20, 7)
+                        ctx.lineTo(20, 9)
+                        ctx.lineTo(18, 9)
+                        ctx.lineTo(18, 11)
+                        ctx.lineTo(20, 11)
+                        ctx.lineTo(20, 13)
+                        ctx.lineTo(22, 13)
+                        ctx.lineTo(22, 11)
+                        ctx.lineTo(24, 11)
+                        ctx.lineTo(24, 9)
+                        ctx.closePath()
                         ctx.fill()
+
+                        // Front person head (ring via evenodd)
                         ctx.beginPath()
-                        ctx.moveTo(9, 13.5); ctx.arcTo(9, 9, 11, 7.5, 4); ctx.arcTo(16.5, 9, 16.5, 13.5, 4)
+                        ctx.arc(8, 8, 4, 0, Math.PI * 2)
+                        ctx.closePath()
+                        ctx.arc(8, 8, 2, 0, Math.PI * 2, true)
+                        ctx.closePath()
+                        ctx.fill("evenodd")
+
+                        // Front person body (outer silhouette + inner cutout)
+                        ctx.beginPath()
+                        ctx.moveTo(8, 13)
+                        ctx.bezierCurveTo(5.33, 13, 0, 14.34, 0, 17)
+                        ctx.lineTo(0, 20)
+                        ctx.lineTo(16, 20)
+                        ctx.lineTo(16, 17)
+                        ctx.bezierCurveTo(16, 14.34, 10.67, 13, 8, 13)
+                        ctx.closePath()
+                        ctx.moveTo(14, 18)
+                        ctx.lineTo(2, 18)
+                        ctx.lineTo(2, 17.01)
+                        ctx.bezierCurveTo(2.2, 16.29, 5.3, 15, 8, 15)
+                        ctx.bezierCurveTo(10.7, 15, 13.8, 16.29, 14, 17)
+                        ctx.lineTo(14, 18)
+                        ctx.closePath()
+                        ctx.fill("evenodd")
+
+                        // Rear person head (crescent peeking behind)
+                        ctx.beginPath()
+                        ctx.moveTo(12.51, 4.05)
+                        ctx.bezierCurveTo(13.43, 5.11, 14, 6.49, 14, 8)
+                        ctx.bezierCurveTo(14, 9.51, 13.43, 10.89, 12.51, 11.95)
+                        ctx.bezierCurveTo(14.47, 11.7, 16, 10.04, 16, 8)
+                        ctx.bezierCurveTo(16, 5.96, 14.47, 4.3, 12.51, 4.05)
+                        ctx.closePath()
                         ctx.fill()
-                        // plus badge
-                        ctx.strokeStyle = chatListRoot.accentColor
-                        ctx.lineWidth = 1.8
-                        ctx.beginPath(); ctx.moveTo(14, 1); ctx.lineTo(14, 5); ctx.stroke()
-                        ctx.beginPath(); ctx.moveTo(12, 3); ctx.lineTo(16, 3); ctx.stroke()
+
+                        // Rear person body
+                        ctx.beginPath()
+                        ctx.moveTo(16.53, 13.83)
+                        ctx.bezierCurveTo(17.42, 14.66, 18, 15.7, 18, 17)
+                        ctx.lineTo(18, 20)
+                        ctx.lineTo(20, 20)
+                        ctx.lineTo(20, 17)
+                        ctx.bezierCurveTo(20, 15.55, 18.41, 14.49, 16.53, 13.83)
+                        ctx.closePath()
+                        ctx.fill()
                     }
                 }
 
@@ -645,27 +706,38 @@ Item {
                                     }
                                 }
 
-                                // Name + last message
+                                // Name + last message. preferredWidth: 0 is
+                                // required so Layout.fillWidth actually
+                                // constrains the Text - otherwise implicitWidth
+                                // (the full unelided string) expands the row
+                                // and the preview spills past the chat-list tile.
                                 ColumnLayout {
                                     Layout.fillWidth: true
+                                    Layout.preferredWidth: 0
                                     spacing: 4
 
                                     Text {
                                         Layout.fillWidth: true
+                                        Layout.preferredWidth: 0
                                         text: model.chatName
                                         font.pixelSize: 15
                                         font.weight: Font.DemiBold
                                         color: chatListRoot.textColor
                                         elide: Text.ElideRight
+                                        maximumLineCount: 1
                                     }
 
                                     Text {
                                         Layout.fillWidth: true
-                                        text: model.lastMessage
+                                        Layout.preferredWidth: 0
+                                        // Shift+Enter messages carry newlines;
+                                        // keep the preview a single elided line.
+                                        text: (model.lastMessage || "").replace(/\n/g, " ")
                                         font.pixelSize: 13
                                         color: model.unreadCount > 0 ? chatListRoot.textColor : chatListRoot.textSecondary
                                         font.weight: model.unreadCount > 0 ? Font.Medium : Font.Normal
                                         elide: Text.ElideRight
+                                        maximumLineCount: 1
                                     }
                                 }
 
@@ -934,14 +1006,19 @@ Item {
     // ever reflects unread state from the last full REST refetch.
     function onMessageReceived(chatId, message) {
         if (authService !== undefined && message.senderId === authService.currentUserId) return
-        if (chatId === chatListRoot.activeChatId) return
 
         var preview = chatService.decryptMessage(chatId, message.content, message.encrypted === true)
+        // Always refresh the snippet - even for the open chat. Skipping that
+        // used to leave the sidebar stuck on whatever was last when the chat
+        // was opened. Only the unread badge is suppressed for the active chat
+        // (you're already looking at it, so it shouldn't count as unread).
+        var isActive = chatId === chatListRoot.activeChatId
 
         var found = false
         for (var i = 0; i < originalChats.length; i++) {
             if (originalChats[i].chatId === chatId) {
-                originalChats[i].unreadCount = (originalChats[i].unreadCount || 0) + 1
+                if (!isActive)
+                    originalChats[i].unreadCount = (originalChats[i].unreadCount || 0) + 1
                 originalChats[i].lastMessage = preview
                 found = true
                 break
@@ -956,11 +1033,36 @@ Item {
 
         for (var j = 0; j < chatModel.count; j++) {
             if (chatModel.get(j).chatId === chatId) {
-                chatModel.setProperty(j, "unreadCount", (chatModel.get(j).unreadCount || 0) + 1)
+                if (!isActive)
+                    chatModel.setProperty(j, "unreadCount", (chatModel.get(j).unreadCount || 0) + 1)
                 chatModel.setProperty(j, "lastMessage", preview)
                 break
             }
         }
+    }
+
+    // Symmetric to onMessageReceived: after a delete (local or for_everyone),
+    // replace the preview with whatever the cache now says is latest - empty
+    // when the thread was cleared entirely.
+    function onChatLastMessageChanged(chatId, preview) {
+        for (var i = 0; i < originalChats.length; i++) {
+            if (originalChats[i].chatId === chatId) {
+                originalChats[i].lastMessage = preview
+                break
+            }
+        }
+        for (var j = 0; j < chatModel.count; j++) {
+            if (chatModel.get(j).chatId === chatId) {
+                chatModel.setProperty(j, "lastMessage", preview)
+                break
+            }
+        }
+    }
+
+    // for_everyone retraction over the socket - drop the cache row and refresh
+    // the preview (ChatService's own DELETE path already does this).
+    function onMessageDeletedRemotely(chatId, messageId) {
+        if (chatService !== undefined) chatService.noteMessageDeleted(chatId, messageId)
     }
 
     // Refresh the whole list the moment we (re)connect - otherwise anything
@@ -992,12 +1094,14 @@ Item {
             chatService.chatsFetched.connect(onChatsFetched)
             chatService.chatError.connect(onChatError)
             chatService.chatRead.connect(onChatRead)
+            chatService.chatLastMessageChanged.connect(onChatLastMessageChanged)
             loadChatsFromAPI()
         } else {
             populateChatModel([])
         }
         if (websocketService !== undefined && websocketService !== null) {
             websocketService.messageReceived.connect(onMessageReceived)
+            websocketService.messageDeletedRemotely.connect(onMessageDeletedRemotely)
             websocketService.presenceChanged.connect(onPresenceChanged)
             websocketService.connected.connect(onWsReconnected)
         }

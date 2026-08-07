@@ -21,11 +21,9 @@ import java.io.IOException
  * Generic file/image attachment transport: encrypt, upload, download, decrypt.
  *
  * Mirrors [VoiceRepository]'s pattern exactly - an attachment is content, so it
- * gets the same end-to-end treatment as a voice note or text message when we
- * have a key for the chat. Group chats are the same exception voice notes
- * are: the pairwise crypto_box here needs exactly one recipient key, and group
- * Sender Keys ([ChatRepository]) only cover text so far - an attachment sent
- * in a group goes out unencrypted, matching the backend/Windows behavior.
+ * gets the same end-to-end treatment as a voice note or text message. Direct
+ * chats use pairwise crypto_box; groups use Sender Keys (raw secretbox +
+ * key_version), matching group text.
  */
 class AttachmentRepository(
     private val context: Context,
@@ -83,14 +81,14 @@ class AttachmentRepository(
         }
     }
 
-    data class Uploaded(val fileUrl: String, val fileSize: Long, val encrypted: Boolean)
+    data class Uploaded(val fileUrl: String, val fileSize: Long, val encrypted: Boolean, val keyVersion: Int = 0)
 
     /** Encrypts (when possible) and uploads [file]'s bytes, returning its server path. */
     suspend fun upload(token: String, chatId: String, file: PickedFile): Result<Uploaded> =
         withContext(Dispatchers.IO) {
             try {
-                val sealed = chatRepository.encryptBytesFor(chatId, file.bytes)
-                val payload = sealed ?: file.bytes
+                val sealed = chatRepository.encryptBytesFor(token, chatId, file.bytes)
+                val payload = sealed?.bytes ?: file.bytes
                 if (sealed == null) {
                     Log.w(TAG, "No key for chat $chatId - uploading attachment unencrypted")
                 }
@@ -105,7 +103,7 @@ class AttachmentRepository(
                     ?.let { runCatching { it.jsonPrimitive.content.toLong() }.getOrNull() }
                     ?: payload.size.toLong()
                 if (response.isSuccessful && !url.isNullOrBlank()) {
-                    Result.success(Uploaded(url, size, sealed != null))
+                    Result.success(Uploaded(url, size, sealed != null, sealed?.keyVersion ?: 0))
                 } else {
                     Result.failure(Exception(response.errorMessage("Failed to send attachment")))
                 }
@@ -124,7 +122,9 @@ class AttachmentRepository(
         messageId: String,
         fileUrl: String,
         fileName: String,
-        encrypted: Boolean
+        encrypted: Boolean,
+        senderId: String = "",
+        keyVersion: Int = 0
     ): Result<File> = withContext(Dispatchers.IO) {
         val cached = cacheFile(messageId, fileName)
         if (cached.exists() && cached.length() > 0) return@withContext Result.success(cached)
@@ -144,7 +144,7 @@ class AttachmentRepository(
                     ?: return@withContext Result.failure(IOException("Empty attachment"))
 
                 val plain = if (encrypted) {
-                    chatRepository.decryptBytesFor(chatId, bytes)
+                    chatRepository.decryptBytesFor(chatId, bytes, senderId, keyVersion)
                         ?: return@withContext Result.failure(
                             IOException("This attachment can't be decrypted on this device")
                         )

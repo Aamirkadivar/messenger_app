@@ -22,11 +22,8 @@ import java.io.IOException
  * server only ever holds an opaque blob it cannot decode - which is why the
  * upload endpoint deliberately doesn't validate the payload as audio.
  *
- * Group chats are the exception, and not by choice: the pairwise crypto_box
- * used here needs exactly one recipient key, and group E2EE is still an open
- * design question (see back-end/handlers/group.go). Voice in a group is sent
- * unencrypted, matching how group text already behaves - [encryptedFor]
- * returns null in that case and callers must surface it.
+ * Direct chats use pairwise crypto_box; groups use Sender Keys (raw
+ * secretbox bytes + key_version on the message), matching group text.
  */
 class VoiceRepository(
     private val context: Context,
@@ -45,7 +42,7 @@ class VoiceRepository(
     private fun playbackFile(messageId: String) =
         File(context.cacheDir, "voice_play_${messageId.replace(Regex("[^A-Za-z0-9_-]"), "_")}.m4a")
 
-    data class Uploaded(val fileUrl: String, val encrypted: Boolean)
+    data class Uploaded(val fileUrl: String, val encrypted: Boolean, val keyVersion: Int = 0)
 
     /**
      * Encrypts (when possible) and uploads [file], returning its server path.
@@ -61,8 +58,8 @@ class VoiceRepository(
                     )
                 }
 
-                val sealed = chatRepository.encryptBytesFor(chatId, raw)
-                val payload = sealed ?: raw
+                val sealed = chatRepository.encryptBytesFor(token, chatId, raw)
+                val payload = sealed?.bytes ?: raw
                 if (sealed == null) {
                     Log.w(TAG, "No key for chat $chatId - uploading voice note unencrypted")
                 }
@@ -77,7 +74,7 @@ class VoiceRepository(
                 val url = response.body()?.get("file_url")
                     ?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
                 if (response.isSuccessful && !url.isNullOrBlank()) {
-                    Result.success(Uploaded(url, sealed != null))
+                    Result.success(Uploaded(url, sealed != null, sealed?.keyVersion ?: 0))
                 } else {
                     Result.failure(Exception(response.errorMessage("Failed to send voice note")))
                 }
@@ -99,7 +96,9 @@ class VoiceRepository(
         chatId: String,
         messageId: String,
         fileUrl: String,
-        encrypted: Boolean
+        encrypted: Boolean,
+        senderId: String = "",
+        keyVersion: Int = 0
     ): Result<File> = withContext(Dispatchers.IO) {
         val cached = playbackFile(messageId)
         if (cached.exists() && cached.length() > 0) return@withContext Result.success(cached)
@@ -119,7 +118,7 @@ class VoiceRepository(
                     ?: return@withContext Result.failure(IOException("Empty voice note"))
 
                 val audio = if (encrypted) {
-                    chatRepository.decryptBytesFor(chatId, bytes)
+                    chatRepository.decryptBytesFor(chatId, bytes, senderId, keyVersion)
                         ?: return@withContext Result.failure(
                             IOException("This voice note can't be decrypted on this device")
                         )

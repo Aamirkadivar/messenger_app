@@ -8,6 +8,7 @@ import com.messenger.app.data.local.dao.CachedChatDao
 import com.messenger.app.data.local.dao.ConversationDao
 import com.messenger.app.data.local.dao.MessageDao
 import com.messenger.app.data.local.dao.UserDao
+import com.messenger.app.data.remote.TokenRefreshAuthenticator
 import com.messenger.app.data.remote.api.AuthApiService
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.data.remote.websocket.WebSocketManager
@@ -54,7 +55,7 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideOkHttpClient(): OkHttpClient {
+    fun provideOkHttpClient(authenticator: TokenRefreshAuthenticator): OkHttpClient {
         val logging = HttpLoggingInterceptor().apply {
             level = if (BuildConfig.DEBUG) {
                 HttpLoggingInterceptor.Level.BODY
@@ -64,6 +65,9 @@ object AppModule {
         }
         return OkHttpClient.Builder()
             .addInterceptor(logging)
+            // Renews an expired access token and replays the request, instead
+            // of letting every call fail until the user signs in again.
+            .authenticator(authenticator)
             .build()
     }
 

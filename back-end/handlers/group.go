@@ -861,28 +861,10 @@ func (s *GroupService) SearchUsers(c *fiber.Ctx) error {
 	})
 }
 
-// Group message encryption is deliberately absent.
-//
-// An EncryptForGroup helper used to live here, but it encrypted only for
-// recipientPublicKeys[0] and panicked on an empty slice - despite its name
-// promising otherwise. It was unreferenced, so it has been removed rather than
-// left as a trap for the first caller.
-//
-// Direct messages are end-to-end encrypted with pairwise X25519 crypto_box
-// (see handlers/crypto.go and the clients' E2ECrypto). That does not extend to
-// N participants without a real decision, and the server must never see
-// plaintext, so the choice has to be made client-side:
-//
-//   - Per-recipient fanout: the sender encrypts once per member and uploads N-1
-//     ciphertexts. No new primitives, but message size grows with the group and
-//     the Message model needs somewhere to put per-recipient payloads (today it
-//     has a single Content column).
-//
-//   - Sender keys (Signal-style): each sender derives a symmetric chain key,
-//     distributes it over the existing pairwise channel, then encrypts each
-//     message once. Efficient, but requires rekeying whenever membership
-//     changes so removed members lose forward access.
-//
-// Until one is implemented, group chats can be created and managed but group
-// messages have no encryption path - do not route them through the direct
-// message crypto, which assumes exactly two parties.
+// Group message encryption lives on the clients (Sender Keys): each member
+// generates a crypto_secretbox key, wraps a copy for every other member with
+// pairwise crypto_box, and publishes those blobs via PublishSenderKey. The
+// server stores and relays ciphertext and key wrappers only - it never sees
+// plaintext. Chat.KeyEpoch (bumped on membership change) is the rotation
+// signal; Message.KeyVersion records which Sender Key sealed a message.
+// See clients' ChatRepository / ChatService and models.GroupSenderKey.

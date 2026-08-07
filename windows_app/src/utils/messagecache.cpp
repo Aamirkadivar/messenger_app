@@ -181,11 +181,25 @@ void MessageCache::deleteChat(const QString& chatId) {
     query.addBindValue(chatId);
     query.exec();
 
-    query.prepare(QStringLiteral("DELETE FROM chats WHERE chat_id = ?"));
+    // "id", not "chat_id": the chats table's primary key is id (see the
+    // CREATE TABLE above). The old column name matched nothing, so this query
+    // silently failed and a deleted chat reappeared from cache on the next
+    // cold start.
+    query.prepare(QStringLiteral("DELETE FROM chats WHERE id = ?"));
     query.addBindValue(chatId);
     query.exec();
     // No VACUUM, unlike clear() below: reclaiming pages rewrites the entire
     // database file, which is far too heavy for dropping one conversation.
+}
+
+void MessageCache::deleteMessage(const QString& messageId) {
+    if (!m_db.isOpen()) return;
+    QSqlQuery query(m_db);
+    query.prepare(QStringLiteral("DELETE FROM messages WHERE id = ?"));
+    query.addBindValue(messageId);
+    if (!query.exec()) {
+        qWarning() << "[MessageCache] Failed to delete message:" << query.lastError().text();
+    }
 }
 
 void MessageCache::clear() {

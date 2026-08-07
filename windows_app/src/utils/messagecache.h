@@ -63,6 +63,11 @@ public:
     // Wipes every cached message and chat (e.g. a user-triggered "clear
     // cache" in Settings) and reclaims the freed space on disk.
     void clear();
+
+    // Drops one message's cached row. Without this a message deleted while
+    // online reappears on the next cold start, because the cache is painted
+    // before the network refresh can correct it.
+    void deleteMessage(const QString& messageId);
     // Size of the on-disk database file, for showing in Settings.
     qint64 sizeBytes() const;
 

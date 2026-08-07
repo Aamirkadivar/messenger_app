@@ -15,6 +15,9 @@
         <file>../qml/GlassPanel.qml</file>
         <file>../qml/AmbientGlow.qml</file>
         <file>../qml/CallOverlay.qml</file>
+        <file>../qml/RoundVideoOverlay.qml</file>
+        <file>../qml/OverlayButton.qml</file>
+        <file>../qml/RoundVideoBubble.qml</file>
         <file>../qml/CallActionButton.qml</file>
     </qresource>
     <qresource prefix="/icons">

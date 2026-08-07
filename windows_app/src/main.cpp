@@ -23,6 +23,9 @@
 #include "services/chatservice.h"
 #include "services/groupservice.h"
 #include "services/voiceservice.h"
+#include "services/roundvideoservice.h"
+#include "utils/circularvideoitem.h"
+#include "utils/videoframeitem.h"
 #include "services/callservice.h"
 
 #ifdef Q_OS_WIN
@@ -78,6 +81,7 @@ int main(int argc, char* argv[]) {
     GroupService groupService(&authService);
     ChatService chatService(&authService, &groupService);
     VoiceService voiceService;
+    RoundVideoService roundVideoService;
     CallService callService(&authService, &websocketService);
     AppConfig appConfig;
 
@@ -151,12 +155,22 @@ int main(int argc, char* argv[]) {
 
     QQmlApplicationEngine engine;
 
+    // Circular video surface, shared by the recorder overlay and the message
+    // bubbles. Registered as a type rather than a context property because
+    // each instance owns its own video sink.
+    qmlRegisterType<CircularVideoItem>("Messenger", 1, 0, "CircularVideo");
+
+    // Rectangular video surface for calls (remote feed + local self-view),
+    // fed decoded QImage frames by CallService.
+    qmlRegisterType<VideoFrameItem>("Messenger", 1, 0, "VideoFrame");
+
     // Register types
     engine.rootContext()->setContextProperty(QStringLiteral("authService"), &authService);
     engine.rootContext()->setContextProperty(QStringLiteral("websocketService"), &websocketService);
     engine.rootContext()->setContextProperty(QStringLiteral("chatService"), &chatService);
     engine.rootContext()->setContextProperty(QStringLiteral("groupService"), &groupService);
     engine.rootContext()->setContextProperty(QStringLiteral("voiceService"), &voiceService);
+    engine.rootContext()->setContextProperty(QStringLiteral("roundVideoService"), &roundVideoService);
     engine.rootContext()->setContextProperty(QStringLiteral("callService"), &callService);
     engine.rootContext()->setContextProperty(QStringLiteral("appConfig"), &appConfig);
     engine.rootContext()->setContextProperty(QStringLiteral("credentialManager"), &CredentialManager::instance());

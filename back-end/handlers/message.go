@@ -282,7 +282,11 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 	}
 
 	var messages []models.Message
+	// Hide anything this user deleted for themselves. A NOT EXISTS against the
+	// join table, rather than an array-contains on messages.deleted_for: that
+	// column cannot be read back at all once written (see MessageDeletion).
 	query := database.DB.Where("chat_id = ?", chatIDParsed.String()).
+		Where("NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = messages.id AND md.user_id = ?)", userID).
 		Order("created_at DESC")
 
 	if before != "" {
@@ -307,7 +311,10 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 
 	// Get total count
 	var total int64
-	database.DB.Model(&models.Message{}).Where("chat_id = ?", chatIDParsed.String()).Count(&total)
+	database.DB.Model(&models.Message{}).
+		Where("chat_id = ?", chatIDParsed.String()).
+		Where("NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = messages.id AND md.user_id = ?)", userID).
+		Count(&total)
 
 	// Decrypt messages for response
 	type DecryptedMessage struct {
@@ -430,18 +437,57 @@ func (s *MessageService) DeleteMessage(c *fiber.Ctx) error {
 		})
 	}
 
-	// Verify user is the sender
-	if message.SenderID != userID {
-		return c.Status(http.StatusForbidden).JSON(fiber.Map{
-			"error":   "forbidden",
-			"message": "You can only delete your own messages",
-		})
+	// "for_everyone" retracts the message for both sides and is the sender's
+	// privilege only. Anything else removes it from the caller's own view,
+	// which any participant may do to their own copy.
+	forEveryone := c.Query("for_everyone") == "true"
+
+	if forEveryone {
+		if message.SenderID != userID {
+			return c.Status(http.StatusForbidden).JSON(fiber.Map{
+				"error":   "forbidden",
+				"message": "You can only delete your own messages for everyone",
+			})
+		}
+		database.DB.Delete(&message, messageIDParsed)
+	} else {
+		// Record the deletion against this user rather than removing the row,
+		// so the other participant keeps their copy - the same "mine only"
+		// semantics DeleteChat uses. ON CONFLICT makes a repeat click a no-op.
+		if err := database.DB.Exec(
+			"INSERT INTO message_deletions (message_id, user_id, created_at) VALUES (?, ?, ?) "+
+				"ON CONFLICT (message_id, user_id) DO NOTHING",
+			messageIDParsed, userID, time.Now(),
+		).Error; err != nil {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+				"error":   "internal error",
+				"message": "Could not delete message",
+			})
+		}
 	}
 
-	database.DB.Delete(&message, messageIDParsed)
+	// Tell the other clients, or the message sits on their screen until they
+	// happen to refetch - which is exactly how the delete-chat flow felt
+	// broken before it pushed an event too.
+	if s.hub != nil && forEveryone {
+		wsMsg := models.WebSocketMessage{
+			Type: "message:deleted",
+			Data: map[string]interface{}{
+				"chat_id":    message.ChatID,
+				"message_id": messageIDParsed.String(),
+				"deleted_by": userID.String(),
+			},
+			Timestamp: time.Now(),
+		}
+		if out, err := json.Marshal(wsMsg); err == nil {
+			s.hub.Broadcast <- out
+		}
+	}
 
 	return c.JSON(fiber.Map{
-		"message": "Message deleted successfully",
+		"message":      "Message deleted successfully",
+		"for_everyone": forEveryone,
+		"message_id":   messageIDParsed.String(),
 	})
 }
 
@@ -649,9 +695,14 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 		participantsByChat[p.ChatID] = append(participantsByChat[p.ChatID], p)
 	}
 
-	// Fetch last messages for each chat
+	// Fetch last messages for each chat. Same message_deletions filter as
+	// GetMessages - without it, a "delete for me" (or clearing the whole
+	// thread that way) left the old ciphertext as last_message forever,
+	// because the row is still in messages and only hidden via the join
+	// table.
 	var messages []models.Message
 	database.DB.Where("chat_id IN ? AND deleted_at IS NULL", chatIDs).
+		Where("NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = messages.id AND md.user_id = ?)", userID).
 		Order("chat_id, created_at DESC").
 		Find(&messages)
 
@@ -671,7 +722,8 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 	var unreadResults []chatUnread
 	database.DB.Model(&models.Message{}).
 		Select("chat_id, COUNT(*) as count").
-		Where("chat_id IN ? AND sender_id != ? AND read_at IS NULL", chatIDs, userID).
+		Where("chat_id IN ? AND sender_id != ? AND read_at IS NULL AND deleted_at IS NULL", chatIDs, userID).
+		Where("NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = messages.id AND md.user_id = ?)", userID).
 		Group("chat_id").
 		Scan(&unreadResults)
 	unreadMap := make(map[string]int64)

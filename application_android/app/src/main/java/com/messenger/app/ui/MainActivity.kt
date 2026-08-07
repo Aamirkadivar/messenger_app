@@ -129,24 +129,34 @@ private fun MessengerApp(
 
     val context = LocalContext.current
     var pendingAccept by remember { mutableStateOf(false) }
-    val micPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        // An incoming call rings regardless of mic permission (the callee
-        // still needs to see who's calling); only actually connecting the
-        // audio track needs it, so the check happens on accept, not on invite.
-        if (granted && pendingAccept) callViewModel.acceptCall()
+    val callPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        // An incoming call rings regardless of permissions (the callee still
+        // needs to see who's calling); only actually connecting the tracks
+        // needs them, so the check happens on accept, not on invite. The mic
+        // is mandatory; a denied camera degrades a video call to voice-only
+        // rather than blocking the answer.
+        val micGranted = results[Manifest.permission.RECORD_AUDIO] ?: false
+        if (micGranted && pendingAccept) callViewModel.acceptCall()
         pendingAccept = false
     }
 
     fun accept() {
-        val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-            PackageManager.PERMISSION_GRANTED
-        if (hasMic) {
+        val needed = buildList {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+                PackageManager.PERMISSION_GRANTED
+            ) add(Manifest.permission.RECORD_AUDIO)
+            if (callViewModel.state.value.isVideoCall &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) !=
+                PackageManager.PERMISSION_GRANTED
+            ) add(Manifest.permission.CAMERA)
+        }
+        if (needed.isEmpty()) {
             callViewModel.acceptCall()
         } else {
             pendingAccept = true
-            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            callPermissionLauncher.launch(needed.toTypedArray())
         }
     }
 
@@ -182,13 +192,22 @@ private fun MessengerApp(
         )
 
         if (callState.status != CallStatus.IDLE) {
+            val localVideoTrack by callViewModel.localVideoTrack.collectAsStateWithLifecycle()
+            val remoteVideoTrack by callViewModel.remoteVideoTrack.collectAsStateWithLifecycle()
+            val remoteVideoTracks by callViewModel.remoteVideoTracks.collectAsStateWithLifecycle()
             CallOverlay(
                 state = callState,
+                localVideoTrack = localVideoTrack,
+                remoteVideoTrack = remoteVideoTrack,
+                remoteVideoTracks = remoteVideoTracks,
+                eglContext = callViewModel.eglBaseContext,
                 onAccept = { accept() },
                 onReject = callViewModel::rejectCall,
                 onEnd = callViewModel::endCall,
                 onToggleMute = callViewModel::toggleMute,
                 onToggleSpeaker = callViewModel::toggleSpeaker,
+                onToggleCamera = callViewModel::toggleCamera,
+                onSwitchCamera = callViewModel::switchCamera,
                 onDismissEnded = callViewModel::dismissEnded
             )
         }

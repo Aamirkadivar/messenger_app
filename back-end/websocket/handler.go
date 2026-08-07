@@ -75,6 +75,16 @@ func NewHub() *Hub {
 	}
 }
 
+// roomScopedTypes are broadcast to whoever has joined the chat's room. Adding
+// a new event type means adding it here - the hub logs and drops anything it
+// has no rule for, rather than failing silently.
+var roomScopedTypes = map[string]bool{
+	"message":         true,
+	"typing":          true,
+	"read":            true,
+	"message:deleted": true,
+}
+
 // Run starts the Hub event loop
 func (h *Hub) Run() {
 	for {
@@ -127,34 +137,34 @@ func (h *Hub) Run() {
 						close(client.Send)
 					}
 				}
-			} else {
-				for _, client := range h.Clients {
-					if wsMsg.Type == "message" || wsMsg.Type == "typing" || wsMsg.Type == "read" {
-						if wsMsg.Data != nil {
-							data := wsMsg.Data.(map[string]interface{})
-							chatID, _ := data["chat_id"].(string)
-							chatType, _ := data["chat_type"].(string)
-
-							if chatType == "direct" {
-								if client.Rooms[chatID] {
-									select {
-									case client.Send <- message:
-									default:
-										close(client.Send)
-									}
-								}
-							} else if chatType == "group" {
-								if client.Rooms[chatID] {
-									select {
-									case client.Send <- message:
-									default:
-										close(client.Send)
-									}
-								}
+			} else if roomScopedTypes[wsMsg.Type] {
+				// Routed purely on room membership.
+				//
+				// This used to branch on chat_type into "direct" and "group"
+				// arms that did exactly the same thing, which achieved nothing
+				// except silently dropping any event whose payload happened to
+				// omit chat_type. Membership of the chat's room is already the
+				// only thing that decides who should receive it.
+				if wsMsg.Data != nil {
+					if data, ok := wsMsg.Data.(map[string]interface{}); ok {
+						chatID, _ := data["chat_id"].(string)
+						for _, client := range h.Clients {
+							if !client.Rooms[chatID] {
+								continue
+							}
+							select {
+							case client.Send <- message:
+							default:
+								close(client.Send)
 							}
 						}
 					}
 				}
+			} else {
+				// An unroutable type is a bug, not a no-op: it means a feature
+				// pushed an event that will never be delivered. message:deleted
+				// spent its first outing being dropped here.
+				log.Printf("hub: no routing rule for broadcast type %q - dropped", wsMsg.Type)
 			}
 			h.mu.RUnlock()
 		}

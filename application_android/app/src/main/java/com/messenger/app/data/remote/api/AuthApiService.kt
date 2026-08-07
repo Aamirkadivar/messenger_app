@@ -80,6 +80,20 @@ interface ChatApiService {
         @Path("chatId") chatId: String
     ): Response<Unit>
 
+    /**
+     * Removes a message. forEveryone retracts it for both sides and the
+     * server only permits it on your own messages; otherwise the server
+     * records this account in the message's deleted_for list, so it
+     * disappears here while the other participant keeps their copy.
+     */
+    @DELETE("messages/{chatId}/{messageId}")
+    suspend fun deleteMessage(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Path("messageId") messageId: String,
+        @Query("for_everyone") forEveryone: Boolean
+    ): Response<Unit>
+
     @POST("chats/{chatId}/read")
     suspend fun markAsRead(
         @Header("Authorization") token: String,
@@ -104,6 +118,22 @@ interface ChatApiService {
     @Multipart
     @POST("messages/attachment")
     suspend fun uploadAttachment(
+        @Header("Authorization") token: String,
+        @Part file: MultipartBody.Part
+    ): Response<Map<String, kotlinx.serialization.json.JsonElement>>
+
+    /** Opaque (usually encrypted) round video message. Returns {"file_url": ..., "file_size": ...}. */
+    @Multipart
+    @POST("messages/video-note")
+    suspend fun uploadVideoNote(
+        @Header("Authorization") token: String,
+        @Part file: MultipartBody.Part
+    ): Response<Map<String, kotlinx.serialization.json.JsonElement>>
+
+    /** A round video's poster frame. Returns {"thumbnail_url": ...}. */
+    @Multipart
+    @POST("messages/video-thumb")
+    suspend fun uploadVideoThumb(
         @Header("Authorization") token: String,
         @Part file: MultipartBody.Part
     ): Response<Map<String, kotlinx.serialization.json.JsonElement>>

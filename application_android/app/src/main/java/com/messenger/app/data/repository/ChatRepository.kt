@@ -64,6 +64,9 @@ class ChatRepository(
         /** content_type marking a message as a generic file attachment. */
         const val FILE_CONTENT_TYPE = "file"
 
+        /** Telegram-style round video message. */
+        const val VIDEO_NOTE_CONTENT_TYPE = "video_note"
+
         /** Parses a server ISO-8601 timestamp to epoch millis for local storage/ordering. */
         private fun parseTimestamp(iso: String?): Long =
             try {
@@ -219,18 +222,45 @@ class ChatRepository(
     }
 
     /**
-     * Encrypts binary content (voice notes) for a chat, or null when we have no
-     * key for it - notably group chats, where the pairwise scheme doesn't apply.
-     * Callers must treat null as "this will be sent in the clear".
+     * Result of [encryptBytesFor]: sealed payload plus the Sender Key version
+     * used for a group (0 for direct crypto_box). Callers must treat null as
+     * "this will be sent in the clear".
      */
-    suspend fun encryptBytesFor(chatId: String, plain: ByteArray): ByteArray? {
+    data class SealedBytes(val bytes: ByteArray, val keyVersion: Int = 0)
+
+    /**
+     * Encrypts binary content (voice / attachment / round video) for a chat.
+     * Direct chats use pairwise crypto_box; groups use the sender's current
+     * Sender Key (same secretbox as group text, but raw bytes for the upload).
+     * [token] is needed so a stale/missing group key can be (re)distributed.
+     */
+    suspend fun encryptBytesFor(token: String, chatId: String, plain: ByteArray): SealedBytes? {
+        if (chatTypeMap[chatId].equals("group", ignoreCase = true)) {
+            val state = ensureGroupSenderKeyReady(token, chatId) ?: return null
+            val cipher = E2ECrypto.secretBoxEncryptBytes(plain, state.keyHex) ?: return null
+            return SealedBytes(cipher, state.version)
+        }
         val otherPub = chatOtherPub[chatId] ?: return null
         val priv = myPriv() ?: return null
-        return E2ECrypto.encryptBytes(plain, otherPub, priv)
+        val cipher = E2ECrypto.encryptBytes(plain, otherPub, priv) ?: return null
+        return SealedBytes(cipher, 0)
     }
 
-    /** Decrypts binary content produced by [encryptBytesFor]. */
-    suspend fun decryptBytesFor(chatId: String, payload: ByteArray): ByteArray? {
+    /**
+     * Decrypts binary content produced by [encryptBytesFor]. For a group,
+     * [senderId] and [keyVersion] select whose Sender Key sealed the blob
+     * (same lookup as [decryptFor] for text).
+     */
+    suspend fun decryptBytesFor(
+        chatId: String,
+        payload: ByteArray,
+        senderId: String = "",
+        keyVersion: Int = 0
+    ): ByteArray? {
+        if (chatTypeMap[chatId].equals("group", ignoreCase = true)) {
+            val keyHex = groupSenderKeyFor(chatId, senderId, keyVersion) ?: return null
+            return E2ECrypto.secretBoxDecryptBytes(payload, keyHex)
+        }
         val otherPub = chatOtherPub[chatId] ?: return null
         val priv = myPriv() ?: return null
         return E2ECrypto.decryptBytes(payload, otherPub, priv)
@@ -533,7 +563,8 @@ class ChatRepository(
         chatType: String,
         fileUrl: String,
         durationMs: Long,
-        encrypted: Boolean
+        encrypted: Boolean,
+        keyVersion: Int = 0
     ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.sendMessage(
@@ -549,7 +580,8 @@ class ChatRepository(
                     encrypted = encrypted,
                     fileUrl = fileUrl,
                     fileType = VOICE_CONTENT_TYPE,
-                    durationMs = durationMs
+                    durationMs = durationMs,
+                    keyVersion = keyVersion
                 )
             )
             if (response.isSuccessful && response.body() != null) {
@@ -565,10 +597,56 @@ class ChatRepository(
     }
 
     /**
+     * Posts a round video message. The video and its poster frame are already
+     * uploaded (see RoundVideoRepository); this records the pointers plus the
+     * duration, so a bubble can be laid out before anything is downloaded.
+     */
+    suspend fun sendVideoNoteMessage(
+        token: String,
+        chatId: String,
+        chatType: String,
+        fileUrl: String,
+        thumbnailUrl: String,
+        durationMs: Long,
+        encrypted: Boolean,
+        keyVersion: Int = 0
+    ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
+        try {
+            val response = chatApiService.sendMessage(
+                bearer(token),
+                SendMessageRequest(
+                    chatId = chatId,
+                    chatType = chatType,
+                    // Same as a voice note: the bubble renders from file_url, and
+                    // a client that does not understand round videos shows
+                    // nothing rather than a bogus blob of text.
+                    content = "",
+                    contentType = VIDEO_NOTE_CONTENT_TYPE,
+                    encrypted = encrypted,
+                    fileUrl = fileUrl,
+                    fileType = VIDEO_NOTE_CONTENT_TYPE,
+                    durationMs = durationMs,
+                    thumbnailUrl = thumbnailUrl,
+                    keyVersion = keyVersion
+                )
+            )
+            if (response.isSuccessful && response.body() != null) {
+                Result.success(response.body()!!.data)
+            } else {
+                if (response.code() == 401) Result.failure(SessionExpiredException())
+                else Result.failure(Exception("Failed to send video message: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "sendVideoNoteMessage error", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
      * Posts a generic file/image attachment message. The file itself is
      * already uploaded (see AttachmentRepository); this records the pointer
-     * plus display metadata (name/size). Not sender-keyed even in a group -
-     * see AttachmentRepository's note on why group attachments aren't E2EE yet.
+     * plus display metadata (name/size). Group attachments use Sender Keys
+     * the same way group text/voice do ([keyVersion] non-zero).
      */
     suspend fun sendAttachmentMessage(
         token: String,
@@ -578,7 +656,8 @@ class ChatRepository(
         fileName: String,
         fileSize: Long,
         contentType: String,
-        encrypted: Boolean
+        encrypted: Boolean,
+        keyVersion: Int = 0
     ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.sendMessage(
@@ -592,7 +671,8 @@ class ChatRepository(
                     fileUrl = fileUrl,
                     fileType = contentType,
                     fileName = fileName,
-                    fileSize = fileSize
+                    fileSize = fileSize,
+                    keyVersion = keyVersion
                 )
             )
             if (response.isSuccessful && response.body() != null) {
@@ -745,6 +825,64 @@ class ChatRepository(
         runCatching {
             conversationDao.getAllConversations().filter { it.isMuted }.map { it.id }.toSet()
         }.getOrDefault(emptySet())
+    }
+
+    /**
+     * Removes a message. [forEveryone] retracts it for both sides and is only
+     * permitted on your own messages; otherwise it disappears from this
+     * account's view alone (the server records it in deleted_for).
+     *
+     * The local Room row goes too, or the message reappears from cache on the
+     * next cold start, before any network refresh can correct it.
+     */
+    suspend fun deleteMessage(
+        token: String,
+        chatId: String,
+        messageId: String,
+        forEveryone: Boolean
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val response = chatApiService.deleteMessage(bearer(token), chatId, messageId, forEveryone)
+            if (!response.isSuccessful) {
+                return@withContext if (response.code() == 401) Result.failure(SessionExpiredException())
+                else Result.failure(Exception("Failed to delete message: ${response.code()}"))
+            }
+            messageDao.deleteMessage(messageId)
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "deleteMessage error", e)
+            Result.failure(e)
+        }
+    }
+
+    /** Retractions pushed by the server when someone deletes for everyone. */
+    val deletedMessages = webSocketManager.deletedMessages
+
+    /** Drops a locally cached message, for a retraction that arrived over the socket. */
+    suspend fun removeCachedMessage(messageId: String) = withContext(Dispatchers.IO) {
+        runCatching { messageDao.deleteMessage(messageId) }
+    }
+
+    /**
+     * Decrypted preview text for the newest remaining message in [chatId], or
+     * empty if the chat has none left. Used to refresh the chat-list preview
+     * after a delete without waiting for a full getChats() round-trip.
+     */
+    suspend fun latestMessagePreview(chatId: String): String = withContext(Dispatchers.IO) {
+        val latest = runCatching { messageDao.getLatestMessage(chatId) }.getOrNull() ?: return@withContext ""
+        when (latest.fileType) {
+            VOICE_CONTENT_TYPE -> "🎤 Voice message"
+            IMAGE_CONTENT_TYPE -> "📷 Photo"
+            FILE_CONTENT_TYPE -> "📎 ${latest.fileName?.takeIf { it.isNotBlank() } ?: "File"}"
+            VIDEO_NOTE_CONTENT_TYPE -> "📹 Video message"
+            else -> decryptFor(
+                chatId,
+                latest.encryptedContent ?: latest.content,
+                latest.isEncrypted,
+                latest.senderId,
+                latest.keyVersion
+            )
+        }
     }
 
     /** Whether one conversation is muted. Used to suppress its notifications. */

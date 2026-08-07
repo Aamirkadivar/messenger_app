@@ -84,7 +84,7 @@ class CallForegroundService : Service() {
                     stopSelf()
                 } else {
                     if (state.status == CallStatus.INCOMING_RINGING) startRinging() else stopRinging()
-                    startForegroundCompat(buildNotification(state), state.status)
+                    startForegroundCompat(buildNotification(state), state)
                 }
             }
             .launchIn(scope)
@@ -112,13 +112,30 @@ class CallForegroundService : Service() {
         ringer.stop()
     }
 
-    private fun startForegroundCompat(notification: Notification, status: CallStatus) {
+    private fun startForegroundCompat(notification: Notification, state: CallUiState) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             // An unanswered incoming call has no audio yet; declaring
             // phoneCall before the mic is live is what the type is for, but
             // Android 14 requires the microphone type only once we're actually
-            // capturing, so phoneCall is used throughout.
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
+            // capturing, so phoneCall is used throughout. The camera type is
+            // added only once a video call's camera is actually live - it
+            // keeps capture alive if the app is backgrounded mid-call, and
+            // Android 14 forbids declaring it from the background (which is
+            // exactly what the incoming-ringing start is).
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+            if (state.isVideoCall && state.isCameraOn &&
+                state.status != CallStatus.INCOMING_RINGING
+            ) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
+            try {
+                startForeground(NOTIFICATION_ID, notification, types)
+            } catch (e: SecurityException) {
+                // Camera type can be rejected (e.g. while-in-use permission
+                // edge cases); a call notification without it is still better
+                // than no foreground service at all.
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
+            }
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }

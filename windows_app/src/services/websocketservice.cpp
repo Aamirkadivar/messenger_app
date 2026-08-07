@@ -195,11 +195,15 @@ void WebSocketService::onTextMessageReceived(const QString& message) {
         QString userId = data[QStringLiteral("user_id")].toString();
         bool online = data[QStringLiteral("is_online")].toBool(false);
         emit presenceChanged(userId, online);
+    } else if (type == QStringLiteral("message:deleted")) {
+        emit messageDeletedRemotely(data[QStringLiteral("chat_id")].toString(),
+                                    data[QStringLiteral("message_id")].toString());
     } else if (type == QStringLiteral("error")) {
         emit errorOccurred(data[QStringLiteral("error")].toString());
-    } else if (type == QStringLiteral("call:invite") || type == QStringLiteral("call:answer") ||
-               type == QStringLiteral("call:ice_candidate") || type == QStringLiteral("call:reject") ||
-               type == QStringLiteral("call:end")) {
+    } else if (type.startsWith(QStringLiteral("call:"))) {
+        // Pairwise (invite/answer/ICE/…) and group session (group_invite/join/leave)
+        // signals both carry optional group_call_id / participant_ids; CallService
+        // decides how to route. toVariantMap preserves JSON arrays as QVariantList.
         emit callSignalReceived(type, data.toVariantMap());
     }
 }

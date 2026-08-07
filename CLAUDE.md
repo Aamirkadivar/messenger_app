@@ -63,11 +63,19 @@ on every membership change) is the rotation signal; `Message.KeyVersion` records
 which key encrypted a message. Wire formats must match byte-for-byte across all
 three clients — hex(`nonce||ciphertext`) for text, raw bytes for binary.
 
-**Calls.** 1:1 audio. Android uses Google WebRTC (`io.github.webrtc-sdk`);
-Windows uses **libdatachannel + libopus**, because no official WebRTC build
-exists for MinGW — so Windows hand-rolls Opus encode/decode and RTP
-packetization that Android gets for free. Only SDP/ICE crosses the server;
-media is DTLS-SRTP peer-to-peer.
+**Calls.** 1:1 and group (max 4, full mesh) audio and video. Android
+uses Google WebRTC (`io.github.webrtc-sdk`); Windows uses **libdatachannel +
+libopus + libvpx**, because no official WebRTC build exists for MinGW — so
+Windows hand-rolls Opus/VP8 encode/decode and RTP packetization (RFC 7741 for
+VP8, in `videocallengine.cpp`) that Android gets for free. Group calls reuse
+pairwise SDP/ICE under `group_call_id`, orchestrated by `call:group_invite` /
+`join` / `leave` (server fans those out; media stays P2P). Windows group video
+encodes VP8 once and fans RTP to each peer. VP8 is the video codec because
+it's the one Android's prebuilt WebRTC always has (software libvpx fallback);
+H.264 is device-dependent. Video-ness is fixed at invite time (`"video": true`
+on invite; no mid-call renegotiation); camera on/off mid-call is signaled via
+the relayed `call:media` type. Only SDP/ICE crosses the server; media is
+DTLS-SRTP peer-to-peer.
 
 **Realtime.** One WebSocket hub (`back-end/websocket/`). Clients must `join` a
 chat room to receive its messages. `call:*` types are relayed 1:1 rather than
@@ -194,6 +202,8 @@ theories.
   `turnserver.conf`). Calls work on a LAN; users behind different NATs need
   TURN. `TURN_HOST` still defaults to `localhost`, which is unreachable from a
   phone.
-- Group calling is not implemented — the call button is direct-chat only.
-- Group *attachments* and *voice notes* are sent unencrypted; only group text
-  uses Sender Keys.
+- Group calls are full mesh (max 4); audio and video. Video uses lower
+  capture settings on Android (480×360@15); Windows encodes VP8 once and
+  fans RTP to each peer. Cross-NAT still needs TURN (same as 1:1).
+- Video calls have no RTCP feedback loop on Windows (no NACK/PLI); recovery
+ from packet loss relies on the ~2s periodic keyframe.

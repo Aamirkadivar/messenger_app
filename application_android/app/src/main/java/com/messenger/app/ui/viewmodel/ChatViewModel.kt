@@ -14,6 +14,14 @@ import com.messenger.app.data.repository.VoiceRepository
 import com.messenger.app.data.voice.VoicePlaybackState
 import com.messenger.app.data.voice.VoicePlayer
 import com.messenger.app.data.voice.VoiceRecorder
+import com.messenger.app.data.repository.RoundVideoRepository
+import com.messenger.app.data.roundvideo.RoundRecorderState
+import com.messenger.app.data.roundvideo.RoundVideoPlayerPool
+import com.messenger.app.data.roundvideo.RoundLens
+import com.messenger.app.data.roundvideo.RoundVideoRecorder
+import com.messenger.app.ui.components.CaptureMode
+import com.messenger.app.ui.components.RoundVideoUiState
+import androidx.media3.exoplayer.ExoPlayer
 import com.messenger.app.security.TokenManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
@@ -21,6 +29,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
@@ -53,10 +65,18 @@ data class ChatMessageUi(
     val attachmentName: String = "",
     val attachmentSize: Long = 0,
     val attachmentEncrypted: Boolean = false,
-    val isImageAttachment: Boolean = false
+    val isImageAttachment: Boolean = false,
+    /** Non-null for a Telegram-style round video; the bubble renders a circle. */
+    val videoUrl: String? = null,
+    val videoThumbnailUrl: String? = null,
+    val videoDurationMs: Long = 0,
+    val videoEncrypted: Boolean = false,
+    /** Sender Key version for group media decrypt; 0 for direct / cleartext. */
+    val keyVersion: Int = 0
 ) {
     val isVoice: Boolean get() = !voiceUrl.isNullOrBlank()
     val isAttachment: Boolean get() = !attachmentUrl.isNullOrBlank()
+    val isVideoNote: Boolean get() = !videoUrl.isNullOrBlank()
     val isSystem: Boolean get() = messageKind == "system"
 }
 
@@ -100,6 +120,20 @@ data class RecordingUiState(
     val amplitude: Float = 0f
 )
 
+/** Composer capture state: which mode, and how a press-and-hold is going. */
+data class CaptureUiState(
+    val mode: CaptureMode = CaptureMode.VOICE,
+    /** True while the round-video overlay is up. */
+    val videoActive: Boolean = false,
+    val isLocked: Boolean = false,
+    val dragX: Float = 0f,
+    val dragY: Float = 0f,
+    val willCancel: Boolean = false,
+    val willLock: Boolean = false,
+    /** Human-readable progress while a recorded video is compressed and uploaded. */
+    val sendStatus: String? = null
+)
+
 data class ChatListUiState(
     val chats: List<ChatListItemUi> = emptyList(),
     val isLoading: Boolean = false,
@@ -113,6 +147,9 @@ class ChatViewModel @Inject constructor(
     private val attachmentRepository: AttachmentRepository,
     private val voiceRecorder: VoiceRecorder,
     private val voicePlayer: VoicePlayer,
+    private val roundVideoRecorder: RoundVideoRecorder,
+    private val roundVideoRepository: RoundVideoRepository,
+    private val playerPool: RoundVideoPlayerPool,
     private val tokenManager: TokenManager
 ) : ViewModel() {
 
@@ -282,17 +319,29 @@ class ChatViewModel @Inject constructor(
         // pushed to whichever chat room is currently joined.
         chatRepository.connectRealtime()
 
+        // A message retracted for everyone must vanish here too, rather than
+        // sitting on screen until the next refetch - and the chat-list preview
+        // has to follow, or deleting the last message leaves a stale snippet.
+        chatRepository.deletedMessages
+            .onEach { deleted ->
+                chatRepository.removeCachedMessage(deleted.messageId)
+                removeMessageLocally(deleted.messageId, deleted.chatId)
+            }
+            .launchIn(viewModelScope)
+
         chatRepository.incomingMessages
             .onEach { incoming ->
                 val myId = resolveCurrentUserId()
                 if (incoming.senderId == myId) return@onEach // our own echo, already shown optimistically
 
                 val isVoice = incoming.contentType == ChatRepository.VOICE_CONTENT_TYPE && !incoming.fileUrl.isNullOrBlank()
-                val isAttachment = !isVoice &&
+                val isVideoNote = incoming.contentType == ChatRepository.VIDEO_NOTE_CONTENT_TYPE &&
+                    !incoming.fileUrl.isNullOrBlank()
+                val isAttachment = !isVoice && !isVideoNote &&
                     (incoming.contentType == ChatRepository.IMAGE_CONTENT_TYPE || incoming.contentType == ChatRepository.FILE_CONTENT_TYPE) &&
                     !incoming.fileUrl.isNullOrBlank()
 
-                var text = if (isVoice || isAttachment) {
+                var text = if (isVoice || isAttachment || isVideoNote) {
                     ""
                 } else {
                     chatRepository.decryptFor(incoming.chatId, incoming.content, incoming.encrypted, incoming.senderId, incoming.keyVersion)
@@ -300,7 +349,7 @@ class ChatViewModel @Inject constructor(
                 // A group message can arrive for a Sender Key we haven't fetched yet
                 // (e.g. it rotated after we last synced) - one retry after a refetch
                 // covers that without hammering the server on every message.
-                if (!isVoice && !isAttachment && incoming.encrypted && text == ChatRepository.ENCRYPTED_PLACEHOLDER &&
+                if (!isVoice && !isAttachment && !isVideoNote && incoming.encrypted && text == ChatRepository.ENCRYPTED_PLACEHOLDER &&
                     chatRepository.chatTypeFor(incoming.chatId).equals("group", ignoreCase = true)
                 ) {
                     tokenManager.getAccessToken().getOrNull()?.let { token ->
@@ -326,7 +375,11 @@ class ChatViewModel @Inject constructor(
                         attachmentName = if (isAttachment) incoming.fileName ?: "" else "",
                         attachmentSize = incoming.fileSize,
                         attachmentEncrypted = isAttachment && incoming.encrypted,
-                        isImageAttachment = isAttachment && incoming.contentType == ChatRepository.IMAGE_CONTENT_TYPE
+                        isImageAttachment = isAttachment && incoming.contentType == ChatRepository.IMAGE_CONTENT_TYPE,
+                        videoUrl = if (isVideoNote) incoming.fileUrl else null,
+                        videoDurationMs = if (isVideoNote) incoming.durationMs else 0,
+                        videoEncrypted = isVideoNote && incoming.encrypted,
+                        keyVersion = incoming.keyVersion
                     )
                     _chatState.update { it.copy(messages = it.messages + message) }
                 } else {
@@ -477,7 +530,9 @@ class ChatViewModel @Inject constructor(
     private suspend fun toChatMessageUi(chatId: String, dto: MessageDto, myId: String): ChatMessageUi {
         val isMine = dto.senderId == myId
         val isVoice = dto.fileType == ChatRepository.VOICE_CONTENT_TYPE && !dto.fileUrl.isNullOrBlank()
-        val isAttachment = !isVoice &&
+        val isVideoNote = dto.fileType == ChatRepository.VIDEO_NOTE_CONTENT_TYPE &&
+            !dto.fileUrl.isNullOrBlank()
+        val isAttachment = !isVoice && !isVideoNote &&
             (dto.fileType == ChatRepository.IMAGE_CONTENT_TYPE || dto.fileType == ChatRepository.FILE_CONTENT_TYPE) &&
             !dto.fileUrl.isNullOrBlank()
         return ChatMessageUi(
@@ -487,7 +542,7 @@ class ChatViewModel @Inject constructor(
                 ?: dto.sender?.username ?: "",
             // A voice note/attachment has no text body; decrypting the empty
             // content would just yield the "encrypted" placeholder.
-            content = if (isVoice || isAttachment) "" else {
+            content = if (isVoice || isAttachment || isVideoNote) "" else {
                 chatRepository.decryptFor(chatId, dto.content, dto.encrypted, dto.senderId, dto.keyVersion)
             },
             timestamp = parseMessageTimestamp(dto.createdAt),
@@ -500,7 +555,12 @@ class ChatViewModel @Inject constructor(
             attachmentName = if (isAttachment) dto.fileName ?: "" else "",
             attachmentSize = dto.fileSize,
             attachmentEncrypted = isAttachment && dto.encrypted,
-            isImageAttachment = isAttachment && dto.fileType == ChatRepository.IMAGE_CONTENT_TYPE
+            isImageAttachment = isAttachment && dto.fileType == ChatRepository.IMAGE_CONTENT_TYPE,
+            videoUrl = if (isVideoNote) dto.fileUrl else null,
+            videoThumbnailUrl = if (isVideoNote) dto.thumbnailUrl else null,
+            videoDurationMs = if (isVideoNote) dto.durationMs else 0,
+            videoEncrypted = isVideoNote && dto.encrypted,
+            keyVersion = dto.keyVersion
         )
     }
 
@@ -663,7 +723,8 @@ class ChatViewModel @Inject constructor(
                         fileName = picked.name,
                         fileSize = uploaded.fileSize,
                         contentType = contentType,
-                        encrypted = uploaded.encrypted
+                        encrypted = uploaded.encrypted,
+                        keyVersion = uploaded.keyVersion
                     )
                         .onSuccess {
                             _chatState.update { it.copy(isSending = false) }
@@ -689,7 +750,8 @@ class ChatViewModel @Inject constructor(
         val chatId = _chatState.value.chatId ?: return null
         val url = message.attachmentUrl ?: return null
         return attachmentRepository.fetchForView(
-            chatId, message.id, url, message.attachmentName, message.attachmentEncrypted
+            chatId, message.id, url, message.attachmentName, message.attachmentEncrypted,
+            message.senderId, message.keyVersion
         ).getOrNull()
     }
 
@@ -710,6 +772,8 @@ class ChatViewModel @Inject constructor(
             return
         }
         _recording.value = RecordingUiState(isRecording = true)
+        // A new take always starts unlocked, whichever way the last one ended.
+        _capture.update { it.copy(isLocked = false, dragX = 0f, dragY = 0f, willCancel = false, willLock = false) }
         tickJob?.cancel()
         tickJob = viewModelScope.launch {
             while (voiceRecorder.isRecording) {
@@ -724,11 +788,22 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Slide-up-to-lock for a voice note: the mic stays open after the finger
+     * lifts, and the composer button turns into Send.
+     */
+    fun lockVoiceRecording() {
+        _capture.update {
+            it.copy(isLocked = true, dragX = 0f, dragY = 0f, willLock = false, willCancel = false)
+        }
+    }
+
     /** Discards the recording without sending. */
     fun cancelRecording() {
         tickJob?.cancel()
         voiceRecorder.cancel()
         _recording.value = RecordingUiState()
+        _capture.update { it.copy(isLocked = false) }
     }
 
     /** Stops, encrypts, uploads and posts the voice note. */
@@ -737,6 +812,7 @@ class ChatViewModel @Inject constructor(
         val chatId = _chatState.value.chatId
         val result = voiceRecorder.stop()
         _recording.value = RecordingUiState()
+        _capture.update { it.copy(isLocked = false) }
 
         if (chatId == null) return
         if (result == null) {
@@ -762,7 +838,8 @@ class ChatViewModel @Inject constructor(
                         chatType = _chatState.value.chatType,
                         fileUrl = uploaded.fileUrl,
                         durationMs = result.durationMs,
-                        encrypted = uploaded.encrypted
+                        encrypted = uploaded.encrypted,
+                        keyVersion = uploaded.keyVersion
                     )
                         .onSuccess {
                             _chatState.update { it.copy(isSending = false) }
@@ -783,6 +860,372 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    // ==================== Round video messages ====================
+
+    private val _capture = MutableStateFlow(CaptureUiState())
+    val capture: StateFlow<CaptureUiState> = _capture.asStateFlow()
+
+    /** Live camera/recorder state, straight from the recorder module. */
+    val recorderState: StateFlow<RoundRecorderState> = roundVideoRecorder.state
+
+    /** Per-message playback state, keyed by message id. */
+    private val _videoStates = MutableStateFlow<Map<String, RoundVideoUiState>>(emptyMap())
+    val videoStates: StateFlow<Map<String, RoundVideoUiState>> = _videoStates.asStateFlow()
+
+    /** The one borrowed player, held by whichever bubble is active. */
+    private val _activePlayer = MutableStateFlow<ExoPlayer?>(null)
+    val activePlayer: StateFlow<ExoPlayer?> = _activePlayer.asStateFlow()
+    private var activeVideoId: String? = null
+    private var videoTicker: Job? = null
+
+    fun toggleCaptureMode() {
+        _capture.update {
+            it.copy(mode = if (it.mode == CaptureMode.VOICE) CaptureMode.VIDEO else CaptureMode.VOICE)
+        }
+    }
+
+    /** Binds the overlay's PreviewView to the camera. */
+    fun bindVideoPreview(
+        owner: androidx.lifecycle.LifecycleOwner,
+        provider: androidx.camera.core.Preview.SurfaceProvider
+    ) {
+        viewModelScope.launch { roundVideoRecorder.bindPreview(owner, provider) }
+    }
+
+    fun flipCamera() = roundVideoRecorder.switchCamera()
+
+    /** Pause/resume a locked video take without ending it. */
+    fun toggleVideoPause() = roundVideoRecorder.togglePause()
+
+    /** Long-press began: show the overlay and start capturing. */
+    fun startVideoRecording() {
+        if (_chatState.value.chatId == null) return
+        _capture.update { it.copy(videoActive = true, isLocked = false, dragX = 0f, dragY = 0f) }
+        // The camera needs a moment to bind before the encoder will accept
+        // frames; starting immediately produces a zero-length take.
+        viewModelScope.launch {
+            delay(180)
+            if (_capture.value.videoActive && !roundVideoRecorder.start()) {
+                _capture.update { it.copy(videoActive = false) }
+                _chatState.update { it.copy(error = "Could not start the camera") }
+            }
+        }
+    }
+
+    fun onCaptureDrag(x: Float, y: Float) = _capture.update { it.copy(dragX = x, dragY = y) }
+    fun onArmCancel(armed: Boolean) = _capture.update { it.copy(willCancel = armed) }
+    fun onArmLock(armed: Boolean) = _capture.update { it.copy(willLock = armed) }
+
+    /**
+     * Finger lifted. Locked wins over cancel: someone who slid up to go
+     * hands-free has already committed to keeping the take.
+     */
+    fun onCaptureRelease(cancelled: Boolean, locked: Boolean) {
+        when {
+            locked -> _capture.update {
+                it.copy(isLocked = true, dragX = 0f, dragY = 0f, willLock = false, willCancel = false)
+            }
+            cancelled -> cancelVideoRecording()
+            else -> stopVideoRecordingAndSend()
+        }
+    }
+
+    fun cancelVideoRecording() {
+        roundVideoRecorder.cancel()
+        roundVideoRecorder.release()
+        _capture.value = CaptureUiState(mode = _capture.value.mode)
+    }
+
+    /** Stops, compresses, encrypts, uploads and posts the round video. */
+    fun stopVideoRecordingAndSend() {
+        val chatId = _chatState.value.chatId
+        // Close the overlay straight away - the container still has to be
+        // finalised, and leaving the camera up during that reads as a freeze.
+        _capture.value = CaptureUiState(mode = _capture.value.mode)
+
+        viewModelScope.launch {
+            // Must await finalisation *before* release(): release() tears the
+            // camera down, and the file is not a valid MP4 until CameraX has
+            // closed it.
+            val file = roundVideoRecorder.stopAndAwait()
+            roundVideoRecorder.release()
+
+            if (chatId == null) return@launch
+            if (file == null) {
+                _chatState.update { it.copy(error = "Hold to record - that was too short") }
+                return@launch
+            }
+
+            _chatState.update { it.copy(isSending = true) }
+            val token = tokenManager.getAccessToken().getOrNull()
+            if (token.isNullOrEmpty()) {
+                _chatState.update { it.copy(isSending = false, error = "Not signed in") }
+                return@launch
+            }
+
+            roundVideoRepository.prepareAndUpload(token, chatId, file) { stage ->
+                val label = when (stage) {
+                    is RoundVideoRepository.SendStage.Compressing ->
+                        "Compressing ${(stage.fraction * 100).toInt()}%"
+                    is RoundVideoRepository.SendStage.Uploading ->
+                        "Uploading ${(stage.fraction * 100).toInt()}%"
+                    RoundVideoRepository.SendStage.Finishing -> "Finishing"
+                }
+                _capture.update { it.copy(sendStatus = label) }
+            }
+                .onSuccess { prepared ->
+                    chatRepository.sendVideoNoteMessage(
+                        token = token,
+                        chatId = chatId,
+                        chatType = _chatState.value.chatType,
+                        fileUrl = prepared.fileUrl,
+                        thumbnailUrl = prepared.thumbnailUrl,
+                        durationMs = prepared.durationMs,
+                        encrypted = prepared.encrypted,
+                        keyVersion = prepared.keyVersion
+                    )
+                        .onSuccess {
+                            _capture.update { it.copy(sendStatus = null) }
+                            _chatState.update { it.copy(isSending = false) }
+                            openChat(chatId, _chatState.value.chatName)
+                        }
+                        .onFailure { e ->
+                            _capture.update { it.copy(sendStatus = null) }
+                            _chatState.update {
+                                it.copy(isSending = false, error = e.message ?: "Failed to send")
+                            }
+                        }
+                }
+                .onFailure { e ->
+                    Log.e(TAG, "video note upload failed", e)
+                    _capture.update { it.copy(sendStatus = null) }
+                    _chatState.update {
+                        it.copy(isSending = false, error = e.message ?: "Failed to send video message")
+                    }
+                }
+        }
+    }
+
+    /**
+     * Fetches a round video's poster frame so its bubble is never an empty
+     * circle. Small enough to do for every video message on screen.
+     */
+    fun ensureVideoThumbnail(message: ChatMessageUi) {
+        val chatId = _chatState.value.chatId ?: return
+        val thumbUrl = message.videoThumbnailUrl
+        if (thumbUrl.isNullOrBlank()) return
+        if (_videoStates.value[message.id]?.thumbnailPath != null) return
+
+        viewModelScope.launch {
+            roundVideoRepository.fetchThumbnail(
+                chatId, message.id, thumbUrl, message.videoEncrypted,
+                message.senderId, message.keyVersion
+            )
+                .onSuccess { f -> updateVideo(message.id) { it.copy(thumbnailPath = f.absolutePath) } }
+        }
+    }
+
+    /** Tap on a round bubble: download if needed, then play or pause. */
+    fun toggleVideoPlayback(message: ChatMessageUi) {
+        val chatId = _chatState.value.chatId ?: return
+        val url = message.videoUrl ?: return
+
+        if (activeVideoId == message.id) {
+            val player = _activePlayer.value ?: return
+            if (player.isPlaying) player.pause() else player.play()
+            updateVideo(message.id) { it.copy(isPlaying = player.isPlaying) }
+            return
+        }
+
+        // Switching bubbles: hand the previous one's player back first, so two
+        // hardware decoders are never held at once.
+        releaseActiveVideo()
+
+        viewModelScope.launch {
+            updateVideo(message.id) {
+                it.copy(isDownloading = true, durationMs = message.videoDurationMs)
+            }
+            roundVideoRepository.fetchForPlayback(
+                chatId, message.id, url, message.videoEncrypted,
+                message.senderId, message.keyVersion
+            ) { f -> updateVideo(message.id) { it.copy(downloadProgress = f) } }
+                .onSuccess { file ->
+                    val player = playerPool.acquire()
+                    playerPool.prepareLooping(player, file, muted = false)
+                    player.play()
+                    activeVideoId = message.id
+                    _activePlayer.value = player
+                    playerPool.setActive(message.id)
+                    updateVideo(message.id) { it.copy(isDownloading = false, isPlaying = true) }
+                    startVideoTicker()
+                }
+                .onFailure { e ->
+                    updateVideo(message.id) { it.copy(isDownloading = false, error = e.message) }
+                    _chatState.update { it.copy(error = e.message ?: "Could not play video message") }
+                }
+        }
+    }
+
+    /** Drag-around-the-ring seek, as a 0..1 fraction. */
+    fun seekVideo(messageId: String, fraction: Float) {
+        if (activeVideoId != messageId) return
+        val player = _activePlayer.value ?: return
+        val duration = player.duration.takeIf { it > 0 } ?: return
+        player.seekTo((duration * fraction).toLong())
+    }
+
+    private fun startVideoTicker() {
+        videoTicker?.cancel()
+        videoTicker = viewModelScope.launch {
+            while (_activePlayer.value != null) {
+                val player = _activePlayer.value ?: break
+                val id = activeVideoId ?: break
+                updateVideo(id) {
+                    it.copy(
+                        positionMs = player.currentPosition,
+                        durationMs = player.duration.takeIf { d -> d > 0 } ?: it.durationMs,
+                        isPlaying = player.isPlaying
+                    )
+                }
+                delay(80)
+            }
+        }
+    }
+
+    fun releaseActiveVideo() {
+        videoTicker?.cancel()
+        videoTicker = null
+        _activePlayer.value?.let { playerPool.release(it) }
+        _activePlayer.value = null
+        activeVideoId?.let { id -> updateVideo(id) { it.copy(isPlaying = false, positionMs = 0) } }
+        activeVideoId = null
+        playerPool.setActive(null)
+    }
+
+    private fun updateVideo(id: String, transform: (RoundVideoUiState) -> RoundVideoUiState) {
+        _videoStates.update { map -> map + (id to transform(map[id] ?: RoundVideoUiState())) }
+    }
+
+    /**
+     * Removes a message. [forEveryone] retracts it for both sides and is only
+     * offered on your own messages; otherwise it disappears here alone.
+     *
+     * The row is dropped from the list immediately on success rather than
+     * waiting for a refetch, so the action feels like it took effect.
+     */
+    fun deleteMessage(messageId: String, forEveryone: Boolean) {
+        val chatId = _chatState.value.chatId ?: return
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull()
+            if (token.isNullOrEmpty()) {
+                _chatState.update { it.copy(error = "Not signed in") }
+                return@launch
+            }
+            chatRepository.deleteMessage(token, chatId, messageId, forEveryone)
+                .onSuccess { removeMessageLocally(messageId, chatId) }
+                .onFailure { e ->
+                    Log.e(TAG, "deleteMessage failed", e)
+                    if (e is SessionExpiredException) _sessionExpired.value = true
+                    _chatState.update { it.copy(error = e.message ?: "Could not delete message") }
+                }
+        }
+    }
+
+    /**
+     * Drops [messageId] from the open chat (when it is open) and refreshes
+     * that chat's list preview from whatever remains. [chatId] is required
+     * for remote deletions of a chat that isn't currently open.
+     */
+    private fun removeMessageLocally(messageId: String, chatId: String? = _chatState.value.chatId) {
+        if (chatId != null && chatId == _chatState.value.chatId) {
+            _chatState.update { state ->
+                state.copy(messages = state.messages.filterNot { it.id == messageId })
+            }
+            // Keep the selection honest - otherwise the counter keeps counting
+            // rows that no longer exist.
+            if (_selectedMessageIds.value.contains(messageId)) {
+                _selectedMessageIds.update { it - messageId }
+            }
+            applyChatListPreview(chatId, previewFromOpenChatMessages())
+        } else if (chatId != null) {
+            viewModelScope.launch {
+                applyChatListPreview(chatId, chatRepository.latestMessagePreview(chatId))
+            }
+        }
+    }
+
+    private fun previewFromOpenChatMessages(): String {
+        val last = _chatState.value.messages.lastOrNull { !it.isSystem } ?: return ""
+        return when {
+            last.isVoice -> "🎤 Voice message"
+            last.isVideoNote -> "📹 Video message"
+            last.isImageAttachment -> "📷 Photo"
+            last.isAttachment -> "📎 ${last.attachmentName.ifBlank { "File" }}"
+            else -> last.content
+        }
+    }
+
+    private fun applyChatListPreview(chatId: String, preview: String) {
+        _chatListState.update { listState ->
+            val idx = listState.chats.indexOfFirst { it.id == chatId }
+            if (idx == -1) return@update listState
+            val updated = listState.chats.toMutableList()
+            updated[idx] = updated[idx].copy(lastMessage = preview)
+            listState.copy(chats = updated)
+        }
+    }
+
+    // ==================== Message selection ====================
+
+    private val _selectedMessageIds = MutableStateFlow<Set<String>>(emptySet())
+    val selectedMessageIds: StateFlow<Set<String>> = _selectedMessageIds.asStateFlow()
+
+    /** Selection mode is simply "something is selected" - no separate flag to drift. */
+    val inSelectionMode: StateFlow<Boolean> = _selectedMessageIds
+        .map { it.isNotEmpty() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    /**
+     * True when every selected message is one of ours, which is the only case
+     * where "delete for everyone" is allowed. The server enforces this too;
+     * this just avoids offering an action that would be refused.
+     */
+    val allSelectedAreMine: StateFlow<Boolean> = combine(
+        _selectedMessageIds, _chatState
+    ) { ids, state ->
+        ids.isNotEmpty() && state.messages.filter { it.id in ids }.all { it.isMine }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    fun toggleMessageSelection(messageId: String) {
+        _selectedMessageIds.update { current ->
+            if (messageId in current) current - messageId else current + messageId
+        }
+    }
+
+    fun clearSelection() {
+        _selectedMessageIds.value = emptySet()
+    }
+
+    fun selectAllMessages() {
+        _selectedMessageIds.value = _chatState.value.messages
+            .filterNot { it.isSystem }
+            .map { it.id }
+            .toSet()
+    }
+
+    /**
+     * Deletes every selected message.
+     *
+     * Rows disappear as each request succeeds rather than optimistically: a
+     * failed delete should not leave a message missing here but alive on the
+     * server.
+     */
+    fun deleteSelectedMessages(forEveryone: Boolean) {
+        val ids = _selectedMessageIds.value.toList()
+        clearSelection()
+        ids.forEach { deleteMessage(it, forEveryone) }
+    }
+
     /** Play/pause a voice note, downloading and decrypting it on first play. */
     fun toggleVoicePlayback(message: ChatMessageUi) {
         val chatId = _chatState.value.chatId ?: return
@@ -795,7 +1238,10 @@ class ChatViewModel @Inject constructor(
         }
 
         viewModelScope.launch {
-            voiceRepository.fetchForPlayback(chatId, message.id, url, message.voiceEncrypted)
+            voiceRepository.fetchForPlayback(
+                chatId, message.id, url, message.voiceEncrypted,
+                message.senderId, message.keyVersion
+            )
                 .onSuccess { file ->
                     voicePlayer.toggle(message.id, file)
                     startPlaybackTicker()
@@ -826,6 +1272,11 @@ class ChatViewModel @Inject constructor(
         playbackTicker?.cancel()
         voiceRecorder.cancel()
         voicePlayer.stop()
+        // Video decoders and the camera are scarce, shared resources - holding
+        // either past the screen's lifetime starves the rest of the app.
+        releaseActiveVideo()
+        playerPool.releaseAll()
+        roundVideoRecorder.release()
     }
 
     fun setTypingStatus(isTyping: Boolean) {

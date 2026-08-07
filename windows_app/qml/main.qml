@@ -754,9 +754,11 @@ ApplicationWindow {
     // Resize handles - a frameless window has no native resize border, so we
     // provide thin edge/corner hit-regions that hand off to the OS's own
     // system resize (gets the right cursor and live edge-snapping for free).
+    // z above the call overlay: otherwise an active call swallows every edge
+    // press and the window cannot be resized until the call ends.
     Item {
         anchors.fill: parent
-        z: 1000
+        z: 3000
         visible: !appRoot.windowMaximized
         enabled: visible
 
@@ -821,11 +823,15 @@ ApplicationWindow {
         }
     }
 
-    // Full-window call overlay - sits above everything (including the resize
-    // handles) whenever a call is ringing/active, matching how a call
-    // interrupts the whole app rather than living inside chat navigation.
+    // Call overlay fills the content area under the title bar so move /
+    // minimize / maximize / close keep working. Resize edges sit above this
+    // (z: 3000). Title bar height matches the GlassPanel above (44).
     Loader {
-        anchors.fill: parent
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.top: parent.top
+        anchors.topMargin: appRoot.isLoggedIn ? 44 : 0
         z: 2000
         active: typeof callService !== "undefined" && callService.isActive
         sourceComponent: CallOverlay {

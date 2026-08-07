@@ -8,6 +8,7 @@ import org.java_websocket.drafts.Draft
 import org.java_websocket.drafts.Draft_6455
 import org.java_websocket.extensions.DefaultExtension
 import org.java_websocket.handshake.ServerHandshake
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
 
@@ -35,6 +36,12 @@ data class IncomingChatMessage(
     val keyVersion: Int = 0
 )
 
+/** Someone retracted a message for everyone. */
+data class DeletedMessage(
+    val chatId: String,
+    val messageId: String
+)
+
 data class IncomingTyping(
     val chatId: String,
     val userId: String,
@@ -56,6 +63,9 @@ data class IncomingReadReceipt(
  * carries sdp, "call:ice_candidate" carries candidate/sdpMid/sdpMLineIndex,
  * "call:reject"/"call:end" carry reason. The server fills in call_id for a
  * fresh invite if the caller didn't set one, so it's always present here.
+ * "call:invite" also carries video (whether the caller wants a video call),
+ * and "call:media" carries camera (the peer turning their camera on/off
+ * mid-call).
  */
 data class IncomingCallSignal(
     val type: String,
@@ -67,7 +77,13 @@ data class IncomingCallSignal(
     val candidate: String = "",
     val sdpMid: String = "",
     val sdpMLineIndex: Int = 0,
-    val reason: String = ""
+    val reason: String = "",
+    val video: Boolean = false,
+    val cameraOn: Boolean = true,
+    /** Shared group-session id when this pairwise signal is a mesh edge. */
+    val groupCallId: String = "",
+    /** Current roster for group_invite / group_join / group_leave. */
+    val participantIds: List<String> = emptyList()
 )
 
 // Pushed whenever any user connects/disconnects - not scoped to a chat room,
@@ -115,6 +131,10 @@ class WebSocketManager private constructor(
 
     private val _incomingMessages = MutableSharedFlow<IncomingChatMessage>(replay = 0, extraBufferCapacity = 64)
     val incomingMessages: SharedFlow<IncomingChatMessage> = _incomingMessages.asSharedFlow()
+
+    /** A message retracted for everyone; open chats drop it on the spot. */
+    private val _deletedMessages = MutableSharedFlow<DeletedMessage>(extraBufferCapacity = 16)
+    val deletedMessages = _deletedMessages.asSharedFlow()
 
     private val _typingUpdates = MutableSharedFlow<IncomingTyping>(replay = 0, extraBufferCapacity = 16)
     val typingUpdates: SharedFlow<IncomingTyping> = _typingUpdates.asSharedFlow()
@@ -245,7 +265,16 @@ class WebSocketManager private constructor(
         }
         val obj = JSONObject()
         obj.put("type", type)
-        obj.put("data", JSONObject(data))
+        val payload = JSONObject()
+        for ((key, value) in data) {
+            when (value) {
+                is JSONArray -> payload.put(key, value)
+                is JSONObject -> payload.put(key, value)
+                is Collection<*> -> payload.put(key, JSONArray(value))
+                else -> payload.put(key, value)
+            }
+        }
+        obj.put("data", payload)
         try {
             webSocketClient?.send(obj.toString())
         } catch (e: Exception) {
@@ -280,6 +309,17 @@ class WebSocketManager private constructor(
                     )
                     CoroutineScope(Dispatchers.Main).launch { _incomingMessages.emit(message) }
                 }
+                "message:deleted" -> {
+                    val data = obj.optJSONObject("data") ?: return
+                    CoroutineScope(Dispatchers.Main).launch {
+                        _deletedMessages.emit(
+                            DeletedMessage(
+                                chatId = data.optString("chat_id"),
+                                messageId = data.optString("message_id")
+                            )
+                        )
+                    }
+                }
                 "typing" -> {
                     val data = obj.optJSONObject("data") ?: return
                     val typing = IncomingTyping(
@@ -310,8 +350,17 @@ class WebSocketManager private constructor(
                     val data = obj.optJSONObject("data")
                     Log.e(TAG, "Server error: ${data?.optString("error")}")
                 }
-                "call:invite", "call:answer", "call:ice_candidate", "call:reject", "call:end" -> {
+                "call:invite", "call:answer", "call:ice_candidate", "call:reject", "call:end", "call:media",
+                "call:group_invite", "call:group_join", "call:group_leave" -> {
                     val data = obj.optJSONObject("data") ?: return
+                    val participantIds = mutableListOf<String>()
+                    val idsArr = data.optJSONArray("participant_ids")
+                    if (idsArr != null) {
+                        for (i in 0 until idsArr.length()) {
+                            val id = idsArr.optString(i)
+                            if (id.isNotBlank()) participantIds.add(id)
+                        }
+                    }
                     val signal = IncomingCallSignal(
                         type = obj.optString("type"),
                         callId = data.optString("call_id"),
@@ -322,7 +371,11 @@ class WebSocketManager private constructor(
                         candidate = data.optString("candidate"),
                         sdpMid = data.optString("sdp_mid"),
                         sdpMLineIndex = data.optInt("sdp_mline_index", 0),
-                        reason = data.optString("reason")
+                        reason = data.optString("reason"),
+                        video = data.optBoolean("video", false),
+                        cameraOn = data.optBoolean("camera", true),
+                        groupCallId = data.optString("group_call_id"),
+                        participantIds = participantIds
                     )
                     CoroutineScope(Dispatchers.Main).launch { _callSignals.emit(signal) }
                 }

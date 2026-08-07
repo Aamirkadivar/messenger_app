@@ -52,6 +52,9 @@ signals:
     // Fired whenever any user connects/disconnects - not scoped to a chat room.
     void presenceChanged(const QString& userId, bool online);
     void errorOccurred(const QString& error);
+    // Someone retracted a message for everyone; the open chat should drop it
+    // rather than leave it on screen until the next refetch.
+    void messageDeletedRemotely(const QString& chatId, const QString& messageId);
     // Fired once per failed connect/reconnect attempt (while auto-reconnect
     // is on) - distinct from connectionStateChanged so a caller can react to
     // "an attempt just failed" without having to infer it from state-string
@@ -60,9 +63,10 @@ signals:
     // hand the socket a fresh one instead of retrying the same dead one
     // forever.
     void connectionAttemptFailed();
-    // One call:* signaling event, forwarded to CallService. type is
-    // "call:invite"/"call:answer"/"call:ice_candidate"/"call:reject"/"call:end";
-    // data carries whatever fields that type needs (see back-end/websocket/calls.go).
+    // One call:* signaling event, forwarded to CallService. type is a pairwise
+    // "call:invite"/"answer"/"ice_candidate"/"reject"/"end"/"media" or a group
+    // session "call:group_invite"/"group_join"/"group_leave". data may include
+    // group_call_id and participant_ids[] for mesh edges (see calls.go).
     void callSignalReceived(const QString& type, const QVariantMap& data);
 
 private slots:

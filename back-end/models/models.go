@@ -97,6 +97,17 @@ type Chat struct {
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
+// MessageDeletion records that one user removed one message from their own
+// view ("delete for me"). A join table rather than an array column on
+// messages: Postgres arrays of uuid do not round-trip through GORM's
+// []uuid.UUID mapping, and one populated row breaks reads of the whole table.
+// A row here is also trivially indexable and removable.
+type MessageDeletion struct {
+	MessageID uuid.UUID `json:"message_id" gorm:"type:uuid;primaryKey"`
+	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;primaryKey"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // GroupSenderKey stores one member's encrypted copy of another member's
 // current group "Sender Key" - see the WhatsApp/Signal-style scheme
 // described on Chat.KeyEpoch. EncryptedKey is hex(nonce||crypto_box(...)),
@@ -124,7 +135,7 @@ type GroupMember struct {
 	CreatedAt time.Time  `json:"created_at"`
 }
 
-// CallLog records a 1:1 audio call's lifecycle for call history (WhatsApp-style
+// CallLog records a 1:1 call's lifecycle for call history (WhatsApp-style
 // "Missed call"/"Answered" entries). The server never sees call media or its
 // keys - libdatachannel negotiates DTLS-SRTP directly between the two peers
 // via ICE, and this table only tracks who called whom, when, and how it ended.
@@ -136,7 +147,10 @@ type CallLog struct {
 	CallerID uuid.UUID `json:"caller_id" gorm:"type:uuid;index"`
 	CalleeID uuid.UUID `json:"callee_id" gorm:"type:uuid;index"`
 	// "ringing" | "answered" | "missed" | "rejected" | "ended" | "failed"
-	Status      string     `json:"status" gorm:"size:20;default:'ringing'"`
+	Status string `json:"status" gorm:"size:20;default:'ringing'"`
+	// True when the caller invited with video (the media itself is still
+	// opaque to the server - this only labels the history entry).
+	IsVideo     bool       `json:"is_video" gorm:"default:false"`
 	StartedAt   time.Time  `json:"started_at"`
 	ConnectedAt *time.Time `json:"connected_at"`
 	EndedAt     *time.Time `json:"ended_at"`
@@ -328,7 +342,7 @@ type ChatResponse struct {
 
 // MigrateDB runs database migrations
 func MigrateDB(db *gorm.DB) error {
-	return db.AutoMigrate(
+	if err := db.AutoMigrate(
 		&User{},
 		&Chat{},
 		&Message{},
@@ -338,5 +352,16 @@ func MigrateDB(db *gorm.DB) error {
 		&TypingIndicator{},
 		&GroupSenderKey{},
 		&CallLog{},
-	)
+		&MessageDeletion{},
+	); err != nil {
+		return err
+	}
+
+	// messages.deleted_for is abandoned in favour of MessageDeletion, and any
+	// value left in it has to go. []uuid.UUID is only scannable while the
+	// column is NULL: the driver returns "{uuid,...}" as a string, which GORM
+	// cannot map into the slice, so a single populated row makes EVERY read of
+	// the messages table fail. Clearing it is safe and idempotent.
+	db.Exec("UPDATE messages SET deleted_for = NULL WHERE deleted_for IS NOT NULL")
+	return nil
 }

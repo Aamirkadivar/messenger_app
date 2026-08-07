@@ -17,6 +17,10 @@
     <!-- Foreground Service Phone (for call features) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE" />
 
+    <!-- Keeps the camera usable if a video call is backgrounded (Android 14+
+         kills camera access for plain phoneCall-typed services). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+
     <!-- Wake Lock for message delivery -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
@@ -97,7 +101,7 @@
         <service
             android:name=".service.CallForegroundService"
             android:exported="false"
-            android:foregroundServiceType="phoneCall" />
+            android:foregroundServiceType="phoneCall|camera" />
 
         <!-- Holds the WebSocket open while the app is closed, so calls still ring. -->
         <service

@@ -4,10 +4,14 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -27,6 +31,13 @@ import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.SelectAll
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -49,7 +60,14 @@ import com.messenger.app.ui.components.Avatar
 import com.messenger.app.ui.components.ChatBackground
 import com.messenger.app.ui.components.GlassSurface
 import com.messenger.app.ui.components.RecordingIndicator
+import com.messenger.app.ui.components.RecordingLockHint
 import com.messenger.app.ui.components.VoiceBubbleContent
+import com.messenger.app.ui.components.CaptureButton
+import com.messenger.app.ui.components.CaptureMode
+import com.messenger.app.ui.components.RoundVideoBubble
+import com.messenger.app.ui.components.RoundVideoRecorderOverlay
+import com.messenger.app.ui.components.RoundVideoUiState
+import com.messenger.app.ui.viewmodel.CaptureUiState
 import com.messenger.app.ui.theme.ChatBubbleShapeReceived
 import com.messenger.app.ui.theme.ChatBubbleShapeSent
 import com.messenger.app.ui.theme.MessengerExtendedColors
@@ -72,8 +90,10 @@ fun ChatScreen(
     isGroup: Boolean = false,
     /** Non-null only for group chats; tapping the title opens group info. */
     onOpenGroupInfo: (() -> Unit)? = null,
-    /** Non-null only for direct chats (see NavGraph) - group calling isn't supported yet. */
-    onStartCall: ((calleeId: String, calleeName: String) -> Unit)? = null
+    /** Non-null for direct chats - places a 1:1 voice/video call. */
+    onStartCall: ((calleeId: String, calleeName: String, video: Boolean) -> Unit)? = null,
+    /** Non-null for group chats - places a mesh group voice/video call. */
+    onStartGroupCall: ((video: Boolean) -> Unit)? = null
 ) {
     val state by viewModel.chatState.collectAsStateWithLifecycle()
     val recording by viewModel.recording.collectAsStateWithLifecycle()
@@ -95,17 +115,69 @@ fun ChatScreen(
         // Start straight away on grant, so the button needs only one press.
         if (granted) viewModel.startRecording()
     }
-    var pendingCall by remember { mutableStateOf(false) }
-    val callMicPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
+    // null = no call pending; false = voice call pending; true = video call
+    // pending. Which permissions the launcher asked for depends on the kind.
+    var pendingCall by remember { mutableStateOf<Boolean?>(null) }
+    val callPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
     ) { granted ->
-        hasMicPermission = granted
-        if (granted && pendingCall) onStartCall?.invoke(state.otherUserId, chatName)
-        pendingCall = false
+        hasMicPermission = granted[Manifest.permission.RECORD_AUDIO] ?: hasMicPermission
+        val wantsVideo = pendingCall
+        // Mic is mandatory; a denied camera still allows a video call, which
+        // then simply connects with our camera dark (same as toggling it off).
+        if (hasMicPermission && wantsVideo != null) {
+            if (onStartGroupCall != null) {
+                onStartGroupCall.invoke(wantsVideo)
+            } else {
+                onStartCall?.invoke(state.otherUserId, chatName, wantsVideo)
+            }
+        }
+        pendingCall = null
     }
     val attachmentPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri -> uri?.let { viewModel.sendAttachment(it) } }
+
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+        )
+    }
+    // A video message needs mic *and* camera, so both are requested together -
+    // granting one and being asked for the other mid-gesture would abort the
+    // press-and-hold the user is in the middle of.
+    val capturePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { granted ->
+        hasMicPermission = granted[Manifest.permission.RECORD_AUDIO] ?: hasMicPermission
+        hasCameraPermission = granted[Manifest.permission.CAMERA] ?: hasCameraPermission
+        // Deliberately not auto-starting here: the finger that began the
+        // long-press is long gone by the time the dialog is dismissed.
+    }
+
+    val selectedIds by viewModel.selectedMessageIds.collectAsStateWithLifecycle()
+    val inSelection by viewModel.inSelectionMode.collectAsStateWithLifecycle()
+    val allSelectedMine by viewModel.allSelectedAreMine.collectAsStateWithLifecycle()
+
+    // Back exits selection before it leaves the chat - the same precedence
+    // every other app uses for a transient modal state.
+    BackHandler(enabled = inSelection) { viewModel.clearSelection() }
+
+    val capture by viewModel.capture.collectAsStateWithLifecycle()
+    val recorderState by viewModel.recorderState.collectAsStateWithLifecycle()
+    val videoStates by viewModel.videoStates.collectAsStateWithLifecycle()
+    val activePlayer by viewModel.activePlayer.collectAsStateWithLifecycle()
+    var fullscreenVideo by remember { mutableStateOf<ChatMessageUi?>(null) }
+    var pendingBulkDelete by remember { mutableStateOf(false) }
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    LaunchedEffect(capture.videoActive) {
+        // A raised keyboard leaves almost no room for the preview and fights
+        // the overlay for the bottom of the screen.
+        if (capture.videoActive) keyboard?.hide()
+    }
 
     LaunchedEffect(chatId) {
         viewModel.openChat(chatId, chatName, isGroup)
@@ -117,10 +189,44 @@ fun ChatScreen(
 
     val dark = MessengerExtendedColors.isDark
 
+    // The recorder is a full-screen layer, so it lives in a Box *around* the
+    // Scaffold rather than inside its content slot. Inside, it was clipped to
+    // the body area between the app bar and the composer - and with the
+    // keyboard open that strip is only a couple of hundred pixels tall, which
+    // put the preview circle behind the app bar and the action buttons inside
+    // the message field.
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         modifier = Modifier.imePadding(),
         topBar = {
             GlassSurface(modifier = Modifier.fillMaxWidth(), shape = androidx.compose.ui.graphics.RectangleShape, sheen = false) {
+            if (inSelection) {
+                // Takes over the header while selecting, so the count and the
+                // destructive action sit where the title normally is instead
+                // of floating over the conversation.
+                TopAppBar(
+                    navigationIcon = {
+                        IconButton(onClick = { viewModel.clearSelection() }) {
+                            Icon(Icons.Outlined.Close, contentDescription = "Cancel selection")
+                        }
+                    },
+                    title = {
+                        Text("${selectedIds.size} selected", fontWeight = FontWeight.SemiBold)
+                    },
+                    actions = {
+                        IconButton(onClick = { viewModel.selectAllMessages() }) {
+                            Icon(Icons.Outlined.SelectAll, contentDescription = "Select all")
+                        }
+                        IconButton(onClick = { pendingBulkDelete = true }) {
+                            Icon(
+                                Icons.Outlined.Delete,
+                                contentDescription = "Delete selected",
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                )
+            } else {
             TopAppBar(
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
@@ -158,21 +264,35 @@ fun ChatScreen(
                     }
                 },
                 actions = {
-                    if (onStartCall != null) {
-                        IconButton(onClick = {
-                            if (hasMicPermission) {
-                                onStartCall(state.otherUserId, chatName)
-                            } else {
-                                pendingCall = true
-                                callMicPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    if (onStartCall != null || onStartGroupCall != null) {
+                        fun requestCall(video: Boolean) {
+                            val needed = buildList {
+                                if (!hasMicPermission) add(Manifest.permission.RECORD_AUDIO)
+                                if (video && !hasCameraPermission) add(Manifest.permission.CAMERA)
                             }
-                        }) {
+                            if (needed.isEmpty()) {
+                                if (onStartGroupCall != null) {
+                                    onStartGroupCall.invoke(video)
+                                } else {
+                                    onStartCall?.invoke(state.otherUserId, chatName, video)
+                                }
+                            } else {
+                                pendingCall = video
+                                callPermissionLauncher.launch(needed.toTypedArray())
+                            }
+                        }
+                        // Groups and directs both get audio + video buttons.
+                        IconButton(onClick = { requestCall(true) }) {
+                            Icon(Icons.Filled.Videocam, contentDescription = "Video call $chatName")
+                        }
+                        IconButton(onClick = { requestCall(false) }) {
                             Icon(Icons.Filled.Call, contentDescription = "Call $chatName")
                         }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
             )
+            }
             }
         },
         containerColor = Color.Transparent,
@@ -198,7 +318,42 @@ fun ChatScreen(
                 },
                 onStopRecording = viewModel::stopRecordingAndSend,
                 onCancelRecording = viewModel::cancelRecording,
-                onPickAttachment = { attachmentPicker.launch("*/*") }
+                onPickAttachment = { attachmentPicker.launch("*/*") },
+                capture = capture,
+                onToggleCaptureMode = viewModel::toggleCaptureMode,
+                onStartCapture = {
+                    // Video needs the camera as well as the mic, so it asks
+                    // for both before the overlay can show anything.
+                    if (capture.mode == CaptureMode.VIDEO) {
+                        if (hasMicPermission && hasCameraPermission) {
+                            viewModel.startVideoRecording()
+                        } else {
+                            capturePermissionLauncher.launch(
+                                arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
+                            )
+                        }
+                    } else if (hasMicPermission) {
+                        viewModel.startRecording()
+                    } else {
+                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                },
+                onCaptureDrag = viewModel::onCaptureDrag,
+                onArmCancel = viewModel::onArmCancel,
+                onArmLock = viewModel::onArmLock,
+                onCaptureRelease = { cancelled, locked ->
+                    if (capture.mode == CaptureMode.VIDEO) {
+                        viewModel.onCaptureRelease(cancelled, locked)
+                    } else {
+                        // Same precedence as video: sliding up is already a
+                        // commitment to keep the take, so lock beats cancel.
+                        when {
+                            locked -> viewModel.lockVoiceRecording()
+                            cancelled -> viewModel.cancelRecording()
+                            else -> viewModel.stopRecordingAndSend()
+                        }
+                    }
+                }
             )
             }
         }
@@ -227,12 +382,107 @@ fun ChatScreen(
                             isPlaying = playback.messageId == message.id && playback.isPlaying,
                             positionMs = if (playback.messageId == message.id) playback.positionMs else 0,
                             onTogglePlay = { viewModel.toggleVoicePlayback(message) },
-                            onFetchAttachment = { viewModel.fetchAttachmentFile(message) }
+                            onFetchAttachment = { viewModel.fetchAttachmentFile(message) },
+                            isSelected = selectedIds.contains(message.id),
+                            selectionMode = inSelection,
+                            onToggleSelected = { viewModel.toggleMessageSelection(message.id) },
+                            videoState = videoStates[message.id],
+                            // Only the bubble that owns the borrowed player
+                            // gets a TextureView; the rest show their poster.
+                            videoPlayer = if (videoStates[message.id]?.isPlaying == true) activePlayer else null,
+                            onToggleVideo = { viewModel.toggleVideoPlayback(message) },
+                            onSeekVideo = { f -> viewModel.seekVideo(message.id, f) },
+                            onExpandVideo = { fullscreenVideo = message },
+                            onLongPress = { viewModel.toggleMessageSelection(message.id) }
                         )
+                        if (message.isVideoNote) {
+                            LaunchedEffect(message.id) { viewModel.ensureVideoThumbnail(message) }
+                        }
                     }
                 }
             }
         }
+    }
+
+    // Floats above the record button. It has to live out here rather than in
+    // the composer Row: inside, it would be clipped to the bar's own height
+    // and could only ever appear beside the button, not above it.
+    if (recording.isRecording) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .navigationBarsPadding()
+                // Clears the 64dp composer, then centres the 44dp capsule over
+                // the 48dp button sitting 8dp in from the edge.
+                .padding(end = 10.dp, bottom = 72.dp)
+        ) {
+            RecordingLockHint(
+                dragY = capture.dragY,
+                armed = capture.willLock,
+                locked = capture.isLocked
+            )
+        }
+    }
+
+    // Drawn last, so it sits above the app bar, the message list and the
+    // composer rather than behind them.
+    if (pendingBulkDelete) {
+        val count = selectedIds.size
+        AlertDialog(
+            onDismissRequest = { pendingBulkDelete = false },
+            title = { Text(if (count == 1) "Delete message?" else "Delete $count messages?") },
+            text = {
+                Text(
+                    if (allSelectedMine) {
+                        "Delete for everyone removes them from both sides. " +
+                            "Delete for me leaves the other person's copy untouched."
+                    } else {
+                        "This removes them from your device only - the other " +
+                            "person keeps their copy."
+                    }
+                )
+            },
+            confirmButton = {
+                Row {
+                    // Only offered when every selected message is ours; the
+                    // server refuses the rest anyway.
+                    if (allSelectedMine) {
+                        TextButton(onClick = {
+                            viewModel.deleteSelectedMessages(forEveryone = true)
+                            pendingBulkDelete = false
+                        }) {
+                            Text("For everyone", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    TextButton(onClick = {
+                        viewModel.deleteSelectedMessages(forEveryone = false)
+                        pendingBulkDelete = false
+                    }) {
+                        Text("For me", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingBulkDelete = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (capture.videoActive) {
+        RoundVideoRecorderOverlay(
+            state = recorderState,
+            dragX = capture.dragX,
+            dragY = capture.dragY,
+            willCancel = capture.willCancel,
+            willLock = capture.willLock,
+            isLocked = capture.isLocked,
+            onBindPreview = { view -> viewModel.bindVideoPreview(lifecycleOwner, view.surfaceProvider) },
+            onFlip = viewModel::flipCamera,
+            onStop = viewModel::stopVideoRecordingAndSend,
+            onCancel = viewModel::cancelVideoRecording,
+            onTogglePause = viewModel::toggleVideoPause
+        )
+    }
     }
 }
 
@@ -266,17 +516,82 @@ private fun openFileExternally(context: android.content.Context, file: File) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageBubble(
     message: ChatMessageUi,
     isPlaying: Boolean = false,
     positionMs: Int = 0,
     onTogglePlay: () -> Unit = {},
-    onFetchAttachment: suspend () -> File? = { null }
+    onFetchAttachment: suspend () -> File? = { null },
+    isSelected: Boolean = false,
+    selectionMode: Boolean = false,
+    onToggleSelected: () -> Unit = {},
+    videoState: RoundVideoUiState? = null,
+    videoPlayer: androidx.media3.exoplayer.ExoPlayer? = null,
+    onToggleVideo: () -> Unit = {},
+    onSeekVideo: (Float) -> Unit = {},
+    onExpandVideo: () -> Unit = {},
+    onLongPress: () -> Unit = {}
 ) {
     val timeFormat = remember { SimpleDateFormat("h:mm a", Locale.getDefault()) }
+    val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+
+    // Long-press starts selecting; once selecting, a plain tap toggles. Keyed
+    // on selectionMode so the tap handler is rebuilt when the mode flips.
+    // Long-press starts selecting; once selecting, a plain tap toggles.
+    //
+    // combinedClickable, NOT pointerInput/detectTapGestures: the latter
+    // consumes the pointer-down, so the enclosing LazyColumn never gets to
+    // claim it for a drag and the message list stops scrolling wherever a
+    // bubble sits under your finger - which is essentially everywhere.
+    //
+    // indication is null because a ripple spanning the whole row reads as a
+    // mis-hit; the selection tint is the feedback that matters.
+    val interactionSource = remember { MutableInteractionSource() }
+    val longPressModifier = Modifier.combinedClickable(
+        interactionSource = interactionSource,
+        indication = null,
+        onClick = { if (selectionMode) onToggleSelected() },
+        onLongClick = {
+            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+            if (selectionMode) onToggleSelected() else onLongPress()
+        }
+    )
+
+    // A band behind the whole row. A bubble-only tint would not read on a
+    // round video (a bare circle) or on a translucent received bubble.
+    val selectionTint = if (isSelected) {
+        Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f))
+    } else {
+        Modifier
+    }
+
+    // A round video is a bare circle, not a chat bubble - giving it the usual
+    // rounded-rectangle background would box the circle in a square.
+    if (message.isVideoNote) {
+        Row(
+            modifier = Modifier.fillMaxWidth().then(selectionTint).then(longPressModifier),
+            horizontalArrangement = if (message.isMine) Arrangement.End else Arrangement.Start
+        ) {
+            // The bubble owns its own tap handling, and a child is offered the
+            // pointer before its parent - so while selecting, its play/pause
+            // would swallow the tap and the circle could never be selected.
+            // Routing its callbacks through selection here keeps one rule:
+            // selecting beats playing.
+            RoundVideoBubble(
+                state = videoState ?: RoundVideoUiState(durationMs = message.videoDurationMs),
+                player = videoPlayer,
+                onTogglePlay = { if (selectionMode) onToggleSelected() else onToggleVideo() },
+                onSeek = { fraction -> if (!selectionMode) onSeekVideo(fraction) },
+                onExpand = { if (selectionMode) onToggleSelected() else onExpandVideo() }
+            )
+        }
+        return
+    }
+
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().then(selectionTint).then(longPressModifier),
         horizontalArrangement = if (message.isMine) Arrangement.End else Arrangement.Start
     ) {
         Column(
@@ -429,76 +744,82 @@ private fun MessageInputBar(
     onStartRecording: () -> Unit,
     onStopRecording: () -> Unit,
     onCancelRecording: () -> Unit,
-    onPickAttachment: () -> Unit
+    onPickAttachment: () -> Unit,
+    capture: CaptureUiState,
+    onToggleCaptureMode: () -> Unit,
+    onStartCapture: () -> Unit,
+    onCaptureDrag: (Float, Float) -> Unit,
+    onArmCancel: (Boolean) -> Unit,
+    onArmLock: (Boolean) -> Unit,
+    onCaptureRelease: (cancelled: Boolean, locked: Boolean) -> Unit
 ) {
     Surface(color = Color.Transparent) {
         Row(
             modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            if (!recording.isRecording) {
-                IconButton(onClick = onPickAttachment) {
-                    Icon(
-                        Icons.Filled.AttachFile,
-                        contentDescription = "Attach file",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+            // Both slots below are ALWAYS composed, and only their contents
+            // swap. Removing the attachment button while recording (which is
+            // what this used to do) changed the Row's child list, so Compose
+            // matched the remaining siblings to different slots and rebuilt
+            // the CaptureButton - tearing down its pointerInput mid-gesture
+            // and cancelling the press. That silently broke slide-to-lock for
+            // voice notes, while video kept working because its recording
+            // state never touched this branch.
+            Box(modifier = Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                if (!recording.isRecording) {
+                    IconButton(onClick = onPickAttachment) {
+                        Icon(
+                            Icons.Filled.AttachFile,
+                            contentDescription = "Attach file",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
-            if (recording.isRecording) {
-                RecordingIndicator(
-                    elapsedMs = recording.elapsedMs,
-                    amplitude = recording.amplitude,
-                    onCancel = onCancelRecording,
-                    modifier = Modifier.weight(1f)
-                )
-            } else {
-                OutlinedTextField(
-                    value = value,
-                    onValueChange = onValueChange,
-                    placeholder = { Text("Type a message…") },
-                    shape = RoundedCornerShape(24.dp),
-                    keyboardActions = KeyboardActions(onSend = { onSend() }),
-                    modifier = Modifier.weight(1f)
-                )
+
+            Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                if (recording.isRecording) {
+                    RecordingIndicator(
+                        elapsedMs = recording.elapsedMs,
+                        amplitude = recording.amplitude,
+                        onCancel = onCancelRecording,
+                        isLocked = capture.isLocked
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = value,
+                        onValueChange = onValueChange,
+                        placeholder = { Text("Type a message…") },
+                        shape = RoundedCornerShape(24.dp),
+                        keyboardActions = KeyboardActions(onSend = { onSend() }),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
 
             Spacer(Modifier.width(8.dp))
 
-            // Mic while nothing is typed, send once there is text - the two
-            // actions never compete for the same tap.
-            val showMic = value.isBlank()
-            FilledIconButton(
-                onClick = {
-                    when {
-                        recording.isRecording -> onStopRecording()
-                        showMic -> onStartRecording()
-                        else -> onSend()
-                    }
+            // One control for send / voice / video: tap flips the mode when
+            // there is nothing typed, hold records, and the drag while holding
+            // arms cancel and lock.
+            CaptureButton(
+                mode = capture.mode,
+                isRecording = recording.isRecording || capture.videoActive,
+                hasText = value.isNotBlank(),
+                // Only voice locks here - a locked video take is driven from
+                // the full-screen overlay's own send button instead.
+                isLocked = capture.isLocked && !capture.videoActive,
+                onToggleMode = onToggleCaptureMode,
+                onSend = {
+                    if (capture.isLocked && recording.isRecording) onStopRecording() else onSend()
                 },
-                colors = IconButtonDefaults.filledIconButtonColors(
-                    containerColor = if (recording.isRecording) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.primary
-                    }
-                ),
-                modifier = Modifier.size(48.dp)
-            ) {
-                Icon(
-                    imageVector = when {
-                        recording.isRecording -> Icons.Filled.Stop
-                        showMic -> Icons.Filled.Mic
-                        else -> Icons.AutoMirrored.Filled.Send
-                    },
-                    contentDescription = when {
-                        recording.isRecording -> "Stop and send voice message"
-                        showMic -> "Record voice message"
-                        else -> "Send"
-                    },
-                    tint = Color.White
-                )
-            }
+                onStartRecording = onStartCapture,
+                onDrag = onCaptureDrag,
+                onArmCancel = onArmCancel,
+                onArmLock = onArmLock,
+                onRelease = onCaptureRelease
+            )
         }
     }
 }

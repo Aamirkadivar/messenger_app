@@ -43,6 +43,8 @@ data class MessageDto(
     @SerialName("file_name") val fileName: String? = null,
     @SerialName("file_size") val fileSize: Long = 0,
     @SerialName("duration_ms") val durationMs: Long = 0,
+    /** A round video's poster frame, shown while the video itself downloads. */
+    @SerialName("thumbnail_url") val thumbnailUrl: String? = null,
     /** Which of the sender's group Sender Key versions encrypted this message. Meaningless outside a group. */
     @SerialName("key_version") val keyVersion: Int = 0,
     val type: String? = null,
@@ -74,8 +76,10 @@ data class SendMessageRequest(
     /** Original filename/size for an attachment - display metadata only, not secret. */
     @SerialName("file_name") val fileName: String = "",
     @SerialName("file_size") val fileSize: Long = 0,
-    /** Voice length in milliseconds, so the bubble can show it before playing. */
+    /** Voice/round-video length in milliseconds, so the bubble can show it before playing. */
     @SerialName("duration_ms") val durationMs: Long = 0,
+    /** A round video's poster frame, so its bubble fills in before the video lands. */
+    @SerialName("thumbnail_url") val thumbnailUrl: String = "",
     /** Only meaningful (and only ever non-zero) for a group message - see MessageDto.keyVersion. */
     @SerialName("key_version") val keyVersion: Int = 0
 )

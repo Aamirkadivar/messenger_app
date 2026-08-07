@@ -41,6 +41,11 @@ Item {
 
     property bool typingVisible: false
     property bool isLoadingMore: false
+    // Set when the user taps audio/video-call on a group; cleared when group info
+    // arrives and startGroupCall is invoked (or on mismatch / too many members).
+    property string pendingGroupCallChatId: ""
+    property string pendingGroupCallName: ""
+    property bool pendingGroupCallVideo: false
 
     onCurrentChatIdChanged: {
         // Deliberately not leaving the previous chat's room here: ChatList.qml
@@ -53,6 +58,39 @@ Item {
             isLoadingMore = true
             chatService.fetchMessages(currentChatId)
             websocketService.joinChat(currentChatId)
+        }
+    }
+
+    Connections {
+        target: groupService
+        function onGroupInfoFetched(group) {
+            if (!chatViewRoot.pendingGroupCallChatId.length) return
+            if (group.id !== chatViewRoot.pendingGroupCallChatId) return
+            var chatId = chatViewRoot.pendingGroupCallChatId
+            var groupName = group.name || chatViewRoot.pendingGroupCallName
+            var video = chatViewRoot.pendingGroupCallVideo
+            chatViewRoot.pendingGroupCallChatId = ""
+            chatViewRoot.pendingGroupCallName = ""
+            chatViewRoot.pendingGroupCallVideo = false
+
+            var ids = []
+            var names = []
+            var members = group.members || []
+            for (var i = 0; i < members.length; i++) {
+                if (members[i].id === authService.currentUserId) continue
+                ids.push(members[i].id)
+                names.push(members[i].bestName || members[i].username || members[i].id)
+            }
+            // Full mesh caps at 4 including self.
+            if (ids.length + 1 > 4) {
+                console.warn("[ChatView] group call rejected: too many members (" + (ids.length + 1) + ")")
+                return
+            }
+            if (ids.length < 1) {
+                console.warn("[ChatView] group call rejected: no other members")
+                return
+            }
+            callService.startGroupCall(chatId, groupName, ids, names, video)
         }
     }
 
@@ -72,7 +110,8 @@ Item {
                 var isRead = isMine && m.readAt && m.readAt.length > 0
                 chatViewRoot.addMessage(m.senderId, m.senderName, m.content, chatViewRoot.formatTime(m.createdAt),
                                          isMine, isRead, m.fileUrl, m.durationMs, m.voiceEncrypted, m.id,
-                                         m.fileType, m.fileName, m.fileSize)
+                                         m.fileType, m.fileName, m.fileSize, m.thumbnailUrl,
+                                         m.rawContent, m.encrypted, m.keyVersion)
                 if (firstUnreadIndex === -1 && !isMine && (!m.readAt || m.readAt.length === 0)) {
                     firstUnreadIndex = i
                 }
@@ -103,11 +142,24 @@ Item {
             if (chatId !== chatViewRoot.currentChatId) return
             chatViewRoot.addMessage(authService.currentUserId, "Me", "", chatViewRoot.formatTime(message.createdAt),
                                      true, false, message.fileUrl, message.durationMs,
-                                     message.encrypted === true, message.id, "audio", "", 0)
+                                     message.encrypted === true, message.id, "audio", "", 0, "",
+                                     "", message.encrypted === true, message.keyVersion || 0)
         }
 
         function onVoiceUploadError(error) {
             console.log("[ChatView] Voice upload error:", error)
+        }
+
+        // Shown once the server has assigned a real message id, which the
+        // bubble needs to correlate its download/thumbnail callbacks.
+        function onVideoNoteMessageSent(chatId, message) {
+            if (chatId !== chatViewRoot.currentChatId) return
+            chatViewRoot.addMessage(authService.currentUserId, "Me", "", chatViewRoot.formatTime(message.createdAt),
+                                     true, false, message.fileUrl, message.durationMs,
+                                     message.encrypted === true, message.id, "video_note", "", 0,
+                                     message.thumbnailUrl || "",
+                                     "", message.encrypted === true, message.keyVersion || 0)
+            scrollAfterSend.restart()
         }
 
         // Same reasoning as onVoiceMessageSent: shown once the server has
@@ -118,11 +170,21 @@ Item {
             chatViewRoot.addMessage(authService.currentUserId, "Me", "", chatViewRoot.formatTime(message.createdAt),
                                      true, false, message.fileUrl, 0,
                                      message.encrypted === true, message.id,
-                                     message.fileType, message.fileName, message.fileSize)
+                                     message.fileType, message.fileName, message.fileSize, "",
+                                     "", message.encrypted === true, message.keyVersion || 0)
         }
 
         function onAttachmentUploadError(error) {
             console.log("[ChatView] Attachment upload error:", error)
+        }
+
+        function onMessageDeleted(chatId, messageId) {
+            if (chatId !== chatViewRoot.currentChatId) return
+            chatViewRoot.removeMessageById(messageId)
+        }
+
+        function onMessageDeleteError(error) {
+            console.log("[ChatView] Delete failed:", error)
         }
 
         function onSecurityCodeChanged(chatId, contactName) {
@@ -133,6 +195,216 @@ Item {
             chatService.takePendingSecurityNotice(chatId)
             chatViewRoot.addSystemMessage("🔒 Your security code with " + contactName + " changed.")
         }
+    }
+
+    Connections {
+        target: websocketService
+
+        function onMessageDeletedRemotely(chatId, messageId) {
+            if (chatId !== chatViewRoot.currentChatId) return
+            chatViewRoot.removeMessageById(messageId)
+        }
+    }
+
+    // ---- Round video capture state ----
+    // "voice" or "video". Tapping the composer button with nothing typed
+    // flips between them, matching the Android client.
+    property string captureMode: "voice"
+    property bool captureActive: false
+    property bool captureLocked: false
+    property real captureDragX: 0
+    property real captureDragY: 0
+    property bool captureWillCancel: false
+    property bool captureWillLock: false
+    property string captureStatus: ""
+
+    // Travel needed to arm each action. Larger than the Android thresholds
+    // because a mouse drag has none of a thumb's slop to overcome.
+    readonly property real cancelDistance: 150
+    readonly property real lockDistance: 120
+
+    // Smoothly brings a list row fully into view.
+    //
+    // positionViewAtIndex jumps instantly, so it is used only to *compute* the
+    // minimal target: let the ListView work out where Contain would land, put
+    // contentY straight back, then ease to it. That avoids reimplementing the
+    // geometry (item offsets, header, spacing) and keeps the "scroll the least
+    // amount necessary" behaviour.
+    function smoothRevealIndex(idx) {
+        if (idx < 0 || idx >= messagesModel.count) return
+        if (messagesListView.dragging || messagesListView.flicking) return
+
+        var from = messagesListView.contentY
+        messagesListView.positionViewAtIndex(idx, ListView.Contain)
+        var to = messagesListView.contentY
+        if (Math.abs(to - from) < 1) return
+
+        messagesListView.contentY = from
+        revealScrollAnim.stop()
+        revealScrollAnim.from = from
+        revealScrollAnim.to = to
+        revealScrollAnim.start()
+    }
+
+    // Same computed-target trick as smoothRevealIndex, but for the newest row.
+    function smoothScrollToEnd() {
+        if (messagesModel.count === 0) return
+        if (messagesListView.dragging || messagesListView.flicking) return
+
+        var from = messagesListView.contentY
+        messagesListView.positionViewAtEnd()
+        var to = messagesListView.contentY
+        if (Math.abs(to - from) < 1) return
+
+        messagesListView.contentY = from
+        revealScrollAnim.stop()
+        revealScrollAnim.from = from
+        revealScrollAnim.to = to
+        revealScrollAnim.start()
+    }
+
+    // A round video bubble is created by a Loader and only reaches its real
+    // height a frame or two after the row is appended, so scrolling in the
+    // same tick lands short of the bottom.
+    Timer {
+        id: scrollAfterSend
+        interval: 90
+        onTriggered: chatViewRoot.smoothScrollToEnd()
+    }
+
+    NumberAnimation {
+        id: revealScrollAnim
+        target: messagesListView
+        property: "contentY"
+        duration: 320
+        easing.type: Easing.OutCubic
+    }
+
+    function toggleCaptureMode() {
+        captureMode = (captureMode === "voice") ? "video" : "voice"
+    }
+
+    function beginCapture() {
+        captureDragX = 0
+        captureDragY = 0
+        captureWillCancel = false
+        captureWillLock = false
+        if (captureMode === "video") {
+            if (!roundVideoService.startPreview()) return
+            captureActive = true
+            // The camera needs a moment before the encoder will take frames;
+            // starting immediately yields a zero-length take.
+            videoStartDelay.restart()
+        } else {
+            voiceService.startRecording()
+        }
+    }
+
+    Timer {
+        id: videoStartDelay
+        interval: 220
+        onTriggered: if (chatViewRoot.captureActive) roundVideoService.startRecording()
+    }
+
+    function updateCaptureDrag(dx, dy) {
+        captureDragX = dx
+        captureDragY = dy
+        captureWillCancel = dx < -cancelDistance
+        captureWillLock = dy < -lockDistance
+    }
+
+    // Lock beats cancel: dragging up is already a commitment to keep the take.
+    function endCapture() {
+        if (captureWillLock) {
+            captureLocked = true
+            captureDragX = 0
+            captureDragY = 0
+            captureWillLock = false
+            captureWillCancel = false
+            return
+        }
+        if (captureWillCancel) {
+            cancelCapture()
+            return
+        }
+        finishLockedCapture()
+    }
+
+    function finishLockedCapture() {
+        if (captureMode === "video") {
+            roundVideoService.stopRecording()   // overlay closes on recordingFinished
+        } else {
+            voiceService.stopRecording()
+        }
+        captureLocked = false
+    }
+
+    function cancelCapture() {
+        if (captureMode === "video") {
+            roundVideoService.cancelRecording()
+            roundVideoService.stopPreview()
+            captureActive = false
+        } else {
+            voiceService.cancelRecording()
+        }
+        captureLocked = false
+        captureDragX = 0
+        captureDragY = 0
+        captureWillCancel = false
+        captureWillLock = false
+    }
+
+    Connections {
+        target: roundVideoService
+
+        function onRecordingFinished(filePath, durationMs) {
+            chatViewRoot.captureActive = false
+            chatViewRoot.captureLocked = false
+            roundVideoService.stopPreview()
+            chatService.sendVideoNote(chatViewRoot.currentChatId, chatViewRoot.currentChatType,
+                                       filePath, durationMs)
+        }
+
+        function onRecordingTooShort() {
+            chatViewRoot.captureActive = false
+            chatViewRoot.captureLocked = false
+            roundVideoService.stopPreview()
+            chatViewRoot.captureStatus = "Hold to record - that was too short"
+            captureStatusClear.restart()
+        }
+
+        function onRecordingFailed(error) {
+            chatViewRoot.captureActive = false
+            chatViewRoot.captureLocked = false
+            roundVideoService.stopPreview()
+            chatViewRoot.captureStatus = error
+            captureStatusClear.restart()
+        }
+    }
+
+    Connections {
+        target: chatService
+
+        function onVideoNoteUploadProgress(sent, total) {
+            if (total > 0) {
+                chatViewRoot.captureStatus = "Uploading " + Math.round(sent * 100 / total) + "%"
+            }
+        }
+
+        function onVideoNoteMessageSent(chatId, message) {
+            chatViewRoot.captureStatus = ""
+        }
+
+        function onVideoNoteUploadError(error) {
+            chatViewRoot.captureStatus = error
+            captureStatusClear.restart()
+        }
+    }
+
+    Timer {
+        id: captureStatusClear
+        interval: 3000
+        onTriggered: chatViewRoot.captureStatus = ""
     }
 
     Connections {
@@ -162,7 +434,8 @@ Item {
             if (chatId !== chatViewRoot.currentChatId) return
             // Our own sends are already shown optimistically when we hit send
             if (message.senderId === authService.currentUserId) return
-            var hasFile = (message.fileType === "audio" || message.fileType === "image" || message.fileType === "file")
+            var hasFile = (message.fileType === "audio" || message.fileType === "image"
+                           || message.fileType === "file" || message.fileType === "video_note")
                           && message.fileUrl && message.fileUrl.length > 0
             var text = hasFile ? "" : chatService.decryptMessage(chatId, message.content, message.encrypted === true,
                                                                   message.senderId, message.keyVersion || 0)
@@ -170,7 +443,10 @@ Item {
                                      chatViewRoot.formatTime(message.createdAt), false, false,
                                      hasFile ? message.fileUrl : "", message.durationMs,
                                      hasFile && message.encrypted === true, message.id,
-                                     message.fileType, message.fileName, message.fileSize)
+                                     message.fileType, message.fileName, message.fileSize,
+                                     message.thumbnailUrl || "",
+                                     hasFile ? "" : message.content,
+                                     message.encrypted === true, message.keyVersion || 0)
             // This chat is already open and visible, so the message that just
             // arrived counts as read immediately - onCurrentChatIdChanged only
             // fires when switching chats, not for new messages in one already open.
@@ -360,12 +636,12 @@ Item {
                     }
                 }
 
-                // Call - direct chats only (group calling isn't supported yet).
+                // Audio call - direct (1:1) or group (full mesh, max 4).
                 Rectangle {
                     Layout.preferredWidth: 36
                     Layout.preferredHeight: 36
                     radius: 9
-                    visible: !chatViewRoot.isGroupChat && chatViewRoot.currentChatId.length > 0
+                    visible: chatViewRoot.currentChatId.length > 0
                     color: callMouse.containsPress ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.2) : (callMouse.containsMouse ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.1) : "transparent")
                     Behavior on color {
                         enabled: !chatViewRoot.instantThemeActive
@@ -382,7 +658,73 @@ Item {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: callService.startOutgoingCall(chatViewRoot.currentChatId, chatViewRoot.otherUserId, chatViewRoot.currentChatName)
+                        onClicked: {
+                            if (chatViewRoot.isGroupChat) {
+                                chatViewRoot.pendingGroupCallChatId = chatViewRoot.currentChatId
+                                chatViewRoot.pendingGroupCallName = chatViewRoot.currentChatName
+                                chatViewRoot.pendingGroupCallVideo = false
+                                groupService.getGroupInfo(chatViewRoot.currentChatId)
+                            } else {
+                                callService.startOutgoingCall(chatViewRoot.currentChatId, chatViewRoot.otherUserId, chatViewRoot.currentChatName, false)
+                            }
+                        }
+                    }
+                }
+
+                // Video call - direct and group (mesh, max 4).
+                Rectangle {
+                    Layout.preferredWidth: 36
+                    Layout.preferredHeight: 36
+                    radius: 9
+                    visible: chatViewRoot.currentChatId.length > 0
+                    color: videoCallMouse.containsPress ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.2) : (videoCallMouse.containsMouse ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.1) : "transparent")
+                    Behavior on color {
+                        enabled: !chatViewRoot.instantThemeActive
+                        ColorAnimation { duration: 100 }
+                    }
+
+                    Canvas {
+                        id: videoCallIcon
+                        anchors.centerIn: parent
+                        width: 18
+                        height: 14
+                        Connections {
+                            target: chatViewRoot
+                            function onTextSecondaryChanged() { videoCallIcon.requestPaint() }
+                        }
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.fillStyle = chatViewRoot.textSecondary
+                            // Camera body
+                            ctx.beginPath()
+                            ctx.roundedRect(0.5, 1.5, 11, 11, 2.2, 2.2)
+                            ctx.fill()
+                            // Lens barrel / viewfinder triangle on the right
+                            ctx.beginPath()
+                            ctx.moveTo(12.5, 5)
+                            ctx.lineTo(17.5, 2)
+                            ctx.lineTo(17.5, 12)
+                            ctx.lineTo(12.5, 9)
+                            ctx.closePath()
+                            ctx.fill()
+                        }
+                    }
+                    MouseArea {
+                        id: videoCallMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (chatViewRoot.isGroupChat) {
+                                chatViewRoot.pendingGroupCallChatId = chatViewRoot.currentChatId
+                                chatViewRoot.pendingGroupCallName = chatViewRoot.currentChatName
+                                chatViewRoot.pendingGroupCallVideo = true
+                                groupService.getGroupInfo(chatViewRoot.currentChatId)
+                            } else {
+                                callService.startOutgoingCall(chatViewRoot.currentChatId, chatViewRoot.otherUserId, chatViewRoot.currentChatName, true)
+                            }
+                        }
                     }
                 }
 
@@ -422,6 +764,60 @@ Item {
                         cursorShape: Qt.PointingHandCursor
                         onClicked: chatViewRoot.openChatInfo(chatViewRoot.currentChatId)
                     }
+                }
+            }
+        }
+
+        // Selection toolbar. Replaces the header while selecting, so the count
+        // and the destructive actions sit where the chat title normally is
+        // rather than floating over the conversation.
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 56
+            visible: chatViewRoot.selectionMode
+            color: Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g,
+                            chatViewRoot.accentColor.b, chatViewRoot.darkMode ? 0.18 : 0.12)
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 14
+                anchors.rightMargin: 14
+                spacing: 12
+
+                ToolButton {
+                    text: "✕"
+                    onClicked: chatViewRoot.clearSelection()
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Cancel selection"
+                }
+
+                Text {
+                    text: chatViewRoot.selectedCount + (chatViewRoot.selectedCount === 1
+                                                         ? " selected" : " selected")
+                    color: chatViewRoot.textColor
+                    font.pixelSize: 14
+                    font.bold: true
+                    Layout.fillWidth: true
+                }
+
+                ToolButton {
+                    text: "Select all"
+                    onClicked: chatViewRoot.selectAll()
+                }
+
+                ToolButton {
+                    text: "Delete for me"
+                    enabled: chatViewRoot.selectedCount > 0
+                    onClicked: chatViewRoot.deleteSelected(false)
+                }
+
+                ToolButton {
+                    // Only offered when every selected message is mine - the
+                    // server refuses the rest anyway.
+                    text: "Delete for everyone"
+                    visible: chatViewRoot.allSelectedAreMine
+                    enabled: chatViewRoot.selectedCount > 0
+                    onClicked: chatViewRoot.deleteSelected(true)
                 }
             }
         }
@@ -499,11 +895,50 @@ Item {
                 MessageBubble {
                     id: bubbleItem
                     visible: model.messageKind !== "system"
+                    // A playing round video is both taller and often the newest
+                    // message, so it frequently sits half off-screen. Contain
+                    // scrolls the minimum needed to show it whole, and the
+                    // delayed second pass catches the grow animation - a single
+                    // call would reveal the old, smaller bounds.
+                    selectionMode: chatViewRoot.selectionMode
+                    selected: chatViewRoot.isSelected(model.messageId)
+                    onToggleSelected: chatViewRoot.toggleSelection(model.messageId)
+                    onRequestDelete: {
+                        // In selection mode a right-click just adds to the
+                        // selection; the toolbar owns the actions from there.
+                        if (chatViewRoot.selectionMode) {
+                            chatViewRoot.toggleSelection(model.messageId)
+                            return
+                        }
+                        messageMenu.targetMessageId = model.messageId
+                        messageMenu.targetIsMine = model.isMine
+                        messageMenu.popup()
+                    }
+                    onVideoPlaybackStarted: {
+                        chatViewRoot.smoothRevealIndex(index)
+                        revealAfterGrow.restart()
+                    }
+                    Timer {
+                        id: revealAfterGrow
+                        // Fires once the grow animation has settled; the first
+                        // reveal only knows the pre-growth size.
+                        interval: 260
+                        onTriggered: chatViewRoot.smoothRevealIndex(index)
+                    }
                     x: 16
                     y: model.showSender ? 10 : 2
                     width: parent.width - 32
                     darkMode: chatViewRoot.darkMode
-                    messageText: model.messageText
+                    // Reading cryptoRevision makes this binding depend on "a
+                    // key was learned", so a row that first rendered as the
+                    // placeholder re-decrypts itself the moment one arrives.
+                    messageText: {
+                        var revision = chatService.cryptoRevision
+                        if (!model.rawContent || model.rawContent.length === 0) return model.messageText
+                        return chatService.decryptMessage(chatViewRoot.currentChatId, model.rawContent,
+                                                          model.rawEncrypted, model.senderId,
+                                                          model.rawKeyVersion)
+                    }
                     messageTime: model.messageTime
                     isMine: model.isMine
                     isRead: model.isRead
@@ -514,10 +949,13 @@ Item {
                     isEncrypted: true
                     accentColor: chatViewRoot.accentColor
                     messageId: model.messageId
+                    senderId: model.senderId
+                    keyVersion: model.rawKeyVersion || 0
                     voiceUrl: model.voiceUrl
                     voiceDurationMs: model.voiceDurationMs
                     voiceEncrypted: model.voiceEncrypted
                     contentType: model.contentType
+                    thumbnailUrl: model.thumbnailUrl
                     fileName: model.fileName
                     fileSize: model.fileSize
                     chatId: chatViewRoot.currentChatId
@@ -582,22 +1020,41 @@ Item {
                     }
 
                     Canvas {
+                        id: attachIcon
                         anchors.centerIn: parent
-                        width: 17
-                        height: 17
+                        width: 20
+                        height: 20
+                        // Canvas does not repaint when a colour binding
+                        // changes, so the icon would keep the old theme's
+                        // colour after a light/dark switch.
+                        Connections {
+                            target: chatViewRoot
+                            function onTextSecondaryChanged() { attachIcon.requestPaint() }
+                        }
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.reset()
                             ctx.strokeStyle = chatViewRoot.textSecondary
                             ctx.lineWidth = 1.6
                             ctx.lineCap = "round"
+                            ctx.lineJoin = "round"
+
+                            // Two nested capsules on a diagonal. The previous
+                            // version chained arc()/arcTo() straight off
+                            // lineTo(), which makes Canvas draw connecting
+                            // lines into each arc's start point - the clip came
+                            // out as a scribble. Rounded rectangles have no
+                            // such ambiguity: the shape is fully determined by
+                            // its bounds and radius.
+                            ctx.translate(width / 2, height / 2)
+                            ctx.rotate(-Math.PI / 4)
+
                             ctx.beginPath()
-                            ctx.moveTo(11, 3)
-                            ctx.lineTo(4.5, 9.5)
-                            ctx.arc(6, 11, 2.2, Math.PI * 1.1, Math.PI * 2.4, false)
-                            ctx.lineTo(13, 6)
-                            ctx.arcTo(15, 4, 13, 2, 2)
-                            ctx.lineTo(6, 9)
+                            ctx.roundedRect(-4.6, -8, 9.2, 16, 4.6, 4.6)
+                            ctx.stroke()
+
+                            ctx.beginPath()
+                            ctx.roundedRect(-1.9, -4.4, 3.8, 9.6, 1.9, 1.9)
                             ctx.stroke()
                         }
                     }
@@ -610,10 +1067,11 @@ Item {
                     }
                 }
 
-                // Message input
+                // Message input — Enter/Return (including keypad Enter) sends;
+                // Shift+Enter inserts a newline. TextArea so multiline works.
                 Rectangle {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 42
+                    Layout.preferredHeight: Math.min(120, Math.max(42, messageInput.contentHeight + 22))
                     radius: 21
                     visible: !voiceService.isRecording
                     // Was a "rgba(r,g,b,a)" string literal - that syntax silently
@@ -625,20 +1083,31 @@ Item {
                     border.width: 1.5
                     Behavior on border.color { ColorAnimation { duration: 100 } }
 
-                    TextField {
+                    TextArea {
                         id: messageInput
                         anchors.fill: parent
                         leftPadding: 16
                         rightPadding: 16
-                        verticalAlignment: TextInput.AlignVCenter
+                        topPadding: 11
+                        bottomPadding: 11
                         background: Item {}
                         placeholderText: "Type a message…"
                         placeholderTextColor: chatViewRoot.textSecondary
                         font.pixelSize: 14
                         color: chatViewRoot.textColor
                         selectByMouse: true
-                        wrapMode: TextInput.Wrap
-                        Keys.onReturnPressed: sendButton.trigger()
+                        wrapMode: TextArea.Wrap
+                        Keys.priority: Keys.BeforeItem
+                        Keys.onPressed: function(event) {
+                            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                                if (event.modifiers & Qt.ShiftModifier) {
+                                    // Let TextArea insert the newline.
+                                    return
+                                }
+                                event.accepted = true
+                                sendButton.trigger()
+                            }
+                        }
                     }
                 }
 
@@ -770,35 +1239,82 @@ Item {
                         }
                     }
 
-                    // Mic icon (idle, no text typed)
+                    // Camera icon - shown instead of the mic once the button
+                    // has been tapped into video mode. Without this the two
+                    // modes looked identical and the toggle appeared dead.
                     Canvas {
+                        id: cameraIcon
                         anchors.centerIn: parent
-                        width: 16
-                        height: 16
+                        width: 18
+                        height: 18
                         visible: !voiceService.isRecording && !sendButton.canSend
+                                 && chatViewRoot.captureMode === "video"
+                        // Canvas does not repaint on a colour binding change.
+                        Connections {
+                            target: chatViewRoot
+                            function onTextSecondaryChanged() { cameraIcon.requestPaint() }
+                        }
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.fillStyle = chatViewRoot.textSecondary
+                            // Body
+                            ctx.beginPath()
+                            ctx.roundedRect(1, 4, 11, 10, 2.5, 2.5)
+                            ctx.fill()
+                            // Lens barrel
+                            ctx.beginPath()
+                            ctx.moveTo(13, 8)
+                            ctx.lineTo(17, 5.5)
+                            ctx.lineTo(17, 12.5)
+                            ctx.lineTo(13, 10)
+                            ctx.closePath()
+                            ctx.fill()
+                        }
+                    }
+
+                    // Mic icon (idle, no text typed, voice mode)
+                    Canvas {
+                        id: micIcon
+                        anchors.centerIn: parent
+                        width: 20
+                        height: 20
+                        visible: !voiceService.isRecording && !sendButton.canSend
+                                 && chatViewRoot.captureMode === "voice"
+                        Connections {
+                            target: chatViewRoot
+                            function onTextSecondaryChanged() { micIcon.requestPaint() }
+                        }
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.reset()
                             ctx.fillStyle = chatViewRoot.textSecondary
                             ctx.strokeStyle = chatViewRoot.textSecondary
-                            ctx.lineWidth = 1.4
+                            ctx.lineWidth = 1.5
                             ctx.lineCap = "round"
-                            // Capsule body
+
+                            // Capsule from roundedRect rather than a chain of
+                            // arcTo calls. arcTo takes tangent points, not the
+                            // corner coordinates it looks like it takes, so the
+                            // old capsule was drawing corners of the wrong
+                            // radius in the wrong places.
                             ctx.beginPath()
-                            ctx.moveTo(8, 1)
-                            ctx.arcTo(11, 1, 11, 4, 3)
-                            ctx.lineTo(11, 8)
-                            ctx.arcTo(11, 11, 8, 11, 3)
-                            ctx.arcTo(5, 11, 5, 8, 3)
-                            ctx.lineTo(5, 4)
-                            ctx.arcTo(5, 1, 8, 1, 3)
-                            ctx.closePath()
+                            ctx.roundedRect(7, 2, 6, 10, 3, 3)
                             ctx.fill()
-                            // Stand
-                            ctx.beginPath(); ctx.moveTo(8, 11); ctx.lineTo(8, 15); ctx.stroke()
-                            ctx.beginPath(); ctx.moveTo(4, 15); ctx.lineTo(12, 15); ctx.stroke()
+
+                            // Cradle: the lower half of a circle around the
+                            // capsule. 0 -> PI sweeps through +y, which is
+                            // downward on screen.
                             ctx.beginPath()
-                            ctx.arc(8, 8.5, 5.5, Math.PI * 0.15, Math.PI * 0.85, false)
+                            ctx.arc(10, 9.5, 5, 0, Math.PI, false)
+                            ctx.stroke()
+
+                            // Stem and base
+                            ctx.beginPath()
+                            ctx.moveTo(10, 14.5); ctx.lineTo(10, 17.5)
+                            ctx.stroke()
+                            ctx.beginPath()
+                            ctx.moveTo(6.5, 17.5); ctx.lineTo(13.5, 17.5)
                             ctx.stroke()
                         }
                     }
@@ -813,18 +1329,66 @@ Item {
                         visible: voiceService.isRecording
                     }
 
+                    // Tap toggles voice/video when nothing is typed; press and
+                    // hold records, and the drag while holding arms cancel
+                    // (left) and lock (up). All three are phases of a single
+                    // press, so they share one handler - splitting them is how
+                    // a tap ends up both switching mode and starting a take.
                     MouseArea {
                         id: sendMouse
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
+
+                        property real pressX: 0
+                        property real pressY: 0
+                        property bool holding: false
+
+                        Timer {
+                            id: holdTimer
+                            interval: 320
+                            onTriggered: {
+                                sendMouse.holding = true
+                                chatViewRoot.beginCapture()
+                            }
+                        }
+
+                        onPressed: function(mouse) {
+                            pressX = mouse.x
+                            pressY = mouse.y
+                            holding = false
+                            if (!sendButton.canSend && !chatViewRoot.captureLocked) holdTimer.start()
+                        }
+
+                        onPositionChanged: function(mouse) {
+                            if (!holding) return
+                            chatViewRoot.updateCaptureDrag(mouse.x - pressX, mouse.y - pressY)
+                        }
+
+                        onReleased: {
+                            holdTimer.stop()
+                            if (holding) {
+                                holding = false
+                                chatViewRoot.endCapture()
+                            }
+                        }
+
+                        onCanceled: {
+                            holdTimer.stop()
+                            if (holding) {
+                                holding = false
+                                chatViewRoot.endCapture()
+                            }
+                        }
+
                         onClicked: {
-                            if (voiceService.isRecording) {
-                                voiceService.stopRecording()
+                            if (holding) return          // the hold already handled it
+                            if (chatViewRoot.captureLocked) {
+                                chatViewRoot.finishLockedCapture()
                             } else if (sendButton.canSend) {
                                 sendButton.trigger()
                             } else {
-                                voiceService.startRecording()
+                                chatViewRoot.toggleCaptureMode()
                             }
                         }
                     }
@@ -834,7 +1398,8 @@ Item {
     }
 
     function addMessage(senderId, senderName, text, time, isMine, isRead, fileUrl, fileDurationMs, fileEncrypted,
-                         messageId, contentType, fileName, fileSize) {
+                         messageId, contentType, fileName, fileSize, thumbnailUrl,
+                         rawContent, rawEncrypted, rawKeyVersion) {
         const prev = messagesModel.count > 0 ? messagesModel.get(messagesModel.count - 1) : null
         const showSender = !isMine && (!prev || prev.senderId !== senderId)
         messagesModel.append({
@@ -843,6 +1408,13 @@ Item {
             senderId: senderId,
             senderName: senderName,
             messageText: text,
+            // Kept so the delegate can decrypt at display time. A row painted
+            // from cache before the chat list was parsed has no key yet; with
+            // only the decrypted string stored, it stayed stuck on the
+            // placeholder for the rest of the session.
+            rawContent: rawContent || "",
+            rawEncrypted: rawEncrypted === true,
+            rawKeyVersion: rawKeyVersion || 0,
             messageTime: time,
             isMine: isMine,
             isRead: isRead === true,
@@ -851,13 +1423,134 @@ Item {
             voiceDurationMs: fileDurationMs || 0,
             voiceEncrypted: fileEncrypted === true,
             contentType: contentType || "",
+            thumbnailUrl: thumbnailUrl || "",
             fileName: fileName || "",
             fileSize: fileSize || 0
         })
+        // Keep the sidebar snippet current while this chat is open - own
+        // sends never go through onMessageReceived (they're filtered as
+        // echoes), and incoming ones used to be skipped for the active chat.
+        pushChatListPreview()
     }
 
     // A small non-bubble line inline in the thread (e.g. a security code
     // change notice) - never sent anywhere, never cached, purely local.
+    // ---- Multi-select ----
+    // selectedIds is a plain array of message ids. It is reassigned rather than
+    // mutated in place, because QML only re-evaluates bindings on assignment -
+    // push() alone would leave every "is this row selected" binding stale.
+    property bool selectionMode: false
+    property var selectedIds: []
+
+    readonly property int selectedCount: selectedIds.length
+
+    // "Delete for everyone" is the sender's privilege, so it is only offered
+    // when every selected message is mine.
+    readonly property bool allSelectedAreMine: {
+        if (selectedIds.length === 0) return false
+        for (var i = 0; i < messagesModel.count; i++) {
+            var row = messagesModel.get(i)
+            if (selectedIds.indexOf(row.messageId) !== -1 && !row.isMine) return false
+        }
+        return true
+    }
+
+    function isSelected(messageId) {
+        return selectedIds.indexOf(messageId) !== -1
+    }
+
+    function toggleSelection(messageId) {
+        if (!messageId || messageId.length === 0) return
+        var next = selectedIds.slice()
+        var at = next.indexOf(messageId)
+        if (at === -1) next.push(messageId)
+        else next.splice(at, 1)
+        selectedIds = next
+        // Leaving the last item deselected drops out of selection mode, so the
+        // chat does not stay in a modal state with nothing selected.
+        if (selectedIds.length === 0) selectionMode = false
+    }
+
+    function enterSelection(messageId) {
+        selectionMode = true
+        selectedIds = []
+        toggleSelection(messageId)
+    }
+
+    function clearSelection() {
+        selectedIds = []
+        selectionMode = false
+    }
+
+    function selectAll() {
+        var next = []
+        for (var i = 0; i < messagesModel.count; i++) {
+            var row = messagesModel.get(i)
+            if (row.messageKind !== "system" && row.messageId && row.messageId.length > 0) {
+                next.push(row.messageId)
+            }
+        }
+        selectedIds = next
+        selectionMode = next.length > 0
+    }
+
+    // Deletes every selected message. The rows disappear as each request comes
+    // back (onMessageDeleted), not optimistically - a failed delete should not
+    // leave the message missing from the list but present on the server.
+    function deleteSelected(forEveryone) {
+        var ids = selectedIds.slice()
+        clearSelection()
+        for (var i = 0; i < ids.length; i++) {
+            chatService.deleteMessage(chatViewRoot.currentChatId, ids[i], forEveryone)
+        }
+    }
+
+    // Drops a row by message id, wherever it currently sits.
+    function removeMessageById(messageId) {
+        if (!messageId || messageId.length === 0) return
+        for (var i = 0; i < messagesModel.count; i++) {
+            if (messagesModel.get(i).messageId === messageId) {
+                messagesModel.remove(i)
+                break
+            }
+        }
+        // Drop it from the selection too, or the count keeps counting rows
+        // that no longer exist.
+        var at = selectedIds.indexOf(messageId)
+        if (at !== -1) {
+            var next = selectedIds.slice()
+            next.splice(at, 1)
+            selectedIds = next
+            if (selectedIds.length === 0) selectionMode = false
+        }
+        // The open chat's messagesModel is authoritative while we're looking
+        // at it - the SQLite cache can still hold a now-deleted "last"
+        // message (or miss ones only ever shown optimistically), so push the
+        // preview from here rather than waiting on ChatService's cache path.
+        pushChatListPreview()
+    }
+
+    // Newest non-system bubble → chat-list preview string.
+    function previewFromMessagesModel() {
+        for (var i = messagesModel.count - 1; i >= 0; i--) {
+            var m = messagesModel.get(i)
+            if (m.messageKind === "system") continue
+            var t = m.contentType || ""
+            if (t === "audio") return "🎤 Voice message"
+            if (t === "image") return "📷 Photo"
+            if (t === "video_note") return "📹 Video message"
+            if (t === "file") return "📎 " + (m.fileName && m.fileName.length > 0 ? m.fileName : "File")
+            return m.messageText || ""
+        }
+        return ""
+    }
+
+    function pushChatListPreview() {
+        if (!chatViewRoot.currentChatId || chatViewRoot.currentChatId.length === 0) return
+        if (chatService !== undefined)
+            chatService.notifyChatPreview(chatViewRoot.currentChatId, previewFromMessagesModel())
+    }
+
     function addSystemMessage(text) {
         messagesModel.append({
             messageKind: "system",
@@ -865,6 +1558,9 @@ Item {
             senderId: "",
             senderName: "",
             messageText: text,
+            rawContent: "",
+            rawEncrypted: false,
+            rawKeyVersion: 0,
             messageTime: "",
             isMine: false,
             isRead: false,
@@ -873,6 +1569,7 @@ Item {
             voiceDurationMs: 0,
             voiceEncrypted: false,
             contentType: "",
+            thumbnailUrl: "",
             fileName: "",
             fileSize: 0
         })
@@ -902,6 +1599,120 @@ Item {
         var d = new Date(isoString)
         if (isNaN(d.getTime())) return ""
         return Qt.formatTime(d, "h:mm AP")
+    }
+
+    // One menu shared by every row - instantiating a Menu per message would
+    // build hundreds of them for a long chat.
+    // Styled to match ChatList's context menu - a GlassPanel background and
+    // hand-built MenuItem content. The stock QuickControls2 Menu paints an
+    // opaque grey system popup that ignores the theme entirely, which looks
+    // pasted on over the glass surfaces everything else uses.
+    Menu {
+        id: messageMenu
+        property string targetMessageId: ""
+        property bool targetIsMine: false
+
+        padding: 6
+
+        background: GlassPanel {
+            implicitWidth: 190
+            darkMode: chatViewRoot.darkMode
+            radius: 10
+            sheen: false
+        }
+
+        MenuItem {
+            text: "Select"
+            onTriggered: chatViewRoot.enterSelection(messageMenu.targetMessageId)
+            contentItem: Text {
+                text: parent.text
+                font.pixelSize: 13
+                color: chatViewRoot.textColor
+                verticalAlignment: Text.AlignVCenter
+                leftPadding: 10
+            }
+            background: Rectangle {
+                implicitHeight: 34
+                radius: 6
+                color: parent.hovered
+                       ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g,
+                                 chatViewRoot.accentColor.b, 0.14)
+                       : "transparent"
+            }
+        }
+
+        MenuSeparator {
+            contentItem: Rectangle {
+                implicitHeight: 1
+                color: chatViewRoot.borderColor
+            }
+        }
+
+        MenuItem {
+            text: "Delete for me"
+            onTriggered: chatService.deleteMessage(chatViewRoot.currentChatId,
+                                                    messageMenu.targetMessageId, false)
+            contentItem: Text {
+                text: parent.text
+                font.pixelSize: 13
+                color: "#FF6B6B"
+                verticalAlignment: Text.AlignVCenter
+                leftPadding: 10
+            }
+            background: Rectangle {
+                implicitHeight: 34
+                radius: 6
+                color: parent.hovered ? Qt.rgba(1, 0.42, 0.42, 0.12) : "transparent"
+            }
+        }
+
+        MenuItem {
+            // Retracting for both sides is the sender's privilege; the server
+            // enforces it too, this just avoids offering what would be refused.
+            text: "Delete for everyone"
+            enabled: messageMenu.targetIsMine
+            onTriggered: chatService.deleteMessage(chatViewRoot.currentChatId,
+                                                    messageMenu.targetMessageId, true)
+            contentItem: Text {
+                text: parent.text
+                font.pixelSize: 13
+                // Dimmed rather than hidden when it does not apply, so the
+                // menu keeps a stable shape between your messages and theirs.
+                color: parent.enabled ? "#FF6B6B" : chatViewRoot.textSecondary
+                opacity: parent.enabled ? 1.0 : 0.5
+                verticalAlignment: Text.AlignVCenter
+                leftPadding: 10
+            }
+            background: Rectangle {
+                implicitHeight: 34
+                radius: 6
+                color: (parent.hovered && parent.enabled)
+                       ? Qt.rgba(1, 0.42, 0.42, 0.12) : "transparent"
+            }
+        }
+    }
+
+    // Loaded on demand so the camera stack is only touched when a video
+    // message is actually being recorded.
+    Loader {
+        id: roundVideoOverlayLoader
+        anchors.fill: parent
+        z: 100
+        active: chatViewRoot.captureActive
+        sourceComponent: RoundVideoOverlay {
+            darkMode: chatViewRoot.darkMode
+            accentColor: chatViewRoot.myMessageBg
+            dragX: chatViewRoot.captureDragX
+            dragY: chatViewRoot.captureDragY
+            willCancel: chatViewRoot.captureWillCancel
+            willLock: chatViewRoot.captureWillLock
+            isLocked: chatViewRoot.captureLocked
+
+            onStopRequested: chatViewRoot.finishLockedCapture()
+            onCancelRequested: chatViewRoot.cancelCapture()
+            onPauseRequested: roundVideoService.togglePause()
+            onFlipRequested: roundVideoService.switchCamera()
+        }
     }
 
     Component.onCompleted: {

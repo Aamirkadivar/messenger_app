@@ -148,7 +148,7 @@ object E2ECrypto {
     // of once per recipient. Byte-for-byte compatible with the Windows client's
     // Encryption::secretBox* (crypto_secretbox_easy). Wire format: nonce[24] ||
     // ciphertext, hex-encoded when embedded in a JSON string field (group text),
-    // raw bytes otherwise (would apply to group voice/attachments, not yet wired).
+    // raw bytes for uploaded media (group voice / attachments / round video).
 
     /** Generates a new random Sender Key. Returns its 32-byte hex encoding. */
     fun secretBoxGenerateKey(): String? {

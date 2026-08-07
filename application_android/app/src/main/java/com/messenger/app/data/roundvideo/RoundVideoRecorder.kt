@@ -20,7 +20,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -32,6 +34,8 @@ enum class RoundLens { FRONT, BACK }
 data class RoundRecorderState(
     val isPreviewing: Boolean = false,
     val isRecording: Boolean = false,
+    /** Paused mid-take; the file stays open and resuming appends to it. */
+    val isPaused: Boolean = false,
     val lens: RoundLens = RoundLens.FRONT,
     val elapsedMs: Long = 0,
     /** Set when the camera or encoder failed, for the UI to surface. */
@@ -64,6 +68,9 @@ class RoundVideoRecorder @Inject constructor(
 
         /** Telegram caps round videos at 60s; longer belongs in a file. */
         const val MAX_DURATION_MS = 60_000L
+
+        /** How long to wait for CameraX to close the container after stop(). */
+        private const val FINALIZE_TIMEOUT_MS = 4_000L
     }
 
     private val _state = MutableStateFlow(RoundRecorderState())
@@ -75,6 +82,9 @@ class RoundVideoRecorder @Inject constructor(
     private var recording: Recording? = null
 
     private var outputFile: File? = null
+
+    /** Completed when CameraX reports Finalize, i.e. the MP4 is closed. */
+    private var finalizeSignal: CompletableDeferred<Unit>? = null
     private var lifecycleOwner: LifecycleOwner? = null
     private var surfaceProvider: Preview.SurfaceProvider? = null
 
@@ -167,28 +177,45 @@ class RoundVideoRecorder @Inject constructor(
             // disk for as little time as possible and is deleted once encrypted.
             val file = File.createTempFile("round_", ".mp4", context.cacheDir)
             outputFile = file
+            finalizeSignal = CompletableDeferred()
 
-            val options = FileOutputOptions.Builder(file).build()
+            // CameraX enforces the cap itself and finalises cleanly at the
+            // limit. Watching elapsed time in the Status callback and stopping
+            // from there cannot work: stopping now has to await finalisation,
+            // and that callback is not a coroutine.
+            val options = FileOutputOptions.Builder(file)
+                .setDurationLimitMillis(MAX_DURATION_MS)
+                .build()
             recording = capture.output
                 .prepareRecording(context, options)
                 .withAudioEnabled()
                 .start(mainExecutor) { event ->
                     when (event) {
                         is VideoRecordEvent.Start ->
-                            _state.update { it.copy(isRecording = true, elapsedMs = 0, error = null) }
+                            _state.update {
+                                it.copy(isRecording = true, isPaused = false, elapsedMs = 0, error = null)
+                            }
+
+                        is VideoRecordEvent.Pause ->
+                            _state.update { it.copy(isPaused = true) }
+
+                        is VideoRecordEvent.Resume ->
+                            _state.update { it.copy(isPaused = false) }
 
                         is VideoRecordEvent.Status -> {
                             val ms = event.recordingStats.recordedDurationNanos / 1_000_000
                             _state.update { it.copy(elapsedMs = ms) }
-                            if (ms >= MAX_DURATION_MS) stop()
                         }
 
                         is VideoRecordEvent.Finalize -> {
+                            finalizeSignal?.complete(Unit)
                             if (event.hasError()) {
                                 Log.e(TAG, "recording error ${event.error}", event.cause)
-                                _state.update { it.copy(isRecording = false, error = "Recording failed") }
+                                _state.update {
+                                    it.copy(isRecording = false, isPaused = false, error = "Recording failed")
+                                }
                             } else {
-                                _state.update { it.copy(isRecording = false) }
+                                _state.update { it.copy(isRecording = false, isPaused = false) }
                             }
                         }
                     }
@@ -202,36 +229,68 @@ class RoundVideoRecorder @Inject constructor(
     }
 
     /**
-     * Stops recording and returns the captured file, or null if the take was
+     * Pauses or resumes the take without ending it.
+     *
+     * CameraX keeps the same file open across a pause, so resuming appends
+     * rather than starting a second clip - which is the whole point of
+     * offering pause instead of a second way to stop.
+     */
+    fun togglePause() {
+        val rec = recording ?: return
+        if (_state.value.isPaused) {
+            runCatching { rec.resume() }
+        } else {
+            runCatching { rec.pause() }
+        }
+    }
+
+    /**
+     * Stops recording and returns the finished file, or null if the take was
      * too short to be a real message.
      *
-     * Finalize arrives asynchronously, so the file is not guaranteed complete
-     * the instant this returns - [RoundVideoRepository] awaits finalisation
-     * before reading it.
+     * Suspends until CameraX reports Finalize, because that is when the muxer
+     * actually closes the container. Reading the file before then yields a
+     * truncated MP4 with no moov atom, which no decoder will open.
+     *
+     * Ownership of the file transfers to the caller: [outputFile] is cleared
+     * here so a later [release]/[cancel] cannot delete a recording that is
+     * already on its way to being sent.
      */
-    fun stop(): File? {
+    suspend fun stopAndAwait(): File? {
         val rec = recording ?: return null
         val elapsed = _state.value.elapsedMs
+        val signal = finalizeSignal
         recording = null
         runCatching { rec.stop() }
+
+        // Bounded: a device that never delivers Finalize must not hang the
+        // send forever. The partial file is usually still playable.
+        withTimeoutOrNull(FINALIZE_TIMEOUT_MS) { signal?.await() }
         _state.update { it.copy(isRecording = false) }
 
         val file = outputFile
-        if (elapsed < MIN_DURATION_MS) {
+        outputFile = null
+        if (elapsed < MIN_DURATION_MS || file == null || file.length() == 0L) {
             file?.delete()
-            outputFile = null
             return null
         }
         return file
     }
 
-    /** Aborts the take and deletes the partial file (slide-left-to-cancel). */
+    /**
+     * Aborts the take and deletes the partial file (slide-left-to-cancel).
+     *
+     * Only ever deletes a file this recorder still owns - [stopAndAwait]
+     * clears the field before handing the recording over, so calling
+     * [release] straight after a send cannot destroy it.
+     */
     fun cancel() {
         recording?.let { runCatching { it.stop() } }
         recording = null
+        finalizeSignal = null
         outputFile?.delete()
         outputFile = null
-        _state.update { it.copy(isRecording = false, elapsedMs = 0) }
+        _state.update { it.copy(isRecording = false, isPaused = false, elapsedMs = 0) }
     }
 
     /** Releases the camera. Called when the overlay closes. */

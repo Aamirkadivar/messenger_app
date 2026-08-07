@@ -17,6 +17,7 @@
 class ChatService : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool isLoading READ isLoading NOTIFY isLoadingChanged)
+    Q_PROPERTY(int cryptoRevision READ cryptoRevision NOTIFY cryptoRevisionChanged)
 
 public:
     // groupService may be null (falls back to sending groups unencrypted,
@@ -43,9 +44,25 @@ public:
     // DeleteChat). A later message in a direct chat brings it back.
     Q_INVOKABLE void deleteChat(const QString& chatId);
 
+    // Removes a single message. forEveryone retracts it for both sides and is
+    // only permitted on your own messages; otherwise it is stamped into the
+    // server's deleted_for list and disappears from this account's view alone,
+    // matching how deleteChat is "mine only".
+    Q_INVOKABLE void deleteMessage(const QString& chatId, const QString& messageId,
+                                    bool forEveryone);
+
     // Returns (and clears) a security-code-change notice queued for chatId
     // while it wasn't the open chat, so it still surfaces the moment the
     // user opens that chat - empty string if there's nothing pending.
+    // Drops a message from the local cache and refreshes the chat-list
+    // preview from whatever remains. Used for for_everyone retractions
+    // arriving over the socket (ChatService's own deleteMessage path does
+    // the same after the REST call succeeds).
+    Q_INVOKABLE void noteMessageDeleted(const QString& chatId, const QString& messageId);
+    // Push a preview computed by the open ChatView (live messagesModel). The
+    // message cache can lag behind the UI while a chat is open - e.g. after
+    // deleting the last visible message - so the view owns the truth there.
+    Q_INVOKABLE void notifyChatPreview(const QString& chatId, const QString& preview);
     Q_INVOKABLE QString takePendingSecurityNotice(const QString& chatId);
 
     // Local on-disk cache (SQLite) - exposed for the Settings screen's
@@ -62,9 +79,8 @@ public:
     Q_INVOKABLE QString decryptMessage(const QString& chatId, const QString& content, bool encrypted,
                                        const QString& senderId = QString(), int keyVersion = 0) const;
 
-    // Whether we currently hold the key needed to encrypt/decrypt for this
-    // chat (false for a group, where the pairwise scheme doesn't apply - see
-    // the note on encryptBytesForChat below).
+    // Whether we currently hold a pairwise key for this chat (direct only).
+    // Groups use Sender Keys - see hasGroupSenderKey / encryptBytesForChat.
     Q_INVOKABLE bool hasKeyForChat(const QString& chatId) const;
 
     // Whether MY OWN group Sender Key is established and current (matches
@@ -72,14 +88,14 @@ public:
     // generate and distribute one before it can actually send encrypted.
     Q_INVOKABLE bool hasGroupSenderKey(const QString& chatId) const;
 
-    // ---- Voice notes ----
-    // Voice is content, so it gets the same E2EE treatment as text. The
-    // pairwise crypto_box scheme needs exactly one recipient key, which is
-    // only meaningful for a direct chat - callers must check hasKeyForChat()
-    // first and tell the user plainly when a group voice note will go out
-    // unencrypted, rather than the failure surfacing silently as static.
+    // ---- Binary media (voice / attachment / round video) ----
+    // Direct: pairwise crypto_box. Group: Sender Key secretbox (same key as
+    // group text). outKeyVersion is set for group sends (0 for direct).
+    // Returns empty on failure - callers fall back to cleartext.
     Q_INVOKABLE QByteArray encryptBytesForChat(const QString& chatId, const QByteArray& plain) const;
-    Q_INVOKABLE QByteArray decryptBytesForChat(const QString& chatId, const QByteArray& payload) const;
+    QByteArray encryptBytesForChat(const QString& chatId, const QByteArray& plain, int* outKeyVersion) const;
+    Q_INVOKABLE QByteArray decryptBytesForChat(const QString& chatId, const QByteArray& payload,
+                                               const QString& senderId = QString(), int keyVersion = 0) const;
 
     // Reads localFilePath (a just-recorded temp file), encrypts it for chatId
     // when possible, uploads it, and posts the message - one call from QML,
@@ -96,12 +112,62 @@ public:
     // note, ready to hand to VoicePlayer. Emits voiceReadyForPlayback on
     // success. QML owns actually starting playback (via voiceService) once
     // the file is ready - this call is only responsible for getting a
-    // decrypted file onto disk.
+    // decrypted file onto disk. senderId/keyVersion required for group media.
     Q_INVOKABLE void preparePlayableVoice(const QString& chatId, const QString& messageId,
-                                           const QString& fileUrl, bool encrypted);
+                                           const QString& fileUrl, bool encrypted,
+                                           const QString& senderId = QString(), int keyVersion = 0);
     // Posts the message pointing at an already-uploaded voice note.
     void sendVoiceMessage(const QString& chatId, const QString& chatType,
-                           const QString& fileUrl, qint64 durationMs, bool encrypted);
+                           const QString& fileUrl, qint64 durationMs, bool encrypted,
+                           int keyVersion = 0);
+
+    // Bumped every time a decryption key is learned. QML message rows read
+    // this inside their text binding, so a row that rendered as the
+    // "Encrypted message" placeholder - because the cached history painted
+    // before the chat list had been parsed - re-decrypts itself the moment
+    // the key lands, instead of staying wrong until the next fetch.
+    int cryptoRevision() const { return m_cryptoRevision; }
+
+    // ---- Round video messages ----
+    // Same read -> encrypt -> upload -> send orchestration as sendVoiceNote,
+    // against /messages/video-note. The wire format is deliberately identical
+    // to the Android client's - content_type "video_note", length in
+    // duration_ms, poster frame in thumbnail_url - so a note recorded on
+    // either platform renders on the other.
+    //
+    // The recording is NOT transcoded. QMediaRecorder is asked for a small,
+    // low-bitrate stream up front instead, and both clients centre-crop to the
+    // circle at playback, which keeps the format tolerant of whatever aspect
+    // the camera produced.
+    Q_INVOKABLE void sendVideoNote(const QString& chatId, const QString& chatType,
+                                    const QString& localFilePath, qint64 durationMs);
+
+    // Fetches (or reuses a cached) decrypted local copy of a round video,
+    // ready to hand to a QML MediaPlayer. Same division of labour as
+    // preparePlayableVoice: this only gets a playable file onto disk.
+    Q_INVOKABLE void preparePlayableVideoNote(const QString& chatId, const QString& messageId,
+                                               const QString& fileUrl, bool encrypted,
+                                               const QString& senderId = QString(), int keyVersion = 0);
+
+    // The poster frame, fetched separately so a bubble fills in before the
+    // much larger video has arrived.
+    Q_INVOKABLE void prepareVideoNoteThumbnail(const QString& chatId, const QString& messageId,
+                                                const QString& thumbnailUrl, bool encrypted,
+                                                const QString& senderId = QString(), int keyVersion = 0);
+
+    // Steps of the send, split so the poster-frame grab (which is async) can
+    // sit between reading the recording and uploading it.
+    void uploadVideoNote(const QString& chatId, const QString& chatType,
+                          const QByteArray& raw, qint64 durationMs,
+                          const QString& thumbnailPath);
+    void uploadVideoNoteThumbnail(const QString& chatId, const QString& chatType,
+                                   const QString& fileUrl, qint64 durationMs,
+                                   bool encrypted, int keyVersion, const QString& thumbnailPath);
+
+    // Posts the message pointing at an already-uploaded round video.
+    void sendVideoNoteMessage(const QString& chatId, const QString& chatType,
+                               const QString& fileUrl, const QString& thumbnailUrl,
+                               qint64 durationMs, bool encrypted, int keyVersion = 0);
 
     // ---- File/image attachments ----
     // localFileUrl is whatever FileDialog.selectedFile.toString() hands QML
@@ -122,7 +188,8 @@ public:
     // Qt.openUrlExternally (any other file type).
     Q_INVOKABLE void prepareAttachment(const QString& chatId, const QString& messageId,
                                         const QString& fileUrl, bool encrypted,
-                                        const QString& fileName);
+                                        const QString& fileName,
+                                        const QString& senderId = QString(), int keyVersion = 0);
 
 signals:
     void isLoadingChanged();
@@ -157,24 +224,41 @@ signals:
     void attachmentReady(const QString& messageId, const QString& localFilePath);
     void attachmentError(const QString& messageId, const QString& error);
 
+    void cryptoRevisionChanged();
+
+    void messageDeleted(const QString& chatId, const QString& messageId);
+    void messageDeleteError(const QString& error);
+    // New chat-list preview after a message was removed (empty string if the
+    // chat now has no remaining messages). Symmetric to the live update
+    // ChatList does on messageReceived.
+    void chatLastMessageChanged(const QString& chatId, const QString& preview);
+
+    void videoNoteUploadError(const QString& error);
+    void videoNoteUploadProgress(qint64 sent, qint64 total);
+    void videoNoteMessageSent(const QString& chatId, const QVariantMap& message);
+    void videoNoteReadyForPlayback(const QString& messageId, const QString& localFilePath);
+    void videoNoteThumbnailReady(const QString& messageId, const QString& localFilePath);
+    void videoNotePlaybackError(const QString& messageId, const QString& error);
+
 private slots:
     void onChatsReplyFinished(QNetworkReply* reply);
 
 private:
     void setupNetworkManager();
     QString buildAuthHeader() const;
+    // Recomputes the chat-list preview from the local message cache and emits
+    // chatLastMessageChanged. Called after any path that removes a message.
+    void refreshChatListPreview(const QString& chatId);
+    QString computeLastMessagePreview(const QString& chatId) const;
     // Posts the message pointing at an already-uploaded attachment.
     void sendAttachmentMessage(const QString& chatId, const QString& chatType,
                                 const QString& fileUrl, const QString& fileName,
-                                const QString& contentType, qint64 fileSize, bool encrypted);
+                                const QString& contentType, qint64 fileSize, bool encrypted,
+                                int keyVersion = 0);
 
     // ---- Group Sender Keys (WhatsApp/Signal-style group E2EE) ----
-    // Scoped to text messages only for now - voice/attachment sends in a
-    // group still go out unencrypted (hasKeyForChat/encryptBytesForChat
-    // above are unchanged, direct-chat-only), same as before this existed.
-    // Extending those to groups needs the sender's id and key_version
-    // threaded through preparePlayableVoice/prepareAttachment too, which
-    // this pass doesn't do.
+    // Used for group text and binary media (voice / attachment / round video).
+    // Direct chats stay on pairwise crypto_box.
     void sendGroupTextMessage(const QString& chatId, const QString& text);
     // Ensures my current Sender Key is generated and distributed to every
     // current member before calling onReady() - a no-op straight to
@@ -195,6 +279,7 @@ private:
     QNetworkAccessManager* m_networkManager = nullptr;
     QNetworkReply* m_currentReply = nullptr;
     bool m_isLoading = false;
+    int m_cryptoRevision = 0;
     MessageCache* m_messageCache = nullptr;
 
     // chatId -> the other participant's public key (hex), learned from the

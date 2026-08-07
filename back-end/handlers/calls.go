@@ -73,6 +73,7 @@ type CallLogResponse struct {
 	CallerID    string  `json:"caller_id"`
 	CalleeID    string  `json:"callee_id"`
 	IsIncoming  bool    `json:"is_incoming"`
+	IsVideo     bool    `json:"is_video"`
 	Status      string  `json:"status"`
 	StartedAt   string  `json:"started_at"`
 	ConnectedAt *string `json:"connected_at,omitempty"`
@@ -109,6 +110,7 @@ func (s *CallService) GetCallHistory(c *fiber.Ctx) error {
 			CallerID:    call.CallerID.String(),
 			CalleeID:    call.CalleeID.String(),
 			IsIncoming:  call.CalleeID == userID,
+			IsVideo:     call.IsVideo,
 			Status:      call.Status,
 			StartedAt:   call.StartedAt.Format("2006-01-02T15:04:05Z07:00"),
 			DurationSec: call.DurationSec,

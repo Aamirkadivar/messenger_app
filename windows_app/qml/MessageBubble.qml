@@ -20,6 +20,8 @@ Item {
     // url/encrypted flag regardless of type (kept named after voice since
     // that was built first, not because the other two are special-cased).
     property string messageId: ""
+    property string senderId: ""
+    property int keyVersion: 0
     property string voiceUrl: ""
     property real voiceDurationMs: 0
     property bool voiceEncrypted: false
@@ -27,10 +29,21 @@ Item {
     property string fileName: ""
     property real fileSize: 0
     property string chatId: ""
+    /** Poster frame for a round video; empty for every other type. */
+    property string thumbnailUrl: ""
+    /** Raised when a round video starts playing, so the list can reveal it. */
+    signal videoPlaybackStarted()
+    /** Right-click anywhere on the bubble - the view owns the actual menu. */
+    signal requestDelete()
+    /** True while the chat is in multi-select. */
+    property bool selectionMode: false
+    property bool selected: false
+    signal toggleSelected()
     readonly property bool isVoiceMessage: voiceUrl && voiceUrl.length > 0 && contentType === "audio"
     readonly property bool isImageMessage: voiceUrl && voiceUrl.length > 0 && contentType === "image"
     readonly property bool isFileMessage: voiceUrl && voiceUrl.length > 0 && contentType === "file"
-    readonly property bool hasAttachment: isVoiceMessage || isImageMessage || isFileMessage
+    readonly property bool isVideoNote: voiceUrl && voiceUrl.length > 0 && contentType === "video_note"
+    readonly property bool hasAttachment: isVoiceMessage || isImageMessage || isFileMessage || isVideoNote
     readonly property real imageContentSize: 220
 
     // Local decrypt-prep state for image/file attachments (voice has its own
@@ -55,7 +68,8 @@ Item {
         bubbleRoot.filePreparing = true
         bubbleRoot.fileError = ""
         chatService.prepareAttachment(bubbleRoot.chatId, bubbleRoot.messageId, bubbleRoot.voiceUrl,
-                                       bubbleRoot.voiceEncrypted, bubbleRoot.fileName)
+                                       bubbleRoot.voiceEncrypted, bubbleRoot.fileName,
+                                       bubbleRoot.senderId, bubbleRoot.keyVersion)
     }
 
     // Images load automatically (a thumbnail is the point); files wait for a
@@ -129,10 +143,85 @@ Item {
     }
 
     width: parent ? parent.width : 400
-    height: bubble.height + 4
+    height: bubbleRoot.isVideoNote ? (roundVideoLoader.height + 8) : (bubble.height + 4)
+
+    // A tinted band behind the whole row, so a selected message reads as
+    // selected even when the bubble itself is a bare circle (round video) or
+    // a translucent glass panel.
+    Rectangle {
+        anchors.fill: parent
+        anchors.margins: -2
+        visible: bubbleRoot.selected
+        color: Qt.rgba(bubbleRoot.accentColor.r, bubbleRoot.accentColor.g,
+                        bubbleRoot.accentColor.b, 0.18)
+        radius: 8
+        z: -1
+    }
+
+    // Right-click always available. The left button is only claimed while
+    // selecting - otherwise this would swallow taps meant for the voice and
+    // video controls inside the bubble.
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: bubbleRoot.selectionMode ? (Qt.LeftButton | Qt.RightButton) : Qt.RightButton
+        onClicked: function(mouse) {
+            if (bubbleRoot.selectionMode && mouse.button === Qt.LeftButton) {
+                bubbleRoot.toggleSelected()
+                return
+            }
+            bubbleRoot.requestDelete()
+        }
+    }
+
+    // Checkbox, on the outer edge of the row so it never covers bubble content.
+    Rectangle {
+        visible: bubbleRoot.selectionMode
+        width: 18
+        height: 18
+        radius: 9
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.left: bubbleRoot.isMine ? undefined : parent.left
+        anchors.right: bubbleRoot.isMine ? parent.right : undefined
+        color: bubbleRoot.selected ? bubbleRoot.accentColor : "transparent"
+        border.width: 1.5
+        border.color: bubbleRoot.selected ? bubbleRoot.accentColor
+                                           : Qt.rgba(1, 1, 1, bubbleRoot.darkMode ? 0.35 : 0.25)
+        Text {
+            anchors.centerIn: parent
+            visible: bubbleRoot.selected
+            text: "✓"
+            color: "#FFFFFF"
+            font.pixelSize: 11
+            font.bold: true
+        }
+    }
+
+    // A round video gets no bubble chrome - a rounded rectangle behind a
+    // circle just boxes it in. Loaded on demand so a chat full of text does
+    // not instantiate a MediaPlayer per message.
+    Loader {
+        id: roundVideoLoader
+        active: bubbleRoot.isVideoNote
+        visible: active
+        anchors.right: isMine ? parent.right : undefined
+        anchors.left: isMine ? undefined : parent.left
+        sourceComponent: RoundVideoBubble {
+            messageId: bubbleRoot.messageId
+            chatId: bubbleRoot.chatId
+            fileUrl: bubbleRoot.voiceUrl
+            thumbnailUrl: bubbleRoot.thumbnailUrl
+            encrypted: bubbleRoot.voiceEncrypted
+            senderId: bubbleRoot.senderId
+            keyVersion: bubbleRoot.keyVersion
+            durationMs: bubbleRoot.voiceDurationMs
+            accentColor: bubbleRoot.myMessageBg
+            onPlaybackStarted: bubbleRoot.videoPlaybackStarted()
+        }
+    }
 
     Rectangle {
         id: bubble
+        visible: !bubbleRoot.isVideoNote
         anchors.right: isMine ? parent.right : undefined
         anchors.left: isMine ? undefined : parent.left
         width: (bubbleRoot.isVoiceMessage || bubbleRoot.isFileMessage)
@@ -384,7 +473,8 @@ Item {
                             bubbleRoot.voicePreparing = true
                             bubbleRoot.voiceError = ""
                             chatService.preparePlayableVoice(bubbleRoot.chatId, bubbleRoot.messageId,
-                                                              bubbleRoot.voiceUrl, bubbleRoot.voiceEncrypted)
+                                                              bubbleRoot.voiceUrl, bubbleRoot.voiceEncrypted,
+                                                              bubbleRoot.senderId, bubbleRoot.keyVersion)
                         }
                     }
                 }

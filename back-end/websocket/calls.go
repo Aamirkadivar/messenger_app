@@ -11,26 +11,44 @@ import (
 	"github.com/google/uuid"
 )
 
-// CallSignalTypes are the WS message types relayed 1:1 between a call's two
-// participants. Only signaling (SDP offer/answer, ICE candidates) ever
-// touches the server - the actual audio is DTLS-SRTP directly between the
-// two peers via libdatachannel, negotiated from this exchange, so the server
-// can no more listen in on a call than it can read an E2EE message.
+// CallSignalTypes are the WS message types for calls. Pairwise types
+// (invite/answer/ICE/reject/end/media) are relayed 1:1. Group session types
+// (group_invite/join/leave) are fanned out to chat members. Only signaling
+// ever touches the server - media is DTLS-SRTP peer-to-peer (full mesh for
+// group calls, one PeerConnection per remote participant).
 var CallSignalTypes = map[string]bool{
 	"call:invite":        true,
 	"call:answer":        true,
 	"call:ice_candidate": true,
 	"call:reject":        true,
 	"call:end":           true,
+	"call:media":         true,
+	"call:group_invite":  true,
+	"call:group_join":    true,
+	"call:group_leave":   true,
 }
 
-// handleCallSignal validates and relays a call signaling message straight to
-// its one intended recipient (BroadcastToUser), and keeps CallLog in sync so
-// call history ("Missed call", "Answered", duration) works without the
-// server ever needing to understand the call's media.
+var groupCallSignalTypes = map[string]bool{
+	"call:group_invite": true,
+	"call:group_join":   true,
+	"call:group_leave":  true,
+}
+
+// MaxGroupCallParticipants caps a mesh group call. Full mesh is O(N²) media
+// paths; Windows software Opus/VP8 and mobile upload make larger rooms
+// impractical without an SFU.
+const MaxGroupCallParticipants = 4
+
+// handleCallSignal validates and relays call signaling. Pairwise messages go
+// to one recipient; group session messages fan out to other chat members.
 func handleCallSignal(hub *Hub, fromUserID uuid.UUID, wsMsg models.WebSocketMessage) {
 	data, ok := wsMsg.Data.(map[string]interface{})
 	if !ok {
+		return
+	}
+
+	if groupCallSignalTypes[wsMsg.Type] {
+		handleGroupCallSignal(hub, fromUserID, wsMsg, data)
 		return
 	}
 
@@ -61,12 +79,14 @@ func handleCallSignal(hub *Hub, fromUserID uuid.UUID, wsMsg models.WebSocketMess
 			return
 		}
 
+		isVideo, _ := data["video"].(bool)
 		database.DB.Create(&models.CallLog{
 			ID:        callID,
 			ChatID:    chatID,
 			CallerID:  fromUserID,
 			CalleeID:  toUserID,
 			Status:    "ringing",
+			IsVideo:   isVideo,
 			StartedAt: time.Now(),
 		})
 
@@ -101,9 +121,6 @@ func handleCallSignal(hub *Hub, fromUserID uuid.UUID, wsMsg models.WebSocketMess
 		return
 	}
 	if err := hub.BroadcastToUser(toUserID, out); err != nil {
-		// Callee disconnected mid-call (or between invite and answer) -
-		// report back to the caller instead of leaving them hanging with a
-		// call that will never ring or connect.
 		if wsMsg.Type == "call:invite" || wsMsg.Type == "call:ice_candidate" {
 			finalizeCallLog(callIDStr)
 			sendCallEventTo(hub, fromUserID, "call:end", map[string]interface{}{
@@ -112,6 +129,114 @@ func handleCallSignal(hub *Hub, fromUserID uuid.UUID, wsMsg models.WebSocketMess
 			})
 		}
 	}
+}
+
+// handleGroupCallSignal fans a group-session event to other members of the
+// chat (or an explicit participant_ids list). Pairwise SDP/ICE still uses
+// call:invite etc. under a shared group_call_id on the clients.
+func handleGroupCallSignal(hub *Hub, fromUserID uuid.UUID, wsMsg models.WebSocketMessage, data map[string]interface{}) {
+	chatID, _ := data["chat_id"].(string)
+	if chatID == "" || !isChatMember(fromUserID, chatID) {
+		log.Printf("%s rejected: %s is not a member of chat %s", wsMsg.Type, fromUserID, chatID)
+		return
+	}
+
+	callIDStr, _ := data["call_id"].(string)
+	if callIDStr == "" {
+		callIDStr = uuid.NewString()
+		data["call_id"] = callIDStr
+	}
+	data["from_user_id"] = fromUserID.String()
+	wsMsg.Data = data
+
+	var targets []uuid.UUID
+	switch wsMsg.Type {
+	case "call:group_invite":
+		// Prefer the caller's capped roster when present (clients truncate to
+		// MaxGroupCallParticipants). Fall back to every active member.
+		members := parseUUIDList(data["participant_ids"])
+		if len(members) == 0 {
+			members = activeMemberIDs(chatID)
+		}
+		if len(members) > MaxGroupCallParticipants {
+			log.Printf("call:group_invite rejected: %d participants (max %d)", len(members), MaxGroupCallParticipants)
+			sendCallEventTo(hub, fromUserID, "call:group_leave", map[string]interface{}{
+				"call_id":      callIDStr,
+				"chat_id":      chatID,
+				"from_user_id": fromUserID.String(),
+				"reason":       "too_large",
+			})
+			return
+		}
+		for _, id := range members {
+			if id != fromUserID {
+				targets = append(targets, id)
+			}
+		}
+	case "call:group_join", "call:group_leave":
+		if ids := parseUUIDList(data["participant_ids"]); len(ids) > 0 {
+			for _, id := range ids {
+				if id != fromUserID {
+					targets = append(targets, id)
+				}
+			}
+		} else {
+			for _, id := range activeMemberIDs(chatID) {
+				if id != fromUserID {
+					targets = append(targets, id)
+				}
+			}
+		}
+	}
+
+	out, err := json.Marshal(wsMsg)
+	if err != nil {
+		return
+	}
+	for _, to := range targets {
+		if !hub.IsUserOnline(to) {
+			continue
+		}
+		if err := hub.BroadcastToUser(to, out); err != nil {
+			log.Printf("%s fanout to %s failed: %v", wsMsg.Type, to, err)
+		}
+	}
+}
+
+func parseUUIDList(raw interface{}) []uuid.UUID {
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]uuid.UUID, 0, len(arr))
+	for _, v := range arr {
+		s, _ := v.(string)
+		id, err := uuid.Parse(s)
+		if err != nil {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func isChatMember(userID uuid.UUID, chatID string) bool {
+	if chatID == "" {
+		return false
+	}
+	var count int64
+	database.DB.Model(&models.ChatParticipant{}).
+		Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, userID).
+		Count(&count)
+	return count == 1
+}
+
+func activeMemberIDs(chatID string) []uuid.UUID {
+	var ids []uuid.UUID
+	database.DB.Model(&models.ChatParticipant{}).
+		Where("chat_id = ? AND left_at IS NULL", chatID).
+		Pluck("user_id", &ids)
+	return ids
 }
 
 // finalizeCallLog closes out a CallLog row when a call ends, computing talk
@@ -158,9 +283,9 @@ func sendCallEventTo(hub *Hub, toUserID uuid.UUID, eventType string, data map[st
 	_ = hub.BroadcastToUser(toUserID, out)
 }
 
-// areChatParticipants checks that both users are (still) active participants
-// of the same direct chat - a call, like a message, shouldn't be dialable
-// between users who don't actually share a conversation.
+// areChatParticipants checks that both users are active participants of the
+// same chat (direct or group). Pairwise mesh edges inside a group call use
+// this the same way 1:1 invites do.
 func areChatParticipants(userA, userB uuid.UUID, chatID string) bool {
 	if chatID == "" {
 		return false

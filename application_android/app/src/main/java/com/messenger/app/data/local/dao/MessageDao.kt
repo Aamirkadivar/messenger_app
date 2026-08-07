@@ -28,6 +28,9 @@ interface MessageDao {
     @Query("SELECT * FROM messages WHERE id = :messageId")
     suspend fun getMessageById(messageId: String): MessageEntity?
 
+    @Query("SELECT * FROM messages WHERE conversation_id = :convId ORDER BY timestamp DESC LIMIT 1")
+    suspend fun getLatestMessage(convId: String): MessageEntity?
+
     @Query("SELECT COUNT(*) FROM messages WHERE conversation_id = :convId")
     fun getMessageCount(convId: String): Flow<Int>
 

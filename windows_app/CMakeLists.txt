@@ -80,8 +80,18 @@ set(PROJECT_SOURCES
     src/services/groupservice.h
     src/services/voiceservice.cpp
     src/services/voiceservice.h
+    src/services/roundvideoservice.cpp
+    src/services/roundvideoservice.h
+    src/utils/circularvideoitem.cpp
+    src/utils/circularvideoitem.h
+    src/utils/videoframeitem.cpp
+    src/utils/videoframeitem.h
+    src/utils/videothumbnailer.cpp
+    src/utils/videothumbnailer.h
     src/services/callservice.cpp
     src/services/callservice.h
+    src/services/videocallengine.cpp
+    src/services/videocallengine.h
     src/utils/config.h
     src/utils/appconfig.h
     src/utils/credentialmanager.cpp
@@ -233,6 +243,9 @@ set(CALLING_LIBS
     "${CALLING_LIB_DIR}/libssl.a"
     "${CALLING_LIB_DIR}/libcrypto.a"
     "${CALLING_LIB_DIR}/libopus.a"
+    # VP8 for video calls - encode/decode is hand-rolled in videocallengine.cpp
+    # the same way opus is for audio.
+    "${CALLING_LIB_DIR}/libvpx.a"
 )
 set(CALLING_FOUND ON)
 foreach(lib ${CALLING_LIBS})

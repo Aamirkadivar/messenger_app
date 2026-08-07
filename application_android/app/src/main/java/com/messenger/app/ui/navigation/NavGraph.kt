@@ -175,8 +175,13 @@ fun MainNavGraph(
                     null
                 },
                 onNavigateBack = { navController.popBackStack() },
-                onStartCall = if (isGroup) null else { calleeId, calleeName ->
-                    callViewModel.startCall(chatId, calleeId, calleeName)
+                onStartCall = if (isGroup) null else { calleeId, calleeName, video ->
+                    callViewModel.startCall(chatId, calleeId, calleeName, video)
+                },
+                onStartGroupCall = if (isGroup) {
+                    { video -> callViewModel.startGroupCall(chatId, chatName, video) }
+                } else {
+                    null
                 }
             )
         }

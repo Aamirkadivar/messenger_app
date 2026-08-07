@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Icon
@@ -131,7 +132,9 @@ fun RecordingIndicator(
     elapsedMs: Long,
     amplitude: Float,
     onCancel: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** True once the user slid up to record hands-free. */
+    isLocked: Boolean = false
 ) {
     val level by animateFloatAsState(amplitude.coerceIn(0f, 1f), label = "micLevel")
 
@@ -140,7 +143,7 @@ fun RecordingIndicator(
             .fillMaxWidth()
             .semantics(mergeDescendants = true) {
                 contentDescription = "Recording, ${formatVoiceDuration(elapsedMs)}. " +
-                    "Release to send."
+                    if (isLocked) "Locked. Tap send when finished." else "Release to send."
             },
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -159,8 +162,19 @@ fun RecordingIndicator(
             color = MaterialTheme.colorScheme.onSurface
         )
         Spacer(Modifier.weight(1f))
+        if (isLocked) {
+            Icon(
+                Icons.Filled.Lock,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(Modifier.width(6.dp))
+        }
+        // Lock is communicated by the capsule floating above the button, so
+        // this only has to cover the other direction.
         Text(
-            text = "Release to send",
+            text = if (isLocked) "Hands-free" else "← Slide to cancel",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -173,5 +187,8 @@ fun RecordingIndicator(
                 .clickable(role = Role.Button, onClick = onCancel)
                 .semantics { contentDescription = "Cancel recording" }
         )
+        // The record button grows to 1.35x while recording and was covering
+        // the Cancel label; this keeps it clear of the overlap.
+        Spacer(Modifier.width(10.dp))
     }
 }
