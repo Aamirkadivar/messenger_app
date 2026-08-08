@@ -47,6 +47,10 @@ data class MessageDto(
     @SerialName("thumbnail_url") val thumbnailUrl: String? = null,
     /** Which of the sender's group Sender Key versions encrypted this message. Meaningless outside a group. */
     @SerialName("key_version") val keyVersion: Int = 0,
+    @SerialName("reply_to_id") val replyToId: String? = null,
+    @SerialName("is_forwarded") val isForwarded: Boolean = false,
+    @SerialName("forwarded_from_name") val forwardedFromName: String = "",
+    @SerialName("forwarded_from_message_id") val forwardedFromMessageId: String? = null,
     val type: String? = null,
     @SerialName("delivered_at") val deliveredAt: String? = null,
     @SerialName("read_at") val readAt: String? = null,
@@ -81,7 +85,18 @@ data class SendMessageRequest(
     /** A round video's poster frame, so its bubble fills in before the video lands. */
     @SerialName("thumbnail_url") val thumbnailUrl: String = "",
     /** Only meaningful (and only ever non-zero) for a group message - see MessageDto.keyVersion. */
-    @SerialName("key_version") val keyVersion: Int = 0
+    @SerialName("key_version") val keyVersion: Int = 0,
+    @SerialName("reply_to_id") val replyToId: String = "",
+    @SerialName("is_forwarded") val isForwarded: Boolean = false,
+    @SerialName("forwarded_from_name") val forwardedFromName: String = "",
+    @SerialName("forwarded_from_message_id") val forwardedFromMessageId: String = ""
+)
+
+/** Display-only forward attribution stamped on a newly sent message. */
+data class ForwardMeta(
+    val isForwarded: Boolean = false,
+    val fromName: String = "",
+    val fromMessageId: String = ""
 )
 
 @Serializable

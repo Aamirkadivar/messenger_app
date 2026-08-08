@@ -111,18 +111,19 @@ Item {
     // ---- Video layers (video calls only) ----
     // Painted below the ColumnLayout so name/status/buttons stay on top.
 
-    // Remote feed, full-bleed once connected (1:1 only).
+    // Remote feed once connected (1:1). Fit letterboxes a portrait phone
+    // feed (black side bars) instead of centre-cropping the face away.
     VideoFrame {
         id: remoteView
         anchors.fill: parent
+        fillMode: VideoFrame.Fit
         visible: callService.isVideoCall && !callService.isGroupCall && hasFrame && callService.remoteCameraOn
                  && (callService.status === "connected" || callService.status === "connecting")
     }
 
-    // Group video: Meet-style grid — every tile is 16:9, centre-cropped
-    // (VideoFrame already cover-crops), sized to the largest fit that keeps
-    // aspect, then centred in the available area. Self is a tile in the
-    // grid (not a floating PiP), matching Meet's small-meeting layout.
+    // Group video: Meet-style 16:9 tile grid. VideoFrame uses Fit so a
+    // vertical phone camera keeps its full frame with black side bars.
+    // Self is a tile in the grid (not a floating PiP).
     Item {
         id: groupVideoArea
         anchors.fill: parent
@@ -212,6 +213,7 @@ Item {
                         id: peerVideo
                         anchors.fill: parent
                         radius: 12
+                        fillMode: VideoFrame.Fit
                         mirror: peerCell.isSelf
                         visible: peerCell.peerCameraOn && hasFrame
                     }
@@ -267,6 +269,7 @@ Item {
         id: localFullView
         anchors.fill: parent
         mirror: true
+        fillMode: VideoFrame.Fit
         visible: callService.isVideoCall && hasFrame && callService.status === "outgoing_ringing"
     }
 
@@ -278,13 +281,13 @@ Item {
     }
 
     // Self-view PiP for 1:1 only (group puts self in the 16:9 grid).
-    // 16:9 landscape — same aspect as Meet tiles / our encode target.
     VideoFrame {
         id: localPip
         width: 176
         height: 99
         radius: 12
         mirror: true
+        fillMode: VideoFrame.Fit
         anchors.top: parent.top
         anchors.right: parent.right
         anchors.margins: 20

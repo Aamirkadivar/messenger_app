@@ -16,6 +16,8 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QStandardPaths>
+#include <QUuid>
+#include <QDateTime>
 
 ChatService::ChatService(AuthService* authService, GroupService* groupService, QObject* parent)
     : QObject(parent)
@@ -24,6 +26,7 @@ ChatService::ChatService(AuthService* authService, GroupService* groupService, Q
 {
     setupNetworkManager();
     m_messageCache = new MessageCache(this);
+    setupForwardSignalHooks();
 }
 
 ChatService::~ChatService() {
@@ -47,6 +50,36 @@ QString ChatService::buildAuthHeader() const {
     }
     return {};
 }
+
+void ChatService::appendForwardFields(QJsonObject& body, bool isForwarded,
+                                       const QString& forwardedFromName,
+                                       const QString& forwardedFromMessageId) const {
+    if (!isForwarded) return;
+    body[QStringLiteral("is_forwarded")] = true;
+    body[QStringLiteral("forwarded_from_name")] = forwardedFromName;
+    if (!forwardedFromMessageId.isEmpty())
+        body[QStringLiteral("forwarded_from_message_id")] = forwardedFromMessageId;
+}
+
+void ChatService::setPendingReplyToId(const QString& id) {
+    if (m_pendingReplyToId == id) return;
+    m_pendingReplyToId = id;
+    emit pendingReplyToIdChanged();
+}
+
+QString ChatService::takePendingReplyToId() {
+    if (m_pendingReplyToId.isEmpty()) return {};
+    const QString id = m_pendingReplyToId;
+    m_pendingReplyToId.clear();
+    emit pendingReplyToIdChanged();
+    return id;
+}
+
+void ChatService::appendReplyField(QJsonObject& body, const QString& replyToId) const {
+    if (replyToId.isEmpty()) return;
+    body[QStringLiteral("reply_to_id")] = replyToId;
+}
+
 
 void ChatService::fetchChats() {
     if (m_isLoading) return;
@@ -275,7 +308,8 @@ void ChatService::fetchMessages(const QString& chatId) {
             for (const auto& e : cached) {
                 bool hasFile = !e.fileUrl.isEmpty()
                                && (e.fileType == QStringLiteral("audio") || e.fileType == QStringLiteral("image")
-                                   || e.fileType == QStringLiteral("file"));
+                                   || e.fileType == QStringLiteral("file")
+                                   || e.fileType == QStringLiteral("video_note"));
                 QVariantMap item;
                 item["id"] = e.id;
                 item["senderId"] = e.senderId;
@@ -292,6 +326,10 @@ void ChatService::fetchMessages(const QString& chatId) {
                 item["fileSize"] = e.fileSize;
                 item["durationMs"] = e.durationMs;
                 item["voiceEncrypted"] = hasFile && e.encrypted;
+                item["keyVersion"] = e.keyVersion;
+                item["isForwarded"] = e.isForwarded;
+                item["forwardedFromName"] = e.forwardedFromName;
+                item["replyToId"] = e.replyToId;
                 cachedResult.append(item);
             }
             emit messagesFetched(chatId, cachedResult);
@@ -380,6 +418,10 @@ void ChatService::fetchMessages(const QString& chatId) {
                 item["durationMs"] = durationMs;
                 item["thumbnailUrl"] = thumbnailUrl;
                 item["voiceEncrypted"] = hasFile && encrypted;
+                item["isForwarded"] = m[QStringLiteral("is_forwarded")].toBool(false);
+                item["forwardedFromName"] = m[QStringLiteral("forwarded_from_name")].toString();
+                item["forwardedFromMessageId"] = m[QStringLiteral("forwarded_from_message_id")].toString();
+                item["replyToId"] = m[QStringLiteral("reply_to_id")].toString();
                 result.append(item);
 
                 MessageCache::Entry cacheEntry;
@@ -396,6 +438,9 @@ void ChatService::fetchMessages(const QString& chatId) {
                 cacheEntry.fileSize = fileSize;
                 cacheEntry.durationMs = durationMs;
                 cacheEntry.keyVersion = keyVersion;
+                cacheEntry.isForwarded = item["isForwarded"].toBool();
+                cacheEntry.forwardedFromName = item["forwardedFromName"].toString();
+                cacheEntry.replyToId = item["replyToId"].toString();
                 toCache.append(cacheEntry);
             }
 
@@ -412,9 +457,11 @@ void ChatService::fetchMessages(const QString& chatId) {
     }
 }
 
-void ChatService::sendMessage(const QString& chatId, const QString& text, const QString& chatType) {
+void ChatService::sendMessage(const QString& chatId, const QString& text, const QString& chatType,
+                               bool isForwarded, const QString& forwardedFromName,
+                               const QString& forwardedFromMessageId) {
     if (chatType == QStringLiteral("group")) {
-        sendGroupTextMessage(chatId, text);
+        sendGroupTextMessage(chatId, text, isForwarded, forwardedFromName, forwardedFromMessageId);
         return;
     }
 
@@ -450,6 +497,8 @@ void ChatService::sendMessage(const QString& chatId, const QString& text, const 
     body["chat_type"] = chatType;
     body["content"] = outContent;
     body["encrypted"] = encrypted;
+    appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
+    appendReplyField(body, takePendingReplyToId());
 
     QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
     connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
@@ -479,6 +528,9 @@ void ChatService::sendMessage(const QString& chatId, const QString& text, const 
         item["senderId"] = data["sender_id"].toString();
         item["content"] = decryptMessage(chatId, data["content"].toString(), data["encrypted"].toBool(false));
         item["createdAt"] = data["created_at"].toString();
+        item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
+        item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
+        item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
 
         emit messageSent(chatId, item);
     });
@@ -758,8 +810,10 @@ void ChatService::fetchGroupSenderKeys(const QString& chatId, std::function<void
     });
 }
 
-void ChatService::sendGroupTextMessage(const QString& chatId, const QString& text) {
-    ensureGroupSenderKeyReady(chatId, [this, chatId, text]() {
+void ChatService::sendGroupTextMessage(const QString& chatId, const QString& text,
+                                        bool isForwarded, const QString& forwardedFromName,
+                                        const QString& forwardedFromMessageId) {
+    ensureGroupSenderKeyReady(chatId, [this, chatId, text, isForwarded, forwardedFromName, forwardedFromMessageId]() {
         QString authToken = buildAuthHeader();
         if (authToken.isEmpty()) {
             emit messageError("Not authenticated. Please login first.");
@@ -790,6 +844,8 @@ void ChatService::sendGroupTextMessage(const QString& chatId, const QString& tex
         body["content"] = outContent;
         body["encrypted"] = encrypted;
         body["key_version"] = keyVersion;
+        appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
+    appendReplyField(body, takePendingReplyToId());
 
         QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
         connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
@@ -810,6 +866,8 @@ void ChatService::sendGroupTextMessage(const QString& chatId, const QString& tex
             item["content"] = decryptMessage(chatId, data["content"].toString(), data["encrypted"].toBool(false),
                                               data["sender_id"].toString(), data["key_version"].toInt());
             item["createdAt"] = data["created_at"].toString();
+            item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
+            item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
             emit messageSent(chatId, item);
         });
     });
@@ -849,7 +907,9 @@ QByteArray ChatService::decryptBytesForChat(const QString& chatId, const QByteAr
 }
 
 void ChatService::sendVoiceNote(const QString& chatId, const QString& chatType,
-                                 const QString& localFilePath, qint64 durationMs) {
+                                 const QString& localFilePath, qint64 durationMs,
+                                 bool isForwarded, const QString& forwardedFromName,
+                                 const QString& forwardedFromMessageId) {
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit voiceUploadError("Not authenticated. Please login first.");
@@ -868,7 +928,7 @@ void ChatService::sendVoiceNote(const QString& chatId, const QString& chatType,
     // it now regardless of what happens to the upload below.
     QFile::remove(localFilePath);
 
-    auto upload = [this, chatId, chatType, raw, durationMs]() {
+    auto upload = [this, chatId, chatType, raw, durationMs, isForwarded, forwardedFromName, forwardedFromMessageId]() {
         int keyVersion = 0;
         QByteArray sealed = encryptBytesForChat(chatId, raw, &keyVersion);
         bool encrypted = !sealed.isEmpty();
@@ -889,7 +949,8 @@ void ChatService::sendVoiceNote(const QString& chatId, const QString& chatType,
         QNetworkReply* reply = m_networkManager->post(request, multiPart);
         multiPart->setParent(reply);
         connect(reply, &QNetworkReply::finished, this,
-                [this, reply, chatId, chatType, durationMs, encrypted, keyVersion]() {
+                [this, reply, chatId, chatType, durationMs, encrypted, keyVersion,
+                 isForwarded, forwardedFromName, forwardedFromMessageId]() {
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
                 emit voiceUploadError(reply->errorString());
@@ -901,7 +962,8 @@ void ChatService::sendVoiceNote(const QString& chatId, const QString& chatType,
                 emit voiceUploadError("Server did not return a file URL");
                 return;
             }
-            sendVoiceMessage(chatId, chatType, fileUrl, durationMs, encrypted, keyVersion);
+            sendVoiceMessage(chatId, chatType, fileUrl, durationMs, encrypted, keyVersion,
+                             isForwarded, forwardedFromName, forwardedFromMessageId);
         });
     };
 
@@ -913,7 +975,9 @@ void ChatService::sendVoiceNote(const QString& chatId, const QString& chatType,
 }
 
 void ChatService::sendVideoNote(const QString& chatId, const QString& chatType,
-                                 const QString& localFilePath, qint64 durationMs) {
+                                 const QString& localFilePath, qint64 durationMs,
+                                 bool isForwarded, const QString& forwardedFromName,
+                                 const QString& forwardedFromMessageId) {
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit videoNoteUploadError("Not authenticated. Please login first.");
@@ -941,23 +1005,30 @@ void ChatService::sendVideoNote(const QString& chatId, const QString& chatType,
     // circle until the whole video has downloaded.
     auto* thumbnailer = new VideoThumbnailer(this);
     connect(thumbnailer, &VideoThumbnailer::ready, this,
-            [this, chatId, chatType, raw, durationMs, localFilePath](const QString& jpegPath) {
+            [this, chatId, chatType, raw, durationMs, localFilePath,
+             isForwarded, forwardedFromName, forwardedFromMessageId](const QString& jpegPath) {
         QFile::remove(localFilePath);
-        uploadVideoNote(chatId, chatType, raw, durationMs, jpegPath);
+        uploadVideoNote(chatId, chatType, raw, durationMs, jpegPath,
+                        isForwarded, forwardedFromName, forwardedFromMessageId);
     });
     connect(thumbnailer, &VideoThumbnailer::failed, this,
-            [this, chatId, chatType, raw, durationMs, localFilePath]() {
+            [this, chatId, chatType, raw, durationMs, localFilePath,
+             isForwarded, forwardedFromName, forwardedFromMessageId]() {
         // A missing poster degrades cleanly, so it is not worth failing a send.
         QFile::remove(localFilePath);
-        uploadVideoNote(chatId, chatType, raw, durationMs, QString());
+        uploadVideoNote(chatId, chatType, raw, durationMs, QString(),
+                        isForwarded, forwardedFromName, forwardedFromMessageId);
     });
     thumbnailer->grab(localFilePath);
 }
 
 void ChatService::uploadVideoNote(const QString& chatId, const QString& chatType,
                                    const QByteArray& raw, qint64 durationMs,
-                                   const QString& thumbnailPath) {
-    auto upload = [this, chatId, chatType, raw, durationMs, thumbnailPath]() {
+                                   const QString& thumbnailPath,
+                                   bool isForwarded, const QString& forwardedFromName,
+                                   const QString& forwardedFromMessageId) {
+    auto upload = [this, chatId, chatType, raw, durationMs, thumbnailPath,
+                   isForwarded, forwardedFromName, forwardedFromMessageId]() {
         QString authToken = buildAuthHeader();
         if (authToken.isEmpty()) {
             emit videoNoteUploadError("Not authenticated. Please login first.");
@@ -987,7 +1058,8 @@ void ChatService::uploadVideoNote(const QString& chatId, const QString& chatType
             emit videoNoteUploadProgress(sent, total);
         });
         connect(reply, &QNetworkReply::finished, this,
-                [this, reply, chatId, chatType, durationMs, encrypted, keyVersion, thumbnailPath]() {
+                [this, reply, chatId, chatType, durationMs, encrypted, keyVersion, thumbnailPath,
+                 isForwarded, forwardedFromName, forwardedFromMessageId]() {
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
                 emit videoNoteUploadError(reply->errorString());
@@ -999,7 +1071,8 @@ void ChatService::uploadVideoNote(const QString& chatId, const QString& chatType
                 emit videoNoteUploadError("Server did not return a file URL");
                 return;
             }
-            uploadVideoNoteThumbnail(chatId, chatType, fileUrl, durationMs, encrypted, keyVersion, thumbnailPath);
+            uploadVideoNoteThumbnail(chatId, chatType, fileUrl, durationMs, encrypted, keyVersion, thumbnailPath,
+                                     isForwarded, forwardedFromName, forwardedFromMessageId);
         });
     };
 
@@ -1012,10 +1085,13 @@ void ChatService::uploadVideoNote(const QString& chatId, const QString& chatType
 
 void ChatService::uploadVideoNoteThumbnail(const QString& chatId, const QString& chatType,
                                             const QString& fileUrl, qint64 durationMs,
-                                            bool encrypted, int keyVersion, const QString& thumbnailPath) {
+                                            bool encrypted, int keyVersion, const QString& thumbnailPath,
+                                            bool isForwarded, const QString& forwardedFromName,
+                                            const QString& forwardedFromMessageId) {
     QFile thumb(thumbnailPath);
     if (thumbnailPath.isEmpty() || !thumb.open(QIODevice::ReadOnly)) {
-        sendVideoNoteMessage(chatId, chatType, fileUrl, QString(), durationMs, encrypted, keyVersion);
+        sendVideoNoteMessage(chatId, chatType, fileUrl, QString(), durationMs, encrypted, keyVersion,
+                             isForwarded, forwardedFromName, forwardedFromMessageId);
         return;
     }
     QByteArray thumbBytes = thumb.readAll();
@@ -1043,7 +1119,8 @@ void ChatService::uploadVideoNoteThumbnail(const QString& chatId, const QString&
     QNetworkReply* reply = m_networkManager->post(request, multiPart);
     multiPart->setParent(reply);
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, chatId, chatType, fileUrl, durationMs, encrypted, keyVersion]() {
+            [this, reply, chatId, chatType, fileUrl, durationMs, encrypted, keyVersion,
+             isForwarded, forwardedFromName, forwardedFromMessageId]() {
         reply->deleteLater();
         QString thumbUrl;
         if (reply->error() == QNetworkReply::NoError) {
@@ -1052,7 +1129,8 @@ void ChatService::uploadVideoNoteThumbnail(const QString& chatId, const QString&
             if (thumbUrl.isEmpty()) thumbUrl = root["file_url"].toString();
         }
         // A failed poster upload must not lose the video message itself.
-        sendVideoNoteMessage(chatId, chatType, fileUrl, thumbUrl, durationMs, encrypted, keyVersion);
+        sendVideoNoteMessage(chatId, chatType, fileUrl, thumbUrl, durationMs, encrypted, keyVersion,
+                             isForwarded, forwardedFromName, forwardedFromMessageId);
     });
 }
 
@@ -1178,7 +1256,9 @@ void ChatService::preparePlayableVoice(const QString& chatId, const QString& mes
 
 void ChatService::sendVoiceMessage(const QString& chatId, const QString& chatType,
                                     const QString& fileUrl, qint64 durationMs, bool encrypted,
-                                    int keyVersion) {
+                                    int keyVersion,
+                                    bool isForwarded, const QString& forwardedFromName,
+                                    const QString& forwardedFromMessageId) {
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit messageError("Not authenticated. Please login first.");
@@ -1202,6 +1282,8 @@ void ChatService::sendVoiceMessage(const QString& chatId, const QString& chatTyp
     body["file_type"] = "audio";
     body["duration_ms"] = durationMs;
     if (keyVersion > 0) body["key_version"] = keyVersion;
+    appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
+    appendReplyField(body, takePendingReplyToId());
 
     QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
     connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
@@ -1225,13 +1307,18 @@ void ChatService::sendVoiceMessage(const QString& chatId, const QString& chatTyp
         item["encrypted"] = data["encrypted"].toBool(false);
         item["keyVersion"] = data["key_version"].toInt(0);
         item["createdAt"] = data["created_at"].toString();
+        item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
+        item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
+        item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
         emit voiceMessageSent(chatId, item);
     });
 }
 
 void ChatService::sendVideoNoteMessage(const QString& chatId, const QString& chatType,
                                         const QString& fileUrl, const QString& thumbnailUrl,
-                                        qint64 durationMs, bool encrypted, int keyVersion) {
+                                        qint64 durationMs, bool encrypted, int keyVersion,
+                                        bool isForwarded, const QString& forwardedFromName,
+                                        const QString& forwardedFromMessageId) {
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit messageError("Not authenticated. Please login first.");
@@ -1257,6 +1344,8 @@ void ChatService::sendVideoNoteMessage(const QString& chatId, const QString& cha
     body["duration_ms"] = durationMs;
     body["thumbnail_url"] = thumbnailUrl;
     if (keyVersion > 0) body["key_version"] = keyVersion;
+    appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
+    appendReplyField(body, takePendingReplyToId());
 
     QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
     connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
@@ -1281,12 +1370,17 @@ void ChatService::sendVideoNoteMessage(const QString& chatId, const QString& cha
         item["encrypted"] = data["encrypted"].toBool(false);
         item["keyVersion"] = data["key_version"].toInt(0);
         item["createdAt"] = data["created_at"].toString();
+        item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
+        item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
+        item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
         emit videoNoteMessageSent(chatId, item);
     });
 }
 
 void ChatService::sendAttachment(const QString& chatId, const QString& chatType,
-                                  const QString& localFileUrl, const QString& contentType) {
+                                  const QString& localFileUrl, const QString& contentType,
+                                  bool isForwarded, const QString& forwardedFromName,
+                                  const QString& forwardedFromMessageId) {
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit attachmentUploadError("Not authenticated. Please login first.");
@@ -1306,7 +1400,8 @@ void ChatService::sendAttachment(const QString& chatId, const QString& chatType,
     QByteArray raw = file.readAll();
     file.close();
 
-    auto upload = [this, chatId, chatType, contentType, fileName, raw]() {
+    auto upload = [this, chatId, chatType, contentType, fileName, raw,
+                   isForwarded, forwardedFromName, forwardedFromMessageId]() {
         int keyVersion = 0;
         QByteArray sealed = encryptBytesForChat(chatId, raw, &keyVersion);
         bool encrypted = !sealed.isEmpty();
@@ -1327,7 +1422,8 @@ void ChatService::sendAttachment(const QString& chatId, const QString& chatType,
         QNetworkReply* reply = m_networkManager->post(request, multiPart);
         multiPart->setParent(reply);
         connect(reply, &QNetworkReply::finished, this,
-                [this, reply, chatId, chatType, fileName, contentType, encrypted, keyVersion]() {
+                [this, reply, chatId, chatType, fileName, contentType, encrypted, keyVersion,
+                 isForwarded, forwardedFromName, forwardedFromMessageId]() {
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
                 emit attachmentUploadError(reply->errorString());
@@ -1340,7 +1436,8 @@ void ChatService::sendAttachment(const QString& chatId, const QString& chatType,
                 return;
             }
             qint64 fileSize = static_cast<qint64>(root["file_size"].toDouble(0));
-            sendAttachmentMessage(chatId, chatType, fileUrl, fileName, contentType, fileSize, encrypted, keyVersion);
+            sendAttachmentMessage(chatId, chatType, fileUrl, fileName, contentType, fileSize, encrypted, keyVersion,
+                                  isForwarded, forwardedFromName, forwardedFromMessageId);
         });
     };
 
@@ -1354,7 +1451,9 @@ void ChatService::sendAttachment(const QString& chatId, const QString& chatType,
 void ChatService::sendAttachmentMessage(const QString& chatId, const QString& chatType,
                                          const QString& fileUrl, const QString& fileName,
                                          const QString& contentType, qint64 fileSize, bool encrypted,
-                                         int keyVersion) {
+                                         int keyVersion,
+                                         bool isForwarded, const QString& forwardedFromName,
+                                         const QString& forwardedFromMessageId) {
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit messageError("Not authenticated. Please login first.");
@@ -1377,6 +1476,8 @@ void ChatService::sendAttachmentMessage(const QString& chatId, const QString& ch
     body["file_name"] = fileName;
     body["file_size"] = fileSize;
     if (keyVersion > 0) body["key_version"] = keyVersion;
+    appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
+    appendReplyField(body, takePendingReplyToId());
 
     QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
     connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
@@ -1401,6 +1502,9 @@ void ChatService::sendAttachmentMessage(const QString& chatId, const QString& ch
         item["encrypted"] = data["encrypted"].toBool(false);
         item["keyVersion"] = data["key_version"].toInt(0);
         item["createdAt"] = data["created_at"].toString();
+        item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
+        item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
+        item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
         emit attachmentMessageSent(chatId, item);
     });
 }
@@ -1449,6 +1553,190 @@ void ChatService::prepareAttachment(const QString& chatId, const QString& messag
         out.close();
         emit attachmentReady(messageId, localPath);
     });
+}
+
+void ChatService::setupForwardSignalHooks() {
+    // Advance the forward queue when the current item's prepare or send finishes.
+    // Only acts while m_forwardPhase is set - normal sends leave the phase Idle.
+    auto onSendOk = [this](const QString&, const QVariantMap&) {
+        if (m_forwardPhase == ForwardPhase::WaitingSend)
+            finishCurrentForward(true);
+    };
+    connect(this, &ChatService::messageSent, this, onSendOk);
+    connect(this, &ChatService::voiceMessageSent, this, onSendOk);
+    connect(this, &ChatService::attachmentMessageSent, this, onSendOk);
+    connect(this, &ChatService::videoNoteMessageSent, this, onSendOk);
+
+    auto onSendFail = [this](const QString&) {
+        if (m_forwardPhase == ForwardPhase::WaitingSend)
+            finishCurrentForward(false);
+    };
+    connect(this, &ChatService::messageError, this, onSendFail);
+    connect(this, &ChatService::voiceUploadError, this, onSendFail);
+    connect(this, &ChatService::attachmentUploadError, this, onSendFail);
+    connect(this, &ChatService::videoNoteUploadError, this, onSendFail);
+
+    auto onMediaReady = [this](const QString& messageId, const QString& localPath) {
+        if (m_forwardPhase != ForwardPhase::PreparingMedia) return;
+        if (messageId != m_forwardAwaitingMessageId) return;
+        if (m_forwardQueue.isEmpty()) return;
+
+        const ForwardItem item = m_forwardQueue.first();
+        // Voice/video send paths delete their local file after reading - copy
+        // so the playback cache for the source message stays intact.
+        const QString sendPath = (item.contentType == QStringLiteral("audio")
+                                  || item.contentType == QStringLiteral("video_note"))
+            ? copyForForwardSend(localPath)
+            : localPath;
+        if (sendPath.isEmpty()) {
+            finishCurrentForward(false);
+            return;
+        }
+
+        m_forwardPhase = ForwardPhase::WaitingSend;
+        if (item.contentType == QStringLiteral("audio")) {
+            sendVoiceNote(m_forwardTargetChatId, m_forwardTargetChatType, sendPath, item.durationMs,
+                          true, item.forwardedFromName, item.messageId);
+        } else if (item.contentType == QStringLiteral("video_note")) {
+            sendVideoNote(m_forwardTargetChatId, m_forwardTargetChatType, sendPath, item.durationMs,
+                          true, item.forwardedFromName, item.messageId);
+        } else {
+            // image / file - sendAttachment never deletes the source path
+            const QString url = QUrl::fromLocalFile(sendPath).toString();
+            const QString ct = item.contentType.isEmpty() ? QStringLiteral("file") : item.contentType;
+            sendAttachment(m_forwardTargetChatId, m_forwardTargetChatType, url, ct,
+                           true, item.forwardedFromName, item.messageId);
+        }
+    };
+    connect(this, &ChatService::voiceReadyForPlayback, this, onMediaReady);
+    connect(this, &ChatService::attachmentReady, this, onMediaReady);
+    connect(this, &ChatService::videoNoteReadyForPlayback, this, onMediaReady);
+
+    auto onMediaFail = [this](const QString& messageId, const QString&) {
+        if (m_forwardPhase != ForwardPhase::PreparingMedia) return;
+        if (messageId != m_forwardAwaitingMessageId) return;
+        finishCurrentForward(false);
+    };
+    connect(this, &ChatService::voicePlaybackError, this, onMediaFail);
+    connect(this, &ChatService::attachmentError, this, onMediaFail);
+    connect(this, &ChatService::videoNotePlaybackError, this, onMediaFail);
+}
+
+QString ChatService::copyForForwardSend(const QString& localPath) const {
+    if (localPath.isEmpty() || !QFile::exists(localPath)) return {};
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
+                  + QStringLiteral("/messenger_forward");
+    QDir().mkpath(dir);
+    QString suffix = QFileInfo(localPath).completeSuffix();
+    QString dest = dir + QLatin1Char('/') + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (!suffix.isEmpty()) dest += QLatin1Char('.') + suffix;
+    if (!QFile::copy(localPath, dest)) return {};
+    return dest;
+}
+
+void ChatService::forwardMessages(const QString& sourceChatId,
+                                   const QString& targetChatId,
+                                   const QString& targetChatType,
+                                   const QVariantList& items) {
+    if (m_forwardPhase != ForwardPhase::Idle) {
+        qWarning() << "[ChatService] forwardMessages ignored - a forward is already in progress";
+        return;
+    }
+    if (sourceChatId.isEmpty() || targetChatId.isEmpty() || items.isEmpty()) {
+        emit forwardFinished(0, 0);
+        return;
+    }
+
+    m_forwardQueue.clear();
+    for (const QVariant& v : items) {
+        const QVariantMap m = v.toMap();
+        ForwardItem item;
+        item.messageId = m.value(QStringLiteral("messageId")).toString();
+        item.contentType = m.value(QStringLiteral("contentType")).toString();
+        item.text = m.value(QStringLiteral("text")).toString();
+        item.fileUrl = m.value(QStringLiteral("fileUrl")).toString();
+        item.encrypted = m.value(QStringLiteral("encrypted")).toBool();
+        item.senderId = m.value(QStringLiteral("senderId")).toString();
+        item.keyVersion = m.value(QStringLiteral("keyVersion")).toInt();
+        item.fileName = m.value(QStringLiteral("fileName")).toString();
+        item.fileSize = m.value(QStringLiteral("fileSize")).toLongLong();
+        item.durationMs = m.value(QStringLiteral("durationMs")).toLongLong();
+        item.thumbnailUrl = m.value(QStringLiteral("thumbnailUrl")).toString();
+        item.forwardedFromName = m.value(QStringLiteral("forwardedFromName")).toString();
+        if (item.messageId.isEmpty()) continue;
+        m_forwardQueue.append(item);
+    }
+
+    m_forwardSourceChatId = sourceChatId;
+    m_forwardTargetChatId = targetChatId;
+    m_forwardTargetChatType = targetChatType.isEmpty() ? QStringLiteral("direct") : targetChatType;
+    m_forwardSuccess = 0;
+    m_forwardFail = 0;
+    m_forwardAwaitingMessageId.clear();
+
+    if (m_forwardQueue.isEmpty()) {
+        emit forwardFinished(0, 0);
+        return;
+    }
+    processNextForward();
+}
+
+void ChatService::processNextForward() {
+    if (m_forwardQueue.isEmpty()) {
+        m_forwardPhase = ForwardPhase::Idle;
+        m_forwardAwaitingMessageId.clear();
+        const int ok = m_forwardSuccess;
+        const int fail = m_forwardFail;
+        m_forwardSourceChatId.clear();
+        m_forwardTargetChatId.clear();
+        m_forwardTargetChatType.clear();
+        emit forwardFinished(ok, fail);
+        return;
+    }
+
+    const ForwardItem& item = m_forwardQueue.first();
+    const bool isMedia = item.contentType == QStringLiteral("audio")
+                         || item.contentType == QStringLiteral("image")
+                         || item.contentType == QStringLiteral("file")
+                         || item.contentType == QStringLiteral("video_note");
+
+    if (!isMedia) {
+        m_forwardPhase = ForwardPhase::WaitingSend;
+        sendMessage(m_forwardTargetChatId, item.text, m_forwardTargetChatType,
+                    true, item.forwardedFromName, item.messageId);
+        return;
+    }
+
+    if (item.fileUrl.isEmpty()) {
+        finishCurrentForward(false);
+        return;
+    }
+
+    m_forwardPhase = ForwardPhase::PreparingMedia;
+    m_forwardAwaitingMessageId = item.messageId;
+
+    if (item.contentType == QStringLiteral("audio")) {
+        preparePlayableVoice(m_forwardSourceChatId, item.messageId, item.fileUrl, item.encrypted,
+                             item.senderId, item.keyVersion);
+    } else if (item.contentType == QStringLiteral("video_note")) {
+        preparePlayableVideoNote(m_forwardSourceChatId, item.messageId, item.fileUrl, item.encrypted,
+                                 item.senderId, item.keyVersion);
+    } else {
+        prepareAttachment(m_forwardSourceChatId, item.messageId, item.fileUrl, item.encrypted,
+                          item.fileName, item.senderId, item.keyVersion);
+    }
+}
+
+void ChatService::finishCurrentForward(bool success) {
+    if (m_forwardPhase == ForwardPhase::Idle) return;
+    if (success) ++m_forwardSuccess;
+    else ++m_forwardFail;
+    if (!m_forwardQueue.isEmpty())
+        m_forwardQueue.removeFirst();
+    m_forwardAwaitingMessageId.clear();
+    // Defer so nested signal handlers (e.g. messageSent during processNext)
+    // finish before the next item starts.
+    QMetaObject::invokeMethod(this, [this]() { processNextForward(); }, Qt::QueuedConnection);
 }
 
 void ChatService::markAsRead(const QString& chatId) {

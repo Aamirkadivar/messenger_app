@@ -54,11 +54,17 @@ type Message struct {
 	DeletedFor        []uuid.UUID `json:"deleted_for" gorm:"type:uuid[]"`
 	ReplyToID         *uuid.UUID  `json:"reply_to_id" gorm:"type:uuid"`
 	MentionIDs        []uuid.UUID `json:"mention_ids" gorm:"type:uuid[]"`
-	DeliveredAt       *time.Time  `json:"delivered_at"`
-	ReadAt            *time.Time  `json:"read_at"`
-	CreatedAt         time.Time   `json:"created_at"`
-	UpdatedAt         time.Time   `json:"updated_at"`
-	DeletedAt         *time.Time  `json:"deleted_at" gorm:"index"`
+	// Forward metadata is display-only. The payload is always a fresh
+	// E2EE ciphertext for the target chat; the server never copies source
+	// ciphertext between chats.
+	IsForwarded            bool       `json:"is_forwarded" gorm:"default:false"`
+	ForwardedFromName      string     `json:"forwarded_from_name" gorm:"size:255"`
+	ForwardedFromMessageID *uuid.UUID `json:"forwarded_from_message_id" gorm:"type:uuid"`
+	DeliveredAt            *time.Time `json:"delivered_at"`
+	ReadAt                 *time.Time `json:"read_at"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
+	DeletedAt              *time.Time `json:"deleted_at" gorm:"index"`
 }
 
 // ChatParticipant represents a participant in a chat
@@ -219,6 +225,10 @@ type MessageCreateRequest struct {
 	KeyVersion int         `json:"key_version"`
 	ReplyToID  *uuid.UUID  `json:"reply_to_id"`
 	MentionIDs []uuid.UUID `json:"mention_ids"`
+	// Forward attribution (UI only; content is always re-encrypted for the target).
+	IsForwarded            bool       `json:"is_forwarded"`
+	ForwardedFromName      string     `json:"forwarded_from_name"`
+	ForwardedFromMessageID *uuid.UUID `json:"forwarded_from_message_id"`
 }
 
 // CreateGroupRequest represents the request to create a group
@@ -311,6 +321,9 @@ type MessageResponse struct {
 	ReadBy            []uuid.UUID `json:"read_by"`
 	ReplyToID         *uuid.UUID  `json:"reply_to_id"`
 	MentionIDs        []uuid.UUID `json:"mention_ids"`
+	IsForwarded            bool       `json:"is_forwarded"`
+	ForwardedFromName      string     `json:"forwarded_from_name"`
+	ForwardedFromMessageID *uuid.UUID `json:"forwarded_from_message_id"`
 	DeliveredAt       *time.Time  `json:"delivered_at"`
 	ReadAt            *time.Time  `json:"read_at"`
 	CreatedAt         time.Time   `json:"created_at"`

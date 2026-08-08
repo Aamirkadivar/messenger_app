@@ -71,18 +71,40 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 	// end-to-end means only the two clients hold the keys.
 	content := req.Content
 
+	// Reply is just an id pointer - clients resolve the quote from local
+	// history so plaintext never rides along. Parent must live in this chat.
+	if req.ReplyToID != nil {
+		var parent models.Message
+		if err := database.DB.Select("id", "chat_id").First(&parent, *req.ReplyToID).Error; err != nil {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+				"error":   "invalid reply_to_id",
+				"message": "Reply target message not found",
+			})
+		}
+		if parent.ChatID != chatIDParsed.String() {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+				"error":   "invalid reply_to_id",
+				"message": "Reply target is not in this chat",
+			})
+		}
+	}
+
 	// Generate message ID
 	messageID := uuid.New()
 
 	// Create message record
 	message := models.Message{
-		ID:               messageID,
-		ChatID:           chatIDParsed.String(),
-		ChatType:         chat.Type,
-		SenderID:         userID,
-		EncryptedContent: content,
-		IsEncrypted:      req.Encrypted,
-		KeyVersion:       req.KeyVersion,
+		ID:                     messageID,
+		ChatID:                 chatIDParsed.String(),
+		ChatType:               chat.Type,
+		SenderID:               userID,
+		EncryptedContent:       content,
+		IsEncrypted:            req.Encrypted,
+		KeyVersion:             req.KeyVersion,
+		ReplyToID:              req.ReplyToID,
+		IsForwarded:            req.IsForwarded,
+		ForwardedFromName:      req.ForwardedFromName,
+		ForwardedFromMessageID: req.ForwardedFromMessageID,
 	}
 
 	if req.FileURL != "" {
@@ -112,24 +134,37 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		})
 	}
 
+	var forwardedFromMsgID interface{}
+	if message.ForwardedFromMessageID != nil {
+		forwardedFromMsgID = message.ForwardedFromMessageID.String()
+	}
+	var replyToID interface{}
+	if message.ReplyToID != nil {
+		replyToID = message.ReplyToID.String()
+	}
+
 	// Create WebSocket message for real-time delivery
 	wsMsg := models.WebSocketMessage{
 		Type: "message",
 		Data: map[string]interface{}{
-			"chat_id":       chatID,
-			"chat_type":     chat.Type,
-			"message_id":    messageID.String(),
-			"sender_id":     userID.String(),
-			"content":       content,
-			"encrypted":     req.Encrypted,
-			"file_url":      message.FileURL,
-			"file_type":     message.ContentType,
-			"file_name":     message.FileName,
-			"file_size":     message.FileSize,
-			"duration_ms":   message.DurationMs,
-			"thumbnail_url": message.ThumbnailURL,
-			"key_version":   message.KeyVersion,
-			"timestamp":     message.CreatedAt,
+			"chat_id":                   chatID,
+			"chat_type":                 chat.Type,
+			"message_id":                messageID.String(),
+			"sender_id":                 userID.String(),
+			"content":                   content,
+			"encrypted":                 req.Encrypted,
+			"file_url":                  message.FileURL,
+			"file_type":                 message.ContentType,
+			"file_name":                 message.FileName,
+			"file_size":                 message.FileSize,
+			"duration_ms":               message.DurationMs,
+			"thumbnail_url":             message.ThumbnailURL,
+			"key_version":               message.KeyVersion,
+			"reply_to_id":               replyToID,
+			"is_forwarded":              message.IsForwarded,
+			"forwarded_from_name":       message.ForwardedFromName,
+			"forwarded_from_message_id": forwardedFromMsgID,
+			"timestamp":                 message.CreatedAt,
 		},
 		Timestamp: time.Now(),
 	}
@@ -144,22 +179,26 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"message": "Message sent successfully",
 		"data": fiber.Map{
-			"id":            messageID,
-			"chat_id":       chatID,
-			"sender_id":     userID,
-			"encrypted":     req.Encrypted,
-			"content":       content,
-			"file_url":      message.FileURL,
-			"file_type":     message.ContentType,
-			"file_name":     message.FileName,
-			"file_size":     message.FileSize,
-			"duration_ms":   message.DurationMs,
-			"thumbnail_url": message.ThumbnailURL,
-			"key_version":   message.KeyVersion,
-			"type":          chat.Type,
-			"delivered_at":  message.CreatedAt,
-			"created_at":    message.CreatedAt,
-			"updated_at":    message.CreatedAt,
+			"id":                        messageID,
+			"chat_id":                   chatID,
+			"sender_id":                 userID,
+			"encrypted":                 req.Encrypted,
+			"content":                   content,
+			"file_url":                  message.FileURL,
+			"file_type":                 message.ContentType,
+			"file_name":                 message.FileName,
+			"file_size":                 message.FileSize,
+			"duration_ms":               message.DurationMs,
+			"thumbnail_url":             message.ThumbnailURL,
+			"key_version":               message.KeyVersion,
+			"reply_to_id":               replyToID,
+			"is_forwarded":              message.IsForwarded,
+			"forwarded_from_name":       message.ForwardedFromName,
+			"forwarded_from_message_id": forwardedFromMsgID,
+			"type":                      chat.Type,
+			"delivered_at":              message.CreatedAt,
+			"created_at":                message.CreatedAt,
+			"updated_at":                message.CreatedAt,
 		},
 	})
 }
@@ -318,24 +357,28 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 
 	// Decrypt messages for response
 	type DecryptedMessage struct {
-		ID           string     `json:"id"`
-		ChatID       string     `json:"chat_id"`
-		SenderID     string     `json:"sender_id"`
-		Sender       fiber.Map  `json:"sender"`
-		Content      string     `json:"content"`
-		Encrypted    bool       `json:"encrypted"`
-		FileURL      *string    `json:"file_url,omitempty"`
-		FileType     *string    `json:"file_type,omitempty"`
-		FileName     *string    `json:"file_name,omitempty"`
-		FileSize     int64      `json:"file_size"`
-		DurationMs   int64      `json:"duration_ms"`
-		ThumbnailURL string     `json:"thumbnail_url"`
-		KeyVersion   int        `json:"key_version"`
-		Type         string     `json:"type"`
-		DeliveredAt  *time.Time `json:"delivered_at"`
-		ReadAt       *time.Time `json:"read_at"`
-		CreatedAt    time.Time  `json:"created_at"`
-		UpdatedAt    time.Time  `json:"updated_at"`
+		ID                     string     `json:"id"`
+		ChatID                 string     `json:"chat_id"`
+		SenderID               string     `json:"sender_id"`
+		Sender                 fiber.Map  `json:"sender"`
+		Content                string     `json:"content"`
+		Encrypted              bool       `json:"encrypted"`
+		FileURL                *string    `json:"file_url,omitempty"`
+		FileType               *string    `json:"file_type,omitempty"`
+		FileName               *string    `json:"file_name,omitempty"`
+		FileSize               int64      `json:"file_size"`
+		DurationMs             int64      `json:"duration_ms"`
+		ThumbnailURL           string     `json:"thumbnail_url"`
+		KeyVersion             int        `json:"key_version"`
+		ReplyToID              *string    `json:"reply_to_id,omitempty"`
+		IsForwarded            bool       `json:"is_forwarded"`
+		ForwardedFromName      string     `json:"forwarded_from_name"`
+		ForwardedFromMessageID *string    `json:"forwarded_from_message_id,omitempty"`
+		Type                   string     `json:"type"`
+		DeliveredAt            *time.Time `json:"delivered_at"`
+		ReadAt                 *time.Time `json:"read_at"`
+		CreatedAt              time.Time  `json:"created_at"`
+		UpdatedAt              time.Time  `json:"updated_at"`
 	}
 
 	decryptedMessages := make([]DecryptedMessage, len(messages))
@@ -368,6 +411,16 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 		fileURL := m.FileURL
 		contentType := m.ContentType
 		fileName := m.FileName
+		var forwardedFromMsgID *string
+		if m.ForwardedFromMessageID != nil {
+			s := m.ForwardedFromMessageID.String()
+			forwardedFromMsgID = &s
+		}
+		var replyToID *string
+		if m.ReplyToID != nil {
+			s := m.ReplyToID.String()
+			replyToID = &s
+		}
 		decryptedMessages[i] = DecryptedMessage{
 			ID:       m.ID.String(),
 			ChatID:   m.ChatID,
@@ -378,20 +431,24 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 				"username":     sender.Username,
 				"display_name": sender.DisplayName,
 			},
-			Content:      m.EncryptedContent,
-			Encrypted:    m.IsEncrypted,
-			FileURL:      &fileURL,
-			FileType:     &contentType,
-			FileName:     &fileName,
-			FileSize:     m.FileSize,
-			DurationMs:   m.DurationMs,
-			ThumbnailURL: m.ThumbnailURL,
-			KeyVersion:   m.KeyVersion,
-			Type:         m.ChatType,
-			DeliveredAt:  m.DeliveredAt,
-			ReadAt:       m.ReadAt,
-			CreatedAt:    m.CreatedAt,
-			UpdatedAt:    m.UpdatedAt,
+			Content:                m.EncryptedContent,
+			Encrypted:              m.IsEncrypted,
+			FileURL:                &fileURL,
+			FileType:               &contentType,
+			FileName:               &fileName,
+			FileSize:               m.FileSize,
+			DurationMs:             m.DurationMs,
+			ThumbnailURL:           m.ThumbnailURL,
+			KeyVersion:             m.KeyVersion,
+			ReplyToID:              replyToID,
+			IsForwarded:            m.IsForwarded,
+			ForwardedFromName:      m.ForwardedFromName,
+			ForwardedFromMessageID: forwardedFromMsgID,
+			Type:                   m.ChatType,
+			DeliveredAt:            m.DeliveredAt,
+			ReadAt:                 m.ReadAt,
+			CreatedAt:              m.CreatedAt,
+			UpdatedAt:              m.UpdatedAt,
 		}
 	}
 

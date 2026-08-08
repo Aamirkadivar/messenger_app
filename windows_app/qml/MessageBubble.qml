@@ -39,6 +39,18 @@ Item {
     property bool selectionMode: false
     property bool selected: false
     signal toggleSelected()
+    /** Display-only forward attribution from the server. */
+    property bool isForwarded: false
+    property string forwardedFromName: ""
+    property string replyToId: ""
+    property string replySenderName: ""
+    property string replyPreview: ""
+    property bool replyAvailable: false
+    signal replyQuoteClicked()
+    /** Long text starts collapsed; user toggles Show more / Show less. */
+    property bool textExpanded: false
+    readonly property int collapsedMaxLines: 8
+    signal textExpandToggled(bool expanded)
     readonly property bool isVoiceMessage: voiceUrl && voiceUrl.length > 0 && contentType === "audio"
     readonly property bool isImageMessage: voiceUrl && voiceUrl.length > 0 && contentType === "image"
     readonly property bool isFileMessage: voiceUrl && voiceUrl.length > 0 && contentType === "file"
@@ -115,10 +127,14 @@ Item {
         target: typeof chatService !== "undefined" ? chatService : null
         function onVoiceReadyForPlayback(msgId, localFilePath) {
             if (msgId !== bubbleRoot.messageId) return
+            // Only auto-start playback when this bubble kicked off the prepare
+            // (a forward queue shares the same signals and must not hijack play).
+            var wasPreparing = bubbleRoot.voicePreparing
             bubbleRoot.voicePreparing = false
             bubbleRoot.voiceLocalPath = localFilePath
             bubbleRoot.voiceError = ""
-            voiceService.togglePlayback(bubbleRoot.messageId, localFilePath)
+            if (wasPreparing)
+                voiceService.togglePlayback(bubbleRoot.messageId, localFilePath)
         }
         function onVoicePlaybackError(msgId, error) {
             if (msgId !== bubbleRoot.messageId) return
@@ -127,13 +143,16 @@ Item {
         }
         function onAttachmentReady(msgId, localFilePath) {
             if (msgId !== bubbleRoot.messageId) return
+            var wasPreparing = bubbleRoot.filePreparing
             bubbleRoot.filePreparing = false
             bubbleRoot.fileLocalPath = localFilePath
             bubbleRoot.fileError = ""
             // A file attachment was fetched because of a tap - open it right
             // away. An image was fetched proactively just to show a
             // thumbnail, so it should NOT jump to opening in another app.
-            if (bubbleRoot.isFileMessage) Qt.openUrlExternally("file:///" + localFilePath)
+            // Forward prepare must not open either (filePreparing is false).
+            if (wasPreparing && bubbleRoot.isFileMessage)
+                Qt.openUrlExternally("file:///" + localFilePath)
         }
         function onAttachmentError(msgId, error) {
             if (msgId !== bubbleRoot.messageId) return
@@ -142,8 +161,14 @@ Item {
         }
     }
 
+    onMessageIdChanged: textExpanded = false
+
     width: parent ? parent.width : 400
-    height: bubbleRoot.isVideoNote ? (roundVideoLoader.height + 8) : (bubble.height + 4)
+    height: bubbleRoot.isVideoNote
+            ? (roundVideoLoader.height
+               + (bubbleRoot.replyToId.length > 0 ? videoReplyQuote.height + 6 : 0)
+               + (bubbleRoot.isForwarded ? 22 : 0) + 8)
+            : (bubble.height + 4)
 
     // A tinted band behind the whole row, so a selected message reads as
     // selected even when the bubble itself is a bare circle (round video) or
@@ -199,12 +224,84 @@ Item {
     // A round video gets no bubble chrome - a rounded rectangle behind a
     // circle just boxes it in. Loaded on demand so a chat full of text does
     // not instantiate a MediaPlayer per message.
+    Rectangle {
+        id: videoReplyQuote
+        visible: bubbleRoot.isVideoNote && bubbleRoot.replyToId.length > 0
+        anchors.right: isMine ? parent.right : undefined
+        anchors.left: isMine ? undefined : parent.left
+        anchors.top: parent.top
+        width: Math.min(220, parent.width - 24)
+        height: videoReplyCol.implicitHeight + 10
+        radius: 8
+        color: darkMode ? Qt.rgba(1, 1, 1, 0.10) : Qt.rgba(0, 0, 0, 0.06)
+        Row {
+            anchors.fill: parent
+            anchors.margins: 6
+            spacing: 8
+            Rectangle {
+                width: 3
+                height: parent.height
+                radius: 1.5
+                color: bubbleRoot.accentColor
+            }
+            Column {
+                id: videoReplyCol
+                width: parent.width - 11
+                spacing: 2
+                Text {
+                    width: parent.width
+                    text: bubbleRoot.replyAvailable
+                          ? (bubbleRoot.replySenderName.length > 0 ? bubbleRoot.replySenderName : "Message")
+                          : "Original message unavailable"
+                    font.pixelSize: 11
+                    font.bold: true
+                    color: bubbleRoot.accentColor
+                    elide: Text.ElideRight
+                }
+                Text {
+                    width: parent.width
+                    visible: bubbleRoot.replyAvailable && bubbleRoot.replyPreview.length > 0
+                    text: bubbleRoot.replyPreview
+                    font.pixelSize: 12
+                    color: bubbleRoot.darkMode ? Qt.rgba(1, 1, 1, 0.7) : Qt.rgba(0, 0, 0, 0.65)
+                    elide: Text.ElideRight
+                    maximumLineCount: 2
+                    wrapMode: Text.Wrap
+                }
+            }
+        }
+        MouseArea {
+            anchors.fill: parent
+            enabled: bubbleRoot.replyAvailable
+            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+            onClicked: bubbleRoot.replyQuoteClicked()
+        }
+    }
+
+    Text {
+        id: videoForwardLabel
+        visible: bubbleRoot.isVideoNote && bubbleRoot.isForwarded
+        anchors.right: isMine ? parent.right : undefined
+        anchors.left: isMine ? undefined : parent.left
+        anchors.top: videoReplyQuote.visible ? videoReplyQuote.bottom : parent.top
+        anchors.topMargin: videoReplyQuote.visible ? 4 : 0
+        text: bubbleRoot.forwardedFromName.length > 0
+              ? ("Forwarded from " + bubbleRoot.forwardedFromName)
+              : "Forwarded"
+        font.pixelSize: 11
+        font.italic: true
+        color: bubbleRoot.darkMode ? Qt.rgba(1, 1, 1, 0.55) : Qt.rgba(0, 0, 0, 0.45)
+    }
+
     Loader {
         id: roundVideoLoader
         active: bubbleRoot.isVideoNote
         visible: active
         anchors.right: isMine ? parent.right : undefined
         anchors.left: isMine ? undefined : parent.left
+        anchors.top: videoForwardLabel.visible ? videoForwardLabel.bottom
+                     : (videoReplyQuote.visible ? videoReplyQuote.bottom : parent.top)
+        anchors.topMargin: (videoForwardLabel.visible || videoReplyQuote.visible) ? 4 : 0
         sourceComponent: RoundVideoBubble {
             messageId: bubbleRoot.messageId
             chatId: bubbleRoot.chatId
@@ -229,7 +326,9 @@ Item {
                : bubbleRoot.isImageMessage
                ? bubbleRoot.imageContentSize + 20
                : Math.min(
-                     Math.max(contentText.implicitWidth, timeRow.implicitWidth, bubbleRoot.minContentWidth) + 28,
+                     Math.max(contentText.width, timeRow.implicitWidth,
+                              bubbleRoot.isForwarded ? forwardLabel.implicitWidth : 0,
+                              bubbleRoot.minContentWidth) + 28,
                      bubbleRoot.maxWidth
                  )
         height: contentColumn.implicitHeight + 20
@@ -258,13 +357,138 @@ Item {
             }
 
             Text {
-                id: contentText
+                id: forwardLabel
+                visible: bubbleRoot.isForwarded
+                text: bubbleRoot.forwardedFromName.length > 0
+                      ? ("Forwarded from " + bubbleRoot.forwardedFromName)
+                      : "Forwarded"
+                font.pixelSize: 11
+                font.italic: true
+                color: isMine ? Qt.rgba(1, 1, 1, 0.75) : bubbleRoot.accentColor
+                elide: Text.ElideRight
                 width: parent.width
-                visible: !bubbleRoot.hasAttachment
+            }
+
+            Rectangle {
+                id: replyQuote
+                visible: bubbleRoot.replyToId.length > 0
+                width: parent.width
+                height: replyQuoteCol.implicitHeight + 10
+                radius: 8
+                color: isMine ? Qt.rgba(1, 1, 1, 0.14) : Qt.rgba(bubbleRoot.accentColor.r, bubbleRoot.accentColor.g, bubbleRoot.accentColor.b, 0.12)
+                Row {
+                    anchors.fill: parent
+                    anchors.margins: 6
+                    spacing: 8
+                    Rectangle {
+                        width: 3
+                        height: parent.height
+                        radius: 1.5
+                        color: isMine ? Qt.rgba(1, 1, 1, 0.85) : bubbleRoot.accentColor
+                    }
+                    Column {
+                        id: replyQuoteCol
+                        width: parent.width - 11
+                        spacing: 2
+                        Text {
+                            width: parent.width
+                            text: bubbleRoot.replyAvailable
+                                  ? (bubbleRoot.replySenderName.length > 0 ? bubbleRoot.replySenderName : "Message")
+                                  : "Original message unavailable"
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: isMine ? "#FFFFFF" : bubbleRoot.accentColor
+                            elide: Text.ElideRight
+                        }
+                        Text {
+                            width: parent.width
+                            visible: bubbleRoot.replyAvailable && bubbleRoot.replyPreview.length > 0
+                            text: bubbleRoot.replyPreview
+                            font.pixelSize: 12
+                            color: isMine ? Qt.rgba(1, 1, 1, 0.8) : (darkMode ? "#C8C8D8" : "#555566")
+                            elide: Text.ElideRight
+                            maximumLineCount: 2
+                            wrapMode: Text.Wrap
+                        }
+                    }
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    enabled: bubbleRoot.replyAvailable
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: bubbleRoot.replyQuoteClicked()
+                }
+            }
+
+            // Invisible metrics for bubble width with wrap off; the visible
+            // Text below wraps and would report a width that depends on its
+            // assigned width (circular for layout).
+            Text {
+                id: contentMeasure
+                visible: false
                 text: bubbleRoot.messageText
                 font.pixelSize: 14
-                color: isMine ? bubbleRoot.myTextColor : bubbleRoot.theirTextColor
+            }
+
+            // Full wrapped height probe — decides whether Show more is needed.
+            Text {
+                id: contentHeightProbe
+                visible: false
+                width: Math.min(
+                           Math.max(contentMeasure.implicitWidth, bubbleRoot.minContentWidth),
+                           bubbleRoot.maxWidth - 28
+                       )
+                text: bubbleRoot.messageText
                 wrapMode: Text.Wrap
+                font.pixelSize: 14
+            }
+
+            readonly property bool textNeedsCollapse: !bubbleRoot.hasAttachment
+                    && contentHeightProbe.lineCount > bubbleRoot.collapsedMaxLines
+            // Clip height instead of maximumLineCount — Qt often fails to
+            // relayout when maximumLineCount shrinks, so Show less looked broken.
+            readonly property real collapsedTextHeight: {
+                var lines = Math.max(1, contentHeightProbe.lineCount)
+                return contentHeightProbe.implicitHeight
+                        * bubbleRoot.collapsedMaxLines / lines
+            }
+
+            Item {
+                id: textBody
+                visible: !bubbleRoot.hasAttachment
+                width: contentHeightProbe.width
+                height: (contentColumn.textNeedsCollapse && !bubbleRoot.textExpanded)
+                        ? contentColumn.collapsedTextHeight
+                        : contentText.implicitHeight
+                clip: true
+
+                Text {
+                    id: contentText
+                    width: parent.width
+                    text: bubbleRoot.messageText
+                    wrapMode: Text.Wrap
+                    font.pixelSize: 14
+                    color: isMine ? bubbleRoot.myTextColor : bubbleRoot.theirTextColor
+                }
+            }
+
+            Text {
+                id: expandToggle
+                visible: contentColumn.textNeedsCollapse
+                text: bubbleRoot.textExpanded ? "Show less" : "Show more"
+                font.pixelSize: 12
+                font.bold: true
+                color: isMine ? Qt.rgba(1, 1, 1, 0.9) : bubbleRoot.accentColor
+                MouseArea {
+                    anchors.fill: parent
+                    anchors.margins: -6
+                    cursorShape: Qt.PointingHandCursor
+                    preventStealing: true
+                    onClicked: {
+                        bubbleRoot.textExpanded = !bubbleRoot.textExpanded
+                        bubbleRoot.textExpandToggled(bubbleRoot.textExpanded)
+                    }
+                }
             }
 
             Item {

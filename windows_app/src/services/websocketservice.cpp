@@ -178,7 +178,12 @@ void WebSocketService::onTextMessageReceived(const QString& message) {
         m["fileName"] = data[QStringLiteral("file_name")].toString();
         m["fileSize"] = static_cast<qint64>(data[QStringLiteral("file_size")].toDouble(0));
         m["durationMs"] = static_cast<qint64>(data[QStringLiteral("duration_ms")].toDouble(0));
+        m["thumbnailUrl"] = data[QStringLiteral("thumbnail_url")].toString();
         m["keyVersion"] = data[QStringLiteral("key_version")].toInt(0);
+        m["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
+        m["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
+        m["forwardedFromMessageId"] = data[QStringLiteral("forwarded_from_message_id")].toString();
+        m["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
 
         emit messageReceived(chatId, m);
     } else if (type == QStringLiteral("typing")) {

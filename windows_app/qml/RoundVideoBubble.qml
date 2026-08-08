@@ -199,10 +199,13 @@ Item {
 
         function onVideoNoteReadyForPlayback(messageId, path) {
             if (messageId !== bubbleRoot.messageId) return
+            // Only auto-play when this bubble started the download - a forward
+            // queue reuses the same signal and must not steal playback.
+            var wasDownloading = bubbleRoot.downloading
             bubbleRoot.downloading = false
             bubbleRoot.localPath = path
             player.source = "file:///" + path
-            player.play()
+            if (wasDownloading) player.play()
         }
 
         function onVideoNoteThumbnailReady(messageId, path) {

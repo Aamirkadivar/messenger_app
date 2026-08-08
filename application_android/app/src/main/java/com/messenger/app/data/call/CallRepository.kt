@@ -130,18 +130,22 @@ class CallRepository @Inject constructor(
         private const val MAX_GROUP_PARTICIPANTS = 4
 
         /**
-         * Capture format for video. 16:9 (Meet-style) so tiles and the PiP
-         * don't letterbox a 4:3 sensor feed into landscape cells. Group
-         * calls keep the same size at a lower frame rate to keep mesh cost
-         * down - Windows also encodes at 640×360.
+         * Landscape capture (phone sideways / tablet). Matches Windows'
+         * 640×360 Meet canvas.
          */
         private const val VIDEO_WIDTH = 640
         private const val VIDEO_HEIGHT = 360
         private const val VIDEO_FPS = 30
 
-        /** Same 16:9 canvas, lower fps when encoding up to 3 mesh edges. */
-        private const val GROUP_VIDEO_WIDTH = 640
-        private const val GROUP_VIDEO_HEIGHT = 360
+        /**
+         * Portrait capture when the phone is upright. Forcing 640×360 while
+         * vertical crops the face heavily; sending a tall frame lets Windows
+         * letterbox (black side bars) like Meet and keep more of the FOV.
+         */
+        private const val VIDEO_WIDTH_PORTRAIT = 360
+        private const val VIDEO_HEIGHT_PORTRAIT = 640
+
+        /** Same sizes, lower fps when encoding up to 3 mesh edges. */
         private const val GROUP_VIDEO_FPS = 15
     }
 
@@ -1554,10 +1558,13 @@ class CallRepository @Inject constructor(
     }
 
     private fun captureFormat(): Triple<Int, Int, Int> {
-        return if (_state.value.isGroupCall) {
-            Triple(GROUP_VIDEO_WIDTH, GROUP_VIDEO_HEIGHT, GROUP_VIDEO_FPS)
+        val portrait = context.resources.configuration.orientation ==
+            android.content.res.Configuration.ORIENTATION_PORTRAIT
+        val fps = if (_state.value.isGroupCall) GROUP_VIDEO_FPS else VIDEO_FPS
+        return if (portrait) {
+            Triple(VIDEO_WIDTH_PORTRAIT, VIDEO_HEIGHT_PORTRAIT, fps)
         } else {
-            Triple(VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS)
+            Triple(VIDEO_WIDTH, VIDEO_HEIGHT, fps)
         }
     }
 

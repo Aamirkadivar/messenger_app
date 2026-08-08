@@ -33,7 +33,11 @@ data class IncomingChatMessage(
     val fileSize: Long = 0,
     val durationMs: Long = 0,
     /** Which of the sender's group Sender Key versions encrypted this message. */
-    val keyVersion: Int = 0
+    val keyVersion: Int = 0,
+    val replyToId: String = "",
+    val isForwarded: Boolean = false,
+    val forwardedFromName: String = "",
+    val forwardedFromMessageId: String = ""
 )
 
 /** Someone retracted a message for everyone. */
@@ -305,7 +309,11 @@ class WebSocketManager private constructor(
                         fileName = data.optString("file_name").takeIf { it.isNotBlank() },
                         fileSize = data.optLong("file_size", 0),
                         durationMs = data.optLong("duration_ms", 0),
-                        keyVersion = data.optInt("key_version", 0)
+                        keyVersion = data.optInt("key_version", 0),
+                        replyToId = data.optString("reply_to_id"),
+                        isForwarded = data.optBoolean("is_forwarded", false),
+                        forwardedFromName = data.optString("forwarded_from_name"),
+                        forwardedFromMessageId = data.optString("forwarded_from_message_id")
                     )
                     CoroutineScope(Dispatchers.Main).launch { _incomingMessages.emit(message) }
                 }

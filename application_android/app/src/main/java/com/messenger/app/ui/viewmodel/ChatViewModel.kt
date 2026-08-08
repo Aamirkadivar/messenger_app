@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.messenger.app.data.model.ChatListItemDto
+import com.messenger.app.data.model.ForwardMeta
 import com.messenger.app.data.model.MessageDto
 import com.messenger.app.data.model.UserSearchResult
 import com.messenger.app.data.repository.AttachmentRepository
@@ -72,7 +73,11 @@ data class ChatMessageUi(
     val videoDurationMs: Long = 0,
     val videoEncrypted: Boolean = false,
     /** Sender Key version for group media decrypt; 0 for direct / cleartext. */
-    val keyVersion: Int = 0
+    val keyVersion: Int = 0,
+    val isForwarded: Boolean = false,
+    val forwardedFromName: String = "",
+    /** Parent message id when this bubble is a reply; resolve quote locally. */
+    val replyToId: String = ""
 ) {
     val isVoice: Boolean get() = !voiceUrl.isNullOrBlank()
     val isAttachment: Boolean get() = !attachmentUrl.isNullOrBlank()
@@ -379,7 +384,10 @@ class ChatViewModel @Inject constructor(
                         videoUrl = if (isVideoNote) incoming.fileUrl else null,
                         videoDurationMs = if (isVideoNote) incoming.durationMs else 0,
                         videoEncrypted = isVideoNote && incoming.encrypted,
-                        keyVersion = incoming.keyVersion
+                        keyVersion = incoming.keyVersion,
+                        isForwarded = incoming.isForwarded,
+                        forwardedFromName = incoming.forwardedFromName,
+                        replyToId = incoming.replyToId
                     )
                     _chatState.update { it.copy(messages = it.messages + message) }
                 } else {
@@ -560,7 +568,10 @@ class ChatViewModel @Inject constructor(
             videoThumbnailUrl = if (isVideoNote) dto.thumbnailUrl else null,
             videoDurationMs = if (isVideoNote) dto.durationMs else 0,
             videoEncrypted = isVideoNote && dto.encrypted,
-            keyVersion = dto.keyVersion
+            keyVersion = dto.keyVersion,
+            isForwarded = dto.isForwarded,
+            forwardedFromName = dto.forwardedFromName,
+            replyToId = dto.replyToId.orEmpty()
         )
     }
 
@@ -606,6 +617,7 @@ class ChatViewModel @Inject constructor(
                 return@launch
             }
             val myId = resolveCurrentUserId()
+            val replyToId = _pendingReply.value?.id.orEmpty()
 
             // Shown immediately; the real-time echo from the server is filtered
             // out in the incomingMessages collector above (see resolveCurrentUserId).
@@ -615,11 +627,19 @@ class ChatViewModel @Inject constructor(
                 senderName = "Me",
                 content = content,
                 timestamp = System.currentTimeMillis(),
-                isMine = true
+                isMine = true,
+                replyToId = replyToId
             )
             _chatState.update { it.copy(messages = it.messages + optimistic) }
+            clearReply()
 
-            chatRepository.sendMessage(token = token, chatId = chatId, chatType = _chatState.value.chatType, plaintext = content)
+            chatRepository.sendMessage(
+                token = token,
+                chatId = chatId,
+                chatType = _chatState.value.chatType,
+                plaintext = content,
+                replyToId = replyToId
+            )
                 .onSuccess {
                     _chatState.update { it.copy(isSending = false) }
                 }
@@ -715,6 +735,8 @@ class ChatViewModel @Inject constructor(
 
             attachmentRepository.upload(token, chatId, picked)
                 .onSuccess { uploaded ->
+                    val replyToId = _pendingReply.value?.id.orEmpty()
+                    clearReply()
                     chatRepository.sendAttachmentMessage(
                         token = token,
                         chatId = chatId,
@@ -724,7 +746,8 @@ class ChatViewModel @Inject constructor(
                         fileSize = uploaded.fileSize,
                         contentType = contentType,
                         encrypted = uploaded.encrypted,
-                        keyVersion = uploaded.keyVersion
+                        keyVersion = uploaded.keyVersion,
+                        replyToId = replyToId
                     )
                         .onSuccess {
                             _chatState.update { it.copy(isSending = false) }
@@ -830,6 +853,8 @@ class ChatViewModel @Inject constructor(
 
             voiceRepository.upload(token, chatId, result.file)
                 .onSuccess { uploaded ->
+                    val replyToId = _pendingReply.value?.id.orEmpty()
+                    clearReply()
                     chatRepository.sendVoiceMessage(
                         token = token,
                         chatId = chatId,
@@ -839,7 +864,8 @@ class ChatViewModel @Inject constructor(
                         fileUrl = uploaded.fileUrl,
                         durationMs = result.durationMs,
                         encrypted = uploaded.encrypted,
-                        keyVersion = uploaded.keyVersion
+                        keyVersion = uploaded.keyVersion,
+                        replyToId = replyToId
                     )
                         .onSuccess {
                             _chatState.update { it.copy(isSending = false) }
@@ -974,6 +1000,8 @@ class ChatViewModel @Inject constructor(
                 _capture.update { it.copy(sendStatus = label) }
             }
                 .onSuccess { prepared ->
+                    val replyToId = _pendingReply.value?.id.orEmpty()
+                    clearReply()
                     chatRepository.sendVideoNoteMessage(
                         token = token,
                         chatId = chatId,
@@ -982,7 +1010,8 @@ class ChatViewModel @Inject constructor(
                         thumbnailUrl = prepared.thumbnailUrl,
                         durationMs = prepared.durationMs,
                         encrypted = prepared.encrypted,
-                        keyVersion = prepared.keyVersion
+                        keyVersion = prepared.keyVersion,
+                        replyToId = replyToId
                     )
                         .onSuccess {
                             _capture.update { it.copy(sendStatus = null) }
@@ -1211,6 +1240,198 @@ class ChatViewModel @Inject constructor(
             .filterNot { it.isSystem }
             .map { it.id }
             .toSet()
+    }
+
+    /** Selects a single message so the forward-chat picker can open on it. */
+    fun beginForward(messageId: String) {
+        _selectedMessageIds.value = setOf(messageId)
+    }
+
+    // ==================== Reply ====================
+
+    private val _pendingReply = MutableStateFlow<ChatMessageUi?>(null)
+    val pendingReply: StateFlow<ChatMessageUi?> = _pendingReply.asStateFlow()
+
+    fun beginReply(messageId: String) {
+        val message = _chatState.value.messages.firstOrNull { it.id == messageId && !it.isSystem } ?: return
+        _pendingReply.value = message
+        clearSelection()
+    }
+
+    fun clearReply() {
+        _pendingReply.value = null
+    }
+
+    /**
+     * Re-sends every selected message into [targetChatId], stamping forward
+     * attribution. Media is fetched/decrypted from the source chat, then
+     * re-uploaded for the target so E2EE keys match the destination.
+     *
+     * Continues past per-message failures and surfaces a summary error.
+     */
+    fun forwardSelectedTo(targetChatId: String, targetChatType: String) {
+        val sourceChatId = _chatState.value.chatId ?: return
+        val selected = _selectedMessageIds.value
+        if (selected.isEmpty()) return
+        val messages = _chatState.value.messages.filter { it.id in selected && !it.isSystem }
+        if (messages.isEmpty()) return
+
+        viewModelScope.launch {
+            _chatState.update { it.copy(isSending = true, error = null) }
+            val token = tokenManager.getAccessToken().getOrNull()
+            if (token.isNullOrEmpty()) {
+                _chatState.update { it.copy(isSending = false, error = "Not signed in") }
+                clearSelection()
+                return@launch
+            }
+
+            val failures = mutableListOf<String>()
+            for (message in messages) {
+                val forward = ForwardMeta(
+                    isForwarded = true,
+                    fromName = message.senderName.ifBlank { "Unknown" },
+                    fromMessageId = message.id
+                )
+                val result = runCatching {
+                    when {
+                        message.isVoice -> forwardVoice(
+                            token, sourceChatId, targetChatId, targetChatType, message, forward
+                        )
+                        message.isVideoNote -> forwardVideoNote(
+                            token, sourceChatId, targetChatId, targetChatType, message, forward
+                        )
+                        message.isAttachment -> forwardAttachment(
+                            token, sourceChatId, targetChatId, targetChatType, message, forward
+                        )
+                        else -> chatRepository.sendMessage(
+                            token = token,
+                            chatId = targetChatId,
+                            chatType = targetChatType,
+                            plaintext = message.content,
+                            forward = forward
+                        ).getOrThrow()
+                    }
+                }
+                if (result.isFailure) {
+                    val err = result.exceptionOrNull()
+                    Log.e(TAG, "forward failed for ${message.id}", err)
+                    if (err is SessionExpiredException) {
+                        _sessionExpired.value = true
+                        break
+                    }
+                    failures += err?.message ?: message.id
+                }
+            }
+
+            clearSelection()
+            _chatState.update {
+                it.copy(
+                    isSending = false,
+                    error = when {
+                        failures.isEmpty() -> null
+                        failures.size == 1 -> "Failed to forward: ${failures.first()}"
+                        else -> "Failed to forward ${failures.size} messages"
+                    }
+                )
+            }
+        }
+    }
+
+    private suspend fun forwardVoice(
+        token: String,
+        sourceChatId: String,
+        targetChatId: String,
+        targetChatType: String,
+        message: ChatMessageUi,
+        forward: ForwardMeta
+    ) {
+        val url = message.voiceUrl ?: error("Voice note has no file")
+        val cached = voiceRepository.fetchForPlayback(
+            sourceChatId, message.id, url, message.voiceEncrypted,
+            message.senderId, message.keyVersion
+        ).getOrThrow()
+        // upload() deletes its input; copy so the playback cache survives.
+        val uploadCopy = File(
+            cached.parentFile,
+            "fwd_voice_${message.id}_${System.currentTimeMillis()}.m4a"
+        )
+        cached.copyTo(uploadCopy, overwrite = true)
+        val uploaded = voiceRepository.upload(token, targetChatId, uploadCopy).getOrThrow()
+        chatRepository.sendVoiceMessage(
+            token = token,
+            chatId = targetChatId,
+            chatType = targetChatType,
+            fileUrl = uploaded.fileUrl,
+            durationMs = message.voiceDurationMs,
+            encrypted = uploaded.encrypted,
+            keyVersion = uploaded.keyVersion,
+            forward = forward
+        ).getOrThrow()
+    }
+
+    private suspend fun forwardVideoNote(
+        token: String,
+        sourceChatId: String,
+        targetChatId: String,
+        targetChatType: String,
+        message: ChatMessageUi,
+        forward: ForwardMeta
+    ) {
+        val url = message.videoUrl ?: error("Video note has no file")
+        val cached = roundVideoRepository.fetchForPlayback(
+            sourceChatId, message.id, url, message.videoEncrypted,
+            message.senderId, message.keyVersion
+        ).getOrThrow()
+        // prepareAndUpload deletes its capture file; copy so the cache survives.
+        val uploadCopy = File(
+            cached.parentFile,
+            "fwd_video_${message.id}_${System.currentTimeMillis()}.mp4"
+        )
+        cached.copyTo(uploadCopy, overwrite = true)
+        val prepared = roundVideoRepository.prepareAndUpload(token, targetChatId, uploadCopy).getOrThrow()
+        chatRepository.sendVideoNoteMessage(
+            token = token,
+            chatId = targetChatId,
+            chatType = targetChatType,
+            fileUrl = prepared.fileUrl,
+            thumbnailUrl = prepared.thumbnailUrl,
+            durationMs = prepared.durationMs,
+            encrypted = prepared.encrypted,
+            keyVersion = prepared.keyVersion,
+            forward = forward
+        ).getOrThrow()
+    }
+
+    private suspend fun forwardAttachment(
+        token: String,
+        sourceChatId: String,
+        targetChatId: String,
+        targetChatType: String,
+        message: ChatMessageUi,
+        forward: ForwardMeta
+    ) {
+        val url = message.attachmentUrl ?: error("Attachment has no file")
+        val file = attachmentRepository.fetchForView(
+            sourceChatId, message.id, url, message.attachmentName,
+            message.attachmentEncrypted, message.senderId, message.keyVersion
+        ).getOrThrow()
+        val name = message.attachmentName.ifBlank { file.name }
+        val bytes = file.readBytes()
+        val picked = AttachmentRepository.PickedFile(name, bytes.size.toLong(), bytes)
+        val contentType = attachmentRepository.classify(name)
+        val uploaded = attachmentRepository.upload(token, targetChatId, picked).getOrThrow()
+        chatRepository.sendAttachmentMessage(
+            token = token,
+            chatId = targetChatId,
+            chatType = targetChatType,
+            fileUrl = uploaded.fileUrl,
+            fileName = name,
+            fileSize = uploaded.fileSize,
+            contentType = contentType,
+            encrypted = uploaded.encrypted,
+            keyVersion = uploaded.keyVersion,
+            forward = forward
+        ).getOrThrow()
     }
 
     /**

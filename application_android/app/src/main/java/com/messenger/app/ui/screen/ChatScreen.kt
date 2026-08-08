@@ -1,6 +1,9 @@
 package com.messenger.app.ui.screen
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.widget.Toast
@@ -18,11 +21,15 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Forward
+import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.AttachFile
@@ -33,6 +40,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.SelectAll
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -40,6 +48,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -49,9 +58,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.messenger.app.data.repository.guessMimeType
@@ -71,6 +83,7 @@ import com.messenger.app.ui.viewmodel.CaptureUiState
 import com.messenger.app.ui.theme.ChatBubbleShapeReceived
 import com.messenger.app.ui.theme.ChatBubbleShapeSent
 import com.messenger.app.ui.theme.MessengerExtendedColors
+import com.messenger.app.ui.viewmodel.ChatListItemUi
 import com.messenger.app.ui.viewmodel.ChatMessageUi
 import com.messenger.app.ui.viewmodel.ChatViewModel
 import com.messenger.app.ui.viewmodel.RecordingUiState
@@ -78,6 +91,15 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
+
+/**
+ * Hard ceiling on how far a text bubble may grow.
+ *
+ * Past roughly this height a bubble stops taking touch input over its lower
+ * part - the collapse link, long-press selection and list scrolling all stop
+ * working there - so an unbounded message has to be read full-screen instead.
+ */
+private const val EXPANDED_MESSAGE_MAX_LINES = 40
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -157,8 +179,11 @@ fun ChatScreen(
     }
 
     val selectedIds by viewModel.selectedMessageIds.collectAsStateWithLifecycle()
+    val pendingReply by viewModel.pendingReply.collectAsStateWithLifecycle()
+    var scrollToMessageId by remember { mutableStateOf<String?>(null) }
     val inSelection by viewModel.inSelectionMode.collectAsStateWithLifecycle()
     val allSelectedMine by viewModel.allSelectedAreMine.collectAsStateWithLifecycle()
+    val chatList by viewModel.chatListState.collectAsStateWithLifecycle()
 
     // Back exits selection before it leaves the chat - the same precedence
     // every other app uses for a transient modal state.
@@ -170,6 +195,7 @@ fun ChatScreen(
     val activePlayer by viewModel.activePlayer.collectAsStateWithLifecycle()
     var fullscreenVideo by remember { mutableStateOf<ChatMessageUi?>(null) }
     var pendingBulkDelete by remember { mutableStateOf(false) }
+    var showForwardPicker by remember { mutableStateOf(false) }
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
 
     val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
@@ -179,12 +205,27 @@ fun ChatScreen(
         if (capture.videoActive) keyboard?.hide()
     }
 
+    LaunchedEffect(showForwardPicker) {
+        if (showForwardPicker && chatList.chats.isEmpty()) {
+            viewModel.loadChats()
+        }
+    }
+
     LaunchedEffect(chatId) {
         viewModel.openChat(chatId, chatName, isGroup)
     }
 
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
+    }
+
+    LaunchedEffect(scrollToMessageId) {
+        val target = scrollToMessageId ?: return@LaunchedEffect
+        val idx = state.messages.indexOfFirst { it.id == target }
+        if (idx >= 0) {
+            listState.animateScrollToItem(idx)
+            scrollToMessageId = null
+        }
     }
 
     val dark = MessengerExtendedColors.isDark
@@ -216,6 +257,37 @@ fun ChatScreen(
                     actions = {
                         IconButton(onClick = { viewModel.selectAllMessages() }) {
                             Icon(Icons.Outlined.SelectAll, contentDescription = "Select all")
+                        }
+                        val selectedText = state.messages
+                            .filter { it.id in selectedIds && it.content.isNotBlank() && !it.isSystem }
+                            .joinToString("\n\n") { it.content }
+                        IconButton(
+                            onClick = {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("message", selectedText))
+                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                            },
+                            enabled = selectedText.isNotBlank()
+                        ) {
+                            Icon(Icons.Outlined.ContentCopy, contentDescription = "Copy")
+                        }
+                        IconButton(
+                            onClick = {
+                                val id = selectedIds.firstOrNull() ?: return@IconButton
+                                viewModel.beginReply(id)
+                            },
+                            enabled = selectedIds.size == 1
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.Reply,
+                                contentDescription = "Reply"
+                            )
+                        }
+                        IconButton(onClick = { showForwardPicker = true }) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.Forward,
+                                contentDescription = "Forward selected"
+                            )
                         }
                         IconButton(onClick = { pendingBulkDelete = true }) {
                             Icon(
@@ -298,6 +370,13 @@ fun ChatScreen(
         containerColor = Color.Transparent,
         bottomBar = {
             GlassSurface(modifier = Modifier.fillMaxWidth(), shape = androidx.compose.ui.graphics.RectangleShape, sheen = false) {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                pendingReply?.let { reply ->
+                    ReplyComposerBar(
+                        message = reply,
+                        onDismiss = { viewModel.clearReply() }
+                    )
+                }
             MessageInputBar(
                 value = messageText,
                 onValueChange = { messageText = it },
@@ -356,6 +435,7 @@ fun ChatScreen(
                 }
             )
             }
+            }
         }
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
@@ -379,6 +459,7 @@ fun ChatScreen(
                     } else {
                         MessageBubble(
                             message = message,
+                            replyParent = state.messages.firstOrNull { it.id == message.replyToId },
                             isPlaying = playback.messageId == message.id && playback.isPlaying,
                             positionMs = if (playback.messageId == message.id) playback.positionMs else 0,
                             onTogglePlay = { viewModel.toggleVoicePlayback(message) },
@@ -393,7 +474,8 @@ fun ChatScreen(
                             onToggleVideo = { viewModel.toggleVideoPlayback(message) },
                             onSeekVideo = { f -> viewModel.seekVideo(message.id, f) },
                             onExpandVideo = { fullscreenVideo = message },
-                            onLongPress = { viewModel.toggleMessageSelection(message.id) }
+                            onLongPress = { viewModel.toggleMessageSelection(message.id) },
+                            onReplyQuoteClick = { id -> scrollToMessageId = id }
                         )
                         if (message.isVideoNote) {
                             LaunchedEffect(message.id) { viewModel.ensureVideoThumbnail(message) }
@@ -426,6 +508,21 @@ fun ChatScreen(
 
     // Drawn last, so it sits above the app bar, the message list and the
     // composer rather than behind them.
+    if (showForwardPicker) {
+        ForwardChatPickerSheet(
+            chats = chatList.chats.filter { it.id != chatId },
+            isLoading = chatList.isLoading,
+            onDismiss = { showForwardPicker = false },
+            onPick = { target ->
+                showForwardPicker = false
+                viewModel.forwardSelectedTo(
+                    target.id,
+                    if (target.isGroup) "group" else "direct"
+                )
+            }
+        )
+    }
+
     if (pendingBulkDelete) {
         val count = selectedIds.size
         AlertDialog(
@@ -520,6 +617,7 @@ private fun openFileExternally(context: android.content.Context, file: File) {
 @Composable
 private fun MessageBubble(
     message: ChatMessageUi,
+    replyParent: ChatMessageUi? = null,
     isPlaying: Boolean = false,
     positionMs: Int = 0,
     onTogglePlay: () -> Unit = {},
@@ -532,7 +630,8 @@ private fun MessageBubble(
     onToggleVideo: () -> Unit = {},
     onSeekVideo: (Float) -> Unit = {},
     onExpandVideo: () -> Unit = {},
-    onLongPress: () -> Unit = {}
+    onLongPress: () -> Unit = {},
+    onReplyQuoteClick: (String) -> Unit = {}
 ) {
     val timeFormat = remember { SimpleDateFormat("h:mm a", Locale.getDefault()) }
     val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
@@ -574,24 +673,50 @@ private fun MessageBubble(
             modifier = Modifier.fillMaxWidth().then(selectionTint).then(longPressModifier),
             horizontalArrangement = if (message.isMine) Arrangement.End else Arrangement.Start
         ) {
-            // The bubble owns its own tap handling, and a child is offered the
-            // pointer before its parent - so while selecting, its play/pause
-            // would swallow the tap and the circle could never be selected.
-            // Routing its callbacks through selection here keeps one rule:
-            // selecting beats playing.
-            RoundVideoBubble(
-                state = videoState ?: RoundVideoUiState(durationMs = message.videoDurationMs),
-                player = videoPlayer,
-                onTogglePlay = { if (selectionMode) onToggleSelected() else onToggleVideo() },
-                onSeek = { fraction -> if (!selectionMode) onSeekVideo(fraction) },
-                onExpand = { if (selectionMode) onToggleSelected() else onExpandVideo() }
-            )
+            Column(
+                horizontalAlignment = if (message.isMine) Alignment.End else Alignment.Start
+            ) {
+                if (message.replyToId.isNotBlank()) {
+                    ReplyQuote(
+                        parent = replyParent,
+                        isMine = message.isMine,
+                        modifier = Modifier
+                            .widthIn(max = 220.dp)
+                            .then(longPressModifier)
+                            .clickable(enabled = replyParent != null) {
+                                replyParent?.let { onReplyQuoteClick(it.id) }
+                            }
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
+                if (message.isForwarded) {
+                    ForwardedLabel(
+                        name = message.forwardedFromName,
+                        isMine = message.isMine,
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                    )
+                }
+                // The bubble owns its own tap handling, and a child is offered the
+                // pointer before its parent - so while selecting, its play/pause
+                // would swallow the tap and the circle could never be selected.
+                // Routing its callbacks through selection here keeps one rule:
+                // selecting beats playing.
+                RoundVideoBubble(
+                    state = videoState ?: RoundVideoUiState(durationMs = message.videoDurationMs),
+                    player = videoPlayer,
+                    onTogglePlay = { if (selectionMode) onToggleSelected() else onToggleVideo() },
+                    onSeek = { fraction -> if (!selectionMode) onSeekVideo(fraction) },
+                    onExpand = { if (selectionMode) onToggleSelected() else onExpandVideo() }
+                )
+            }
         }
         return
     }
 
+    // Long-press is applied to body pieces, not the whole row — otherwise it
+    // sits above Show more/less and eats the collapse tap.
     Row(
-        modifier = Modifier.fillMaxWidth().then(selectionTint).then(longPressModifier),
+        modifier = Modifier.fillMaxWidth().then(selectionTint),
         horizontalArrangement = if (message.isMine) Arrangement.End else Arrangement.Start
     ) {
         Column(
@@ -601,44 +726,439 @@ private fun MessageBubble(
                 .background(if (message.isMine) MessengerExtendedColors.sentBubble else MessengerExtendedColors.receivedBubble)
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
+            if (message.isForwarded) {
+                ForwardedLabel(
+                    name = message.forwardedFromName,
+                    isMine = message.isMine,
+                    modifier = longPressModifier
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+            }
+            if (message.replyToId.isNotBlank()) {
+                ReplyQuote(
+                    parent = replyParent,
+                    isMine = message.isMine,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .then(longPressModifier)
+                        .clickable(enabled = replyParent != null) {
+                            replyParent?.let { onReplyQuoteClick(it.id) }
+                        }
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+            }
             if (message.isVoice) {
                 val tint = if (message.isMine) Color.White else MaterialTheme.colorScheme.primary
-                VoiceBubbleContent(
-                    isPlaying = isPlaying,
-                    positionMs = positionMs,
-                    durationMs = message.voiceDurationMs,
-                    tint = tint,
-                    trackColor = tint.copy(alpha = 0.25f),
-                    onTogglePlay = onTogglePlay
-                )
+                Column(modifier = longPressModifier) {
+                    VoiceBubbleContent(
+                        isPlaying = isPlaying,
+                        positionMs = positionMs,
+                        durationMs = message.voiceDurationMs,
+                        tint = tint,
+                        trackColor = tint.copy(alpha = 0.25f),
+                        onTogglePlay = onTogglePlay
+                    )
+                }
             } else if (message.isAttachment) {
-                AttachmentContent(
-                    message = message,
-                    isMine = message.isMine,
-                    onFetchAttachment = onFetchAttachment
-                )
+                Column(modifier = longPressModifier) {
+                    AttachmentContent(
+                        message = message,
+                        isMine = message.isMine,
+                        onFetchAttachment = onFetchAttachment
+                    )
+                }
             } else {
-                Text(
-                    message.content,
+                CollapsibleMessageText(
+                    text = message.content,
+                    messageId = message.id,
                     color = if (message.isMine) Color.White else MessengerExtendedColors.receivedBubbleText,
-                    style = MaterialTheme.typography.bodyLarge
+                    linkColor = if (message.isMine) {
+                        Color.White.copy(alpha = 0.9f)
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
+                    bodyModifier = longPressModifier
                 )
             }
-            Spacer(Modifier.height(2.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Spacer(modifier = Modifier.height(2.dp))
+            Row(
+                modifier = longPressModifier,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
                     timeFormat.format(message.timestamp),
                     style = MaterialTheme.typography.labelSmall,
                     color = if (message.isMine) Color.White.copy(alpha = 0.7f) else MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 if (message.isMine) {
-                    Spacer(Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
                     Icon(
                         imageVector = if (message.isRead) Icons.Filled.DoneAll else Icons.Filled.Done,
                         contentDescription = if (message.isRead) "Seen" else "Sent",
                         tint = if (message.isRead) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.7f),
                         modifier = Modifier.size(14.dp)
                     )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CollapsibleMessageText(
+    text: String,
+    messageId: String,
+    color: Color,
+    linkColor: Color,
+    bodyModifier: Modifier = Modifier,
+    collapsedMaxLines: Int = 8
+) {
+    // Saveable, so scrolling the bubble out of the LazyColumn (or a config
+    // change) does not silently drop the message back to collapsed.
+    var expanded by rememberSaveable(messageId) { mutableStateOf(false) }
+    var showFullMessage by rememberSaveable(messageId) { mutableStateOf(false) }
+    var overflowsCollapsed by remember(messageId, text) { mutableStateOf(false) }
+    var overflowsExpanded by remember(messageId, text) { mutableStateOf(false) }
+
+    // Restored expanded state implies the message was long - the link is the
+    // only way to reach it.
+    val showToggle = overflowsCollapsed || expanded
+
+    val bringIntoView = remember { BringIntoViewRequester() }
+    var collapseRequests by remember(messageId) { mutableIntStateOf(0) }
+    LaunchedEffect(collapseRequests) {
+        if (collapseRequests > 0) bringIntoView.bringIntoView()
+    }
+
+    Column(modifier = Modifier.bringIntoViewRequester(bringIntoView)) {
+        Text(
+            text = text,
+            color = color,
+            style = MaterialTheme.typography.bodyLarge,
+            // Never Int.MAX_VALUE. A bubble grown to the full height of a
+            // multi-thousand-line message stops responding to touch past the
+            // first stretch of it: long-press, the toggle and even list
+            // scrolling die on the dead part. Capping expansion keeps the
+            // bubble a size the UI can handle; the rest is read full-screen.
+            maxLines = if (expanded) EXPANDED_MESSAGE_MAX_LINES else collapsedMaxLines,
+            overflow = TextOverflow.Ellipsis,
+            modifier = bodyModifier.fillMaxWidth(),
+            onTextLayout = { result ->
+                if (expanded) {
+                    overflowsExpanded = result.hasVisualOverflow
+                } else {
+                    overflowsCollapsed =
+                        result.hasVisualOverflow || result.lineCount >= collapsedMaxLines
+                }
+            }
+        )
+        if (showToggle) {
+            // Extra bottom room: the timestamp row below carries its own click
+            // handler and touch targets are padded out to 48dp, so a tight gap
+            // lets the timestamp sit over the link and swallow the tap.
+            Row(
+                modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                MessageTextLink(
+                    text = if (expanded) "Show less" else "Show more",
+                    color = linkColor
+                ) {
+                    val collapsing = expanded
+                    expanded = !expanded
+                    // A tall bubble leaves the list scrolled far past itself;
+                    // collapsing then lands the viewport in whatever follows
+                    // and reads as "nothing happened".
+                    if (collapsing) collapseRequests++
+                }
+                // Only when even the capped expansion cannot show all of it.
+                if (expanded && overflowsExpanded) {
+                    MessageTextLink(text = "Read all", color = linkColor) {
+                        showFullMessage = true
+                    }
+                }
+            }
+        }
+    }
+
+    if (showFullMessage) {
+        FullMessageDialog(text = text, onDismiss = { showFullMessage = false })
+    }
+}
+
+@Composable
+private fun MessageTextLink(
+    text: String,
+    color: Color,
+    onClick: () -> Unit
+) {
+    Text(
+        text = text,
+        color = color,
+        style = MaterialTheme.typography.labelLarge,
+        fontWeight = FontWeight.Bold,
+        // clickable before padding, so the padding widens the hit area instead
+        // of sitting outside it - one small line of text is easy to miss.
+        modifier = Modifier
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                role = Role.Button,
+                onClick = onClick
+            )
+            .padding(vertical = 2.dp, horizontal = 4.dp)
+    )
+}
+
+/**
+ * Full-screen reader for messages too long to sit in a bubble.
+ *
+ * The body is split into blocks fed through a LazyColumn rather than one
+ * enormous Text, for the same reason the bubble is capped: a single text node
+ * that tall stops behaving.
+ */
+@Composable
+private fun FullMessageDialog(text: String, onDismiss: () -> Unit) {
+    val blocks = remember(text) {
+        text.split("\n").chunked(20).map { it.joinToString("\n") }
+    }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.surface
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Message",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Outlined.Close, contentDescription = "Close")
+                    }
+                }
+                HorizontalDivider()
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .navigationBarsPadding(),
+                    contentPadding = PaddingValues(16.dp)
+                ) {
+                    items(blocks.size) { index ->
+                        Text(
+                            text = blocks[index],
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+private fun replyPreviewText(message: ChatMessageUi): String = when {
+    message.content.isNotBlank() -> message.content.replace("\n", " ").take(120)
+    message.isVoice -> "Voice message"
+    message.isVideoNote -> "Video message"
+    message.isImageAttachment -> "Photo"
+    message.isAttachment -> message.attachmentName.ifBlank { "File" }
+    else -> "Message"
+}
+
+@Composable
+private fun ReplyComposerBar(
+    message: ChatMessageUi,
+    onDismiss: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = message.senderName.ifBlank { if (message.isMine) "You" else "Message" },
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = replyPreviewText(message),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        IconButton(onClick = onDismiss) {
+            Icon(Icons.Outlined.Close, contentDescription = "Cancel reply")
+        }
+    }
+}
+
+@Composable
+private fun ReplyQuote(
+    parent: ChatMessageUi?,
+    isMine: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val bar = if (isMine) Color.White.copy(alpha = 0.85f) else MaterialTheme.colorScheme.primary
+    val title = if (parent == null) {
+        "Original message unavailable"
+    } else {
+        parent.senderName.ifBlank { if (parent.isMine) "You" else "Message" }
+    }
+    val body = if (parent == null) "" else replyPreviewText(parent)
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(
+                if (isMine) Color.White.copy(alpha = 0.14f)
+                else MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+            )
+            .padding(horizontal = 8.dp, vertical = 6.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .width(3.dp)
+                .height(32.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(bar)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = if (isMine) Color.White else MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (body.isNotBlank()) {
+                Text(
+                    text = body,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isMine) Color.White.copy(alpha = 0.8f)
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ForwardedLabel(
+    name: String,
+    isMine: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val label = if (name.isBlank()) "Forwarded" else "Forwarded from $name"
+    Text(
+        text = label,
+        modifier = modifier,
+        style = MaterialTheme.typography.labelSmall,
+        fontStyle = FontStyle.Italic,
+        color = if (isMine) {
+            Color.White.copy(alpha = 0.7f)
+        } else {
+            MaterialTheme.colorScheme.onSurfaceVariant
+        },
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ForwardChatPickerSheet(
+    chats: List<ChatListItemUi>,
+    isLoading: Boolean,
+    onDismiss: () -> Unit,
+    onPick: (ChatListItemUi) -> Unit
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(bottom = 12.dp)
+        ) {
+            Text(
+                "Forward to…",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
+            )
+            when {
+                chats.isEmpty() && isLoading -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                    }
+                }
+                chats.isEmpty() -> {
+                    Text(
+                        "No other chats yet",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp)
+                    )
+                }
+                else -> {
+                    chats.forEach { chat ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onPick(chat) }
+                                .heightIn(min = 56.dp)
+                                .padding(horizontal = 20.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Avatar(name = chat.name, avatarUrl = chat.avatarUrl, size = 40.dp)
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    chat.name,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    if (chat.isGroup) "Group" else "Direct chat",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

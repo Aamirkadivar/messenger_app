@@ -111,7 +111,8 @@ Item {
                 chatViewRoot.addMessage(m.senderId, m.senderName, m.content, chatViewRoot.formatTime(m.createdAt),
                                          isMine, isRead, m.fileUrl, m.durationMs, m.voiceEncrypted, m.id,
                                          m.fileType, m.fileName, m.fileSize, m.thumbnailUrl,
-                                         m.rawContent, m.encrypted, m.keyVersion)
+                                         m.rawContent, m.encrypted, m.keyVersion,
+                                         m.isForwarded === true, m.forwardedFromName || "", m.replyToId || "")
                 if (firstUnreadIndex === -1 && !isMine && (!m.readAt || m.readAt.length === 0)) {
                     firstUnreadIndex = i
                 }
@@ -143,7 +144,8 @@ Item {
             chatViewRoot.addMessage(authService.currentUserId, "Me", "", chatViewRoot.formatTime(message.createdAt),
                                      true, false, message.fileUrl, message.durationMs,
                                      message.encrypted === true, message.id, "audio", "", 0, "",
-                                     "", message.encrypted === true, message.keyVersion || 0)
+                                     "", message.encrypted === true, message.keyVersion || 0,
+                                     message.isForwarded === true, message.forwardedFromName || "", message.replyToId || "")
         }
 
         function onVoiceUploadError(error) {
@@ -158,7 +160,8 @@ Item {
                                      true, false, message.fileUrl, message.durationMs,
                                      message.encrypted === true, message.id, "video_note", "", 0,
                                      message.thumbnailUrl || "",
-                                     "", message.encrypted === true, message.keyVersion || 0)
+                                     "", message.encrypted === true, message.keyVersion || 0,
+                                     message.isForwarded === true, message.forwardedFromName || "", message.replyToId || "")
             scrollAfterSend.restart()
         }
 
@@ -171,11 +174,16 @@ Item {
                                      true, false, message.fileUrl, 0,
                                      message.encrypted === true, message.id,
                                      message.fileType, message.fileName, message.fileSize, "",
-                                     "", message.encrypted === true, message.keyVersion || 0)
+                                     "", message.encrypted === true, message.keyVersion || 0,
+                                     message.isForwarded === true, message.forwardedFromName || "", message.replyToId || "")
         }
 
         function onAttachmentUploadError(error) {
             console.log("[ChatView] Attachment upload error:", error)
+        }
+
+        function onForwardFinished(successCount, failCount) {
+            console.log("[ChatView] Forward finished: ok=" + successCount + " fail=" + failCount)
         }
 
         function onMessageDeleted(chatId, messageId) {
@@ -261,6 +269,106 @@ Item {
         revealScrollAnim.from = from
         revealScrollAnim.to = to
         revealScrollAnim.start()
+    }
+
+    // ---- Middle-click autoscroll (Windows-style) ----
+    // One middle click drops an anchor; after that the pointer's vertical
+    // distance from it sets a continuous scroll speed, with no button held.
+    // Any click, a wheel turn, or Escape cancels.
+    property bool autoScrollActive: false
+    property real autoScrollAnchorX: 0
+    property real autoScrollAnchorY: 0
+    property real autoScrollCursorY: 0
+
+    /** Below this many pixels from the anchor, nothing moves - otherwise the
+        view creeps whenever the hand is not perfectly still. */
+    readonly property int autoScrollDeadZone: 14
+
+    function startAutoScroll(x, y) {
+        stopMessagesScrollAnim()
+        autoScrollAnchorX = x
+        autoScrollAnchorY = y
+        autoScrollCursorY = y
+        autoScrollActive = true
+    }
+
+    function stopAutoScroll() {
+        autoScrollActive = false
+    }
+
+    Timer {
+        id: autoScrollTicker
+        running: chatViewRoot.autoScrollActive
+        interval: 16          // ~60fps
+        repeat: true
+        onTriggered: {
+            var dy = chatViewRoot.autoScrollCursorY - chatViewRoot.autoScrollAnchorY
+            var dead = chatViewRoot.autoScrollDeadZone
+            if (Math.abs(dy) <= dead)
+                return
+            // Speed ramps with distance past the dead zone, so a small nudge
+            // creeps and a big one flies - the familiar browser feel.
+            var travel = dy > 0 ? (dy - dead) : (dy + dead)
+            var step = travel * 0.35
+            // scrollMessagesBy treats a positive delta as "content moves down"
+            // (wheel-up), so dragging below the anchor needs a negative delta.
+            chatViewRoot.scrollMessagesBy(-step)
+        }
+    }
+
+    // ---- Follow-the-conversation ----
+    // Whether the view is parked at (or within a bubble's height of) the
+    // newest message. Everything about auto-scrolling keys off this: a chat
+    // that yanks you to the bottom while you are reading history is worse
+    // than one that never scrolls at all.
+    readonly property int followThreshold: 90
+    readonly property bool messagesAtBottom: {
+        if (messagesListView.count === 0)
+            return true
+        return messagesListView.contentY >= messagesScrollMaxY() - followThreshold
+    }
+
+    // Messages that arrived while scrolled up, shown on the jump button so
+    // there is a reason to press it.
+    property int missedMessageCount: 0
+
+    onMessagesAtBottomChanged: if (messagesAtBottom) missedMessageCount = 0
+
+    // ListView contentY is relative to originY (often non-zero with header/
+    // footer). Clamping to [0, …] desyncs the scrollbar handle and makes
+    // dragging it feel broken.
+    function messagesScrollMinY() {
+        return messagesListView.originY
+    }
+    function messagesScrollMaxY() {
+        return messagesListView.originY
+                + Math.max(0, messagesListView.contentHeight - messagesListView.height)
+    }
+    function clampMessagesContentY() {
+        if (messagesListView.count <= 0)
+            return
+        var minY = messagesScrollMinY()
+        var maxY = messagesScrollMaxY()
+        if (messagesListView.contentY < minY)
+            messagesListView.contentY = minY
+        else if (messagesListView.contentY > maxY)
+            messagesListView.contentY = maxY
+    }
+    function scrollMessagesBy(deltaY) {
+        revealScrollAnim.stop()
+        if (!messagesScrollBar.pressed)
+            messagesListView.cancelFlick()
+        var y = messagesListView.contentY - deltaY
+        messagesListView.contentY = Math.max(messagesScrollMinY(),
+                                            Math.min(messagesScrollMaxY(), y))
+        clampMessagesContentY()
+    }
+    function stopMessagesScrollAnim() {
+        revealScrollAnim.stop()
+        // cancelFlick while the scrollbar is driving contentY fights the
+        // handle and makes it flash/jump.
+        if (!messagesScrollBar.pressed)
+            messagesListView.cancelFlick()
     }
 
     // A round video bubble is created by a Loader and only reaches its real
@@ -363,6 +471,7 @@ Item {
             roundVideoService.stopPreview()
             chatService.sendVideoNote(chatViewRoot.currentChatId, chatViewRoot.currentChatType,
                                        filePath, durationMs)
+            chatViewRoot.dismissReplyBar()
         }
 
         function onRecordingTooShort() {
@@ -412,6 +521,7 @@ Item {
 
         function onRecordingFinished(filePath, durationMs) {
             chatService.sendVoiceNote(chatViewRoot.currentChatId, chatViewRoot.currentChatType, filePath, durationMs)
+            chatViewRoot.dismissReplyBar()
         }
 
         function onRecordingFailed(error) {
@@ -446,7 +556,8 @@ Item {
                                      message.fileType, message.fileName, message.fileSize,
                                      message.thumbnailUrl || "",
                                      hasFile ? "" : message.content,
-                                     message.encrypted === true, message.keyVersion || 0)
+                                     message.encrypted === true, message.keyVersion || 0,
+                                     message.isForwarded === true, message.forwardedFromName || "", message.replyToId || "")
             // This chat is already open and visible, so the message that just
             // arrived counts as read immediately - onCurrentChatIdChanged only
             // fires when switching chats, not for new messages in one already open.
@@ -502,17 +613,21 @@ Item {
             var contentType = chatViewRoot.attachmentContentType(selectedFile)
             chatService.sendAttachment(chatViewRoot.currentChatId, chatViewRoot.currentChatType,
                                         selectedFile.toString(), contentType)
+            chatViewRoot.dismissReplyBar()
         }
     }
 
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
+        // Keep a growing composer from painting past the chat pane.
+        clip: true
 
         // Chat header
         GlassPanel {
             Layout.fillWidth: true
-            height: 60
+            Layout.preferredHeight: 60
+            Layout.maximumHeight: 60
             radius: 0
             sheen: false
             darkMode: chatViewRoot.darkMode
@@ -806,6 +921,18 @@ Item {
                 }
 
                 ToolButton {
+                    text: "Reply"
+                    enabled: chatViewRoot.selectedCount === 1
+                    onClicked: chatViewRoot.beginReply(chatViewRoot.selectedIds[0])
+                }
+
+                ToolButton {
+                    text: "Forward"
+                    enabled: chatViewRoot.selectedCount > 0
+                    onClicked: chatViewRoot.openForwardPicker(chatViewRoot.selectedIds.slice())
+                }
+
+                ToolButton {
                     text: "Delete for me"
                     enabled: chatViewRoot.selectedCount > 0
                     onClicked: chatViewRoot.deleteSelected(false)
@@ -850,10 +977,42 @@ Item {
         ListView {
             id: messagesListView
             anchors.fill: parent
+            anchors.rightMargin: 14
             clip: true
             spacing: 2
             model: messagesModel
-            ScrollBar.vertical: ScrollBar {}
+            pressDelay: 150
+            boundsBehavior: Flickable.StopAtBounds
+            flickableDirection: Flickable.VerticalFlick
+            // More allocated delegates → less wild contentHeight estimates
+            // while scrolling (variable-height chat bubbles).
+            cacheBuffer: Math.max(800, Math.floor(height * 3))
+
+            onMovementStarted: chatViewRoot.stopMessagesScrollAnim()
+            onDraggingChanged: if (dragging) chatViewRoot.stopMessagesScrollAnim()
+            onMovementEnded: chatViewRoot.clampMessagesContentY()
+            onContentHeightChanged: {
+                if (!messagesScrollBar.pressed && !moving && !flicking)
+                    chatViewRoot.clampMessagesContentY()
+            }
+
+            WheelHandler {
+                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                enabled: !messagesScrollBar.pressed
+                onWheel: function(event) {
+                    var delta = event.pixelDelta.y !== 0
+                                ? event.pixelDelta.y
+                                : event.angleDelta.y / 2
+                    chatViewRoot.scrollMessagesBy(delta)
+                    event.accepted = true
+                }
+            }
+
+            // Middle-click autoscroll is handled by the overlay below rather
+            // than a DragHandler here. A DragHandler only pans while the wheel
+            // is held down and dragged, which is not what middle-click
+            // scrolling means on Windows: one click arms it, then the pointer's
+            // distance from the anchor sets a continuous speed, hands-free.
 
             header: Item {
                 width: messagesListView.width
@@ -912,11 +1071,22 @@ Item {
                         }
                         messageMenu.targetMessageId = model.messageId
                         messageMenu.targetIsMine = model.isMine
+                        messageMenu.targetMessageText = bubbleItem.messageText || ""
                         messageMenu.popup()
                     }
                     onVideoPlaybackStarted: {
                         chatViewRoot.smoothRevealIndex(index)
                         revealAfterGrow.restart()
+                    }
+                    onTextExpandToggled: function(expanded) {
+                        // Persist on the model row. Dragging the scrollbar
+                        // calls positionViewAtIndex, which destroys and
+                        // rebuilds delegates - state held only in the delegate
+                        // went with them, so an expanded message silently
+                        // collapsed mid-drag.
+                        messagesModel.setProperty(index, "textExpanded", expanded)
+                        if (expanded)
+                            chatViewRoot.smoothRevealIndex(index)
                     }
                     Timer {
                         id: revealAfterGrow
@@ -959,6 +1129,25 @@ Item {
                     fileName: model.fileName
                     fileSize: model.fileSize
                     chatId: chatViewRoot.currentChatId
+                    isForwarded: model.isForwarded === true
+                    forwardedFromName: model.forwardedFromName || ""
+                    replyToId: model.replyToId || ""
+                    replySenderName: {
+                        var r = chatViewRoot.resolveReplyFields(model.replyToId || "")
+                        return r.name
+                    }
+                    replyPreview: {
+                        var r = chatViewRoot.resolveReplyFields(model.replyToId || "")
+                        return r.preview
+                    }
+                    replyAvailable: {
+                        var r = chatViewRoot.resolveReplyFields(model.replyToId || "")
+                        return r.available
+                    }
+                    onReplyQuoteClicked: chatViewRoot.jumpToMessage(model.replyToId || "")
+                    // Restored from the model, so a recycled delegate comes
+                    // back expanded - see onTextExpandToggled above.
+                    textExpanded: model.textExpanded === true
                 }
             }
 
@@ -992,25 +1181,358 @@ Item {
                 }
             }
         }
+
+            // Detached from ListView's ScrollBar.vertical on purpose: the
+            // attached bar binds size/position to contentHeight, and chat
+            // bubbles have variable heights so that estimate jumps every
+            // frame while dragging → handle flashes. Drive by message index
+            // instead so the handle never lands in estimated empty space.
+            ScrollBar {
+                id: messagesScrollBar
+                anchors.top: parent.top
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                width: 14
+                padding: 2
+                z: 20
+                policy: ScrollBar.AlwaysOn
+                interactive: true
+                minimumSize: 0.08
+
+                property bool updatingFromList: false
+
+                function visibleFraction() {
+                    var c = Math.max(1, messagesListView.count)
+                    var approxRow = 72
+                    var visible = Math.max(1, messagesListView.height / approxRow)
+                    return Math.min(1, Math.max(minimumSize, visible / c))
+                }
+
+                function firstVisibleIndex() {
+                    var lv = messagesListView
+                    if (lv.count <= 0)
+                        return 0
+                    var idx = lv.indexAt(Math.max(8, lv.width / 2), lv.contentY + 8)
+                    if (idx >= 0)
+                        return idx
+                    idx = lv.indexAt(Math.max(8, lv.width / 2), lv.contentY + Math.min(80, lv.height / 3))
+                    if (idx >= 0)
+                        return idx
+                    var maxY = Math.max(0, lv.contentHeight - lv.height)
+                    if (maxY <= 0)
+                        return 0
+                    var t = (lv.contentY - lv.originY) / maxY
+                    return Math.round(Math.min(1, Math.max(0, t)) * (lv.count - 1))
+                }
+
+                function syncFromList() {
+                    if (pressed)
+                        return
+                    var c = messagesListView.count
+                    updatingFromList = true
+                    size = visibleFraction()
+                    if (c <= 1) {
+                        position = 0
+                    } else {
+                        var scrollable = Math.max(0.0001, 1 - size)
+                        var atEnd = messagesListView.contentY
+                                    >= messagesScrollMaxY() - 2
+                        position = atEnd
+                                   ? scrollable
+                                   : (firstVisibleIndex() / (c - 1)) * scrollable
+                    }
+                    updatingFromList = false
+                }
+
+                contentItem: Rectangle {
+                    implicitWidth: 8
+                    radius: 4
+                    color: messagesScrollBar.pressed
+                           ? chatViewRoot.accentColor
+                           : Qt.rgba(chatViewRoot.textSecondary.r,
+                                     chatViewRoot.textSecondary.g,
+                                     chatViewRoot.textSecondary.b, 0.55)
+                }
+                background: Rectangle {
+                    implicitWidth: 14
+                    color: Qt.rgba(1, 1, 1, chatViewRoot.darkMode ? 0.04 : 0.06)
+                }
+
+                onPressedChanged: {
+                    if (pressed) {
+                        updatingFromList = true
+                        size = visibleFraction()
+                        updatingFromList = false
+                        chatViewRoot.stopMessagesScrollAnim()
+                    } else {
+                        chatViewRoot.clampMessagesContentY()
+                        syncFromList()
+                    }
+                }
+
+                onPositionChanged: {
+                    if (updatingFromList || !pressed)
+                        return
+                    var c = messagesListView.count
+                    if (c <= 0)
+                        return
+                    var scrollable = Math.max(0.0001, 1 - size)
+                    var t = Math.min(1, Math.max(0, position / scrollable))
+                    var idx = Math.round(t * (c - 1))
+                    if (t >= 0.995)
+                        messagesListView.positionViewAtEnd()
+                    else if (t <= 0.005)
+                        messagesListView.positionViewAtBeginning()
+                    else
+                        messagesListView.positionViewAtIndex(idx, ListView.Beginning)
+                }
+
+                Component.onCompleted: syncFromList()
+            }
+
+            Connections {
+                target: messagesListView
+                function onContentYChanged() { messagesScrollBar.syncFromList() }
+                function onContentHeightChanged() { messagesScrollBar.syncFromList() }
+                function onHeightChanged() { messagesScrollBar.syncFromList() }
+                function onOriginYChanged() { messagesScrollBar.syncFromList() }
+                function onCountChanged() { messagesScrollBar.syncFromList() }
+            }
+
+            // Arms autoscroll. MiddleButton only, so left clicks, selection and
+            // every control inside the bubbles still receive their events
+            // normally - this never sits in front of them.
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.MiddleButton
+                onPressed: function(mouse) {
+                    if (chatViewRoot.autoScrollActive)
+                        chatViewRoot.stopAutoScroll()
+                    else
+                        chatViewRoot.startAutoScroll(mouse.x, mouse.y)
+                }
+            }
+
+            // While armed this covers the list to track the pointer and to
+            // swallow the click that cancels. It exists only in that state, so
+            // it cannot interfere with anything the rest of the time.
+            MouseArea {
+                id: autoScrollCatcher
+                anchors.fill: parent
+                enabled: chatViewRoot.autoScrollActive
+                visible: enabled
+                hoverEnabled: true
+                acceptedButtons: Qt.AllButtons
+                cursorShape: Qt.SizeVerCursor
+                z: 50
+                onPositionChanged: function(mouse) {
+                    chatViewRoot.autoScrollCursorY = mouse.y
+                }
+                onPressed: chatViewRoot.stopAutoScroll()
+                onWheel: chatViewRoot.stopAutoScroll()
+                Keys.onEscapePressed: chatViewRoot.stopAutoScroll()
+                onEnabledChanged: if (enabled) forceActiveFocus()
+            }
+
+            // The anchor marker: origin of the gesture, and a reminder that a
+            // mode is active.
+            Rectangle {
+                visible: chatViewRoot.autoScrollActive
+                z: 51
+                width: 28
+                height: 28
+                radius: 14
+                x: chatViewRoot.autoScrollAnchorX - width / 2
+                y: chatViewRoot.autoScrollAnchorY - height / 2
+                color: chatViewRoot.darkMode ? Qt.rgba(0, 0, 0, 0.55)
+                                             : Qt.rgba(1, 1, 1, 0.85)
+                border.width: 1
+                border.color: chatViewRoot.accentColor
+
+                Canvas {
+                    anchors.fill: parent
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        ctx.strokeStyle = chatViewRoot.accentColor
+                        ctx.lineWidth = 1.6
+                        ctx.lineCap = "round"
+                        ctx.lineJoin = "round"
+                        var cx = width / 2
+                        // Up and down chevrons around a centre dot.
+                        ctx.beginPath()
+                        ctx.moveTo(cx - 4, 11); ctx.lineTo(cx, 7); ctx.lineTo(cx + 4, 11)
+                        ctx.moveTo(cx - 4, 17); ctx.lineTo(cx, 21); ctx.lineTo(cx + 4, 17)
+                        ctx.stroke()
+                        ctx.fillStyle = chatViewRoot.accentColor
+                        ctx.beginPath()
+                        ctx.arc(cx, 14, 1.4, 0, Math.PI * 2)
+                        ctx.fill()
+                    }
+                }
+            }
+
+            // Jump to the newest message. Only shown while scrolled up, so it
+            // never covers the conversation during normal reading - and it is
+            // the counterpart to not auto-scrolling in that state: the view
+            // stays put, and this says how much has been missed.
+            Rectangle {
+                id: jumpToBottom
+                width: 40
+                height: 40
+                radius: 20
+                anchors.right: parent.right
+                anchors.rightMargin: 22
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 18
+                color: jumpMouse.containsPress
+                       ? Qt.darker(chatViewRoot.myMessageBg, 1.15)
+                       : (jumpMouse.containsMouse
+                          ? Qt.lighter(chatViewRoot.myMessageBg, 1.08)
+                          : chatViewRoot.myMessageBg)
+
+                visible: opacity > 0.01
+                opacity: chatViewRoot.messagesAtBottom ? 0 : 1
+                Behavior on opacity { NumberAnimation { duration: 140 } }
+                // Slides up as it appears rather than popping in.
+                transform: Translate {
+                    y: chatViewRoot.messagesAtBottom ? 8 : 0
+                    Behavior on y { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+                }
+
+                Canvas {
+                    anchors.centerIn: parent
+                    width: 18
+                    height: 18
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        ctx.strokeStyle = "#FFFFFF"
+                        ctx.lineWidth = 2
+                        ctx.lineCap = "round"
+                        ctx.lineJoin = "round"
+                        ctx.beginPath()
+                        ctx.moveTo(9, 3); ctx.lineTo(9, 14)
+                        ctx.moveTo(4, 9.5); ctx.lineTo(9, 14.5); ctx.lineTo(14, 9.5)
+                        ctx.stroke()
+                    }
+                }
+
+                // Unread-since-scroll badge.
+                Rectangle {
+                    visible: chatViewRoot.missedMessageCount > 0
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottom: parent.top
+                    anchors.bottomMargin: -6
+                    width: Math.max(18, badgeText.implicitWidth + 10)
+                    height: 18
+                    radius: 9
+                    color: "#E74C3C"
+                    Text {
+                        id: badgeText
+                        anchors.centerIn: parent
+                        text: chatViewRoot.missedMessageCount > 99
+                              ? "99+" : chatViewRoot.missedMessageCount
+                        color: "#FFFFFF"
+                        font.pixelSize: 10
+                        font.bold: true
+                    }
+                }
+
+                MouseArea {
+                    id: jumpMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        chatViewRoot.missedMessageCount = 0
+                        chatViewRoot.smoothScrollToEnd()
+                    }
+                }
+            }
         }
 
-        // Message input area
+        // Message input area — grows upward into the message list (layout-
+        // managed height), then scrolls inside once it hits ~40% of the chat.
         GlassPanel {
+            id: composerBar
             Layout.fillWidth: true
-            height: 68
+            // Cap against the chat pane so a huge paste cannot push this bar
+            // off the bottom of the window. The messages ListView (fillHeight)
+            // shrinks to make room as we grow.
+            readonly property int barMaxHeight: Math.max(68, Math.floor(chatViewRoot.height * 0.4))
+            readonly property int inputMinHeight: 42
+            readonly property int inputMaxHeight: Math.max(inputMinHeight, barMaxHeight - 24)
+            readonly property int inputHeight: {
+                if (voiceService.isRecording)
+                    return inputMinHeight
+                return Math.min(inputMaxHeight,
+                                Math.max(inputMinHeight, messageInput.contentHeight + 22))
+            }
+            // Must be Layout.* — a bare `height:` grows the item outside its
+            // layout cell and spills below the window.
+            Layout.preferredHeight: Math.min(barMaxHeight, Math.max(68, inputHeight + 24)
+                                             + (chatViewRoot.pendingReplyId.length > 0 ? 48 : 0))
+            Layout.maximumHeight: barMaxHeight
+            Layout.minimumHeight: 68
             radius: 0
             sheen: false
             darkMode: chatViewRoot.darkMode
+            clip: true
+
+            Rectangle {
+                id: pendingReplyBar
+                visible: chatViewRoot.pendingReplyId.length > 0
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                height: visible ? 48 : 0
+                color: Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g,
+                                chatViewRoot.accentColor.b, chatViewRoot.darkMode ? 0.18 : 0.12)
+                z: 2
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 12
+                    anchors.rightMargin: 4
+                    spacing: 8
+                    Column {
+                        Layout.fillWidth: true
+                        spacing: 2
+                        Text {
+                            width: parent.width
+                            text: chatViewRoot.pendingReplyName
+                            color: chatViewRoot.accentColor
+                            font.pixelSize: 12
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+                        Text {
+                            width: parent.width
+                            text: chatViewRoot.pendingReplyPreview
+                            color: chatViewRoot.textSecondary
+                            font.pixelSize: 12
+                            elide: Text.ElideRight
+                        }
+                    }
+                    ToolButton {
+                        text: "✕"
+                        onClicked: chatViewRoot.clearReply()
+                    }
+                }
+            }
 
             RowLayout {
+                id: inputRow
                 anchors.fill: parent
                 anchors.margins: 12
+                anchors.topMargin: pendingReplyBar.visible ? 52 : 12
                 spacing: 10
 
                 // Attachment button
                 Rectangle {
                     Layout.preferredWidth: 40
                     Layout.preferredHeight: 40
+                    Layout.alignment: Qt.AlignBottom
                     radius: 10
                     visible: !voiceService.isRecording
                     color: attMouse.containsPress ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.2) : (attMouse.containsMouse ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.1) : "transparent")
@@ -1071,9 +1593,12 @@ Item {
                 // Shift+Enter inserts a newline. TextArea so multiline works.
                 Rectangle {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: Math.min(120, Math.max(42, messageInput.contentHeight + 22))
+                    Layout.preferredHeight: composerBar.inputHeight
+                    Layout.maximumHeight: composerBar.inputMaxHeight
+                    Layout.alignment: Qt.AlignBottom
                     radius: 21
                     visible: !voiceService.isRecording
+                    clip: true
                     // Was a "rgba(r,g,b,a)" string literal - that syntax silently
                     // drops the alpha channel in this Qt build (always resolves
                     // fully opaque), which is why this rendered solid black in
@@ -1083,29 +1608,44 @@ Item {
                     border.width: 1.5
                     Behavior on border.color { ColorAnimation { duration: 100 } }
 
-                    TextArea {
-                        id: messageInput
+                    // A bare TextArea does not scroll its own overflow - past
+                    // its bounds the text is simply clipped by the Rectangle
+                    // above (clip: true), not shown via a scrollbar. That is
+                    // what made a long paste "disappear": it was still there,
+                    // just clipped off past inputMaxHeight. ScrollView gives it
+                    // an actual scrolling viewport once content exceeds the cap.
+                    ScrollView {
+                        id: inputScroll
                         anchors.fill: parent
-                        leftPadding: 16
-                        rightPadding: 16
-                        topPadding: 11
-                        bottomPadding: 11
-                        background: Item {}
-                        placeholderText: "Type a message…"
-                        placeholderTextColor: chatViewRoot.textSecondary
-                        font.pixelSize: 14
-                        color: chatViewRoot.textColor
-                        selectByMouse: true
-                        wrapMode: TextArea.Wrap
-                        Keys.priority: Keys.BeforeItem
-                        Keys.onPressed: function(event) {
-                            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                                if (event.modifiers & Qt.ShiftModifier) {
-                                    // Let TextArea insert the newline.
-                                    return
+                        clip: true
+                        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                        ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+                        TextArea {
+                            id: messageInput
+                            // Required inside ScrollView so wrap uses the
+                            // viewport width instead of growing forever sideways.
+                            width: inputScroll.availableWidth
+                            leftPadding: 16
+                            rightPadding: 16
+                            topPadding: 11
+                            bottomPadding: 11
+                            background: Item {}
+                            placeholderText: "Type a message…"
+                            placeholderTextColor: chatViewRoot.textSecondary
+                            font.pixelSize: 14
+                            color: chatViewRoot.textColor
+                            selectByMouse: true
+                            wrapMode: TextArea.Wrap
+                            Keys.priority: Keys.BeforeItem
+                            Keys.onPressed: function(event) {
+                                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                                    if (event.modifiers & Qt.ShiftModifier) {
+                                        return
+                                    }
+                                    event.accepted = true
+                                    sendButton.trigger()
                                 }
-                                event.accepted = true
-                                sendButton.trigger()
                             }
                         }
                     }
@@ -1116,6 +1656,7 @@ Item {
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 42
+                    Layout.alignment: Qt.AlignBottom
                     radius: 21
                     visible: voiceService.isRecording
                     color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
@@ -1160,6 +1701,7 @@ Item {
                 Rectangle {
                     Layout.preferredWidth: 40
                     Layout.preferredHeight: 40
+                    Layout.alignment: Qt.AlignBottom
                     radius: 10
                     visible: voiceService.isRecording
                     color: cancelRecMouse.containsMouse ? Qt.rgba(231/255, 76/255, 60/255, 0.15) : "transparent"
@@ -1199,6 +1741,7 @@ Item {
                     id: sendButton
                     Layout.preferredWidth: 42
                     Layout.preferredHeight: 42
+                    Layout.alignment: Qt.AlignBottom
                     radius: 21
                     property bool canSend: messageInput.text.trim().length > 0
                     color: voiceService.isRecording ? "#E74C3C"
@@ -1212,9 +1755,13 @@ Item {
                     function trigger() {
                         if (!canSend) return
                         var text = messageInput.text.trim()
-                        chatViewRoot.addMessage(authService.currentUserId, "Me", text, chatViewRoot.formatTime(new Date().toISOString()), true, false)
+                        var replyId = chatViewRoot.pendingReplyId
+                        chatViewRoot.addMessage(authService.currentUserId, "Me", text, chatViewRoot.formatTime(new Date().toISOString()), true, false,
+                                                 "", 0, false, "", "", "", 0, "",
+                                                 "", false, 0, false, "", replyId)
                         chatService.sendMessage(chatViewRoot.currentChatId, text, chatViewRoot.currentChatType)
                         chatViewRoot.sendMessage(text)
+                        chatViewRoot.clearReply()
                         messageInput.text = ""
                     }
 
@@ -1397,11 +1944,81 @@ Item {
         }
     }
 
+
+    function replyPreviewForMessage(m) {
+        if (!m) return ""
+        var text = (m.messageText || "").toString().replace(/\n/g, " ").trim()
+        if (text.length > 0) return text.substring(0, 120)
+        var ct = (m.contentType || "").toString()
+        if (ct === "audio") return "Voice message"
+        if (ct === "video_note") return "Video message"
+        if (ct === "image") return "Photo"
+        if (ct === "file") return (m.fileName || "File")
+        return "Message"
+    }
+
+    function beginReply(messageId) {
+        for (var i = 0; i < messagesModel.count; i++) {
+            var row = messagesModel.get(i)
+            if (row.messageId === messageId && row.messageKind !== "system") {
+                pendingReplyId = messageId
+                pendingReplyName = row.isMine ? "You" : (row.senderName || "Message")
+                pendingReplyPreview = replyPreviewForMessage(row)
+                chatService.pendingReplyToId = messageId
+                clearSelection()
+                return
+            }
+        }
+    }
+
+    // Hide the composer quote without clearing ChatService.pendingReplyToId —
+    // media uploads take the id later when POST /messages is built.
+    function dismissReplyBar() {
+        pendingReplyId = ""
+        pendingReplyName = ""
+        pendingReplyPreview = ""
+    }
+
+    function clearReply() {
+        dismissReplyBar()
+        chatService.pendingReplyToId = ""
+    }
+
+    function jumpToMessage(messageId) {
+        if (!messageId || messageId.length === 0) return
+        for (var i = 0; i < messagesModel.count; i++) {
+            if (messagesModel.get(i).messageId === messageId) {
+                smoothRevealIndex(i)
+                return
+            }
+        }
+    }
+
+    function resolveReplyFields(replyToId) {
+        var out = { available: false, name: "", preview: "" }
+        if (!replyToId || replyToId.length === 0) return out
+        for (var i = 0; i < messagesModel.count; i++) {
+            var row = messagesModel.get(i)
+            if (row.messageId === replyToId) {
+                out.available = true
+                out.name = row.isMine ? "You" : (row.senderName || "Message")
+                out.preview = replyPreviewForMessage(row)
+                return out
+            }
+        }
+        return out
+    }
+
     function addMessage(senderId, senderName, text, time, isMine, isRead, fileUrl, fileDurationMs, fileEncrypted,
                          messageId, contentType, fileName, fileSize, thumbnailUrl,
-                         rawContent, rawEncrypted, rawKeyVersion) {
+                         rawContent, rawEncrypted, rawKeyVersion, isForwarded, forwardedFromName, replyToId) {
         const prev = messagesModel.count > 0 ? messagesModel.get(messagesModel.count - 1) : null
         const showSender = !isMine && (!prev || prev.senderId !== senderId)
+        // Sampled BEFORE the append, because appending changes contentHeight
+        // and so changes the answer. Skipped entirely while a history fetch is
+        // populating the list - that run ends in scrollToUnreadOrEnd, which
+        // owns the final position.
+        const wasAtBottom = !chatViewRoot.isLoadingMore && chatViewRoot.messagesAtBottom
         messagesModel.append({
             messageKind: "message",
             messageId: messageId || "",
@@ -1425,12 +2042,38 @@ Item {
             contentType: contentType || "",
             thumbnailUrl: thumbnailUrl || "",
             fileName: fileName || "",
-            fileSize: fileSize || 0
+            fileSize: fileSize || 0,
+            isForwarded: isForwarded === true,
+            forwardedFromName: forwardedFromName || "",
+            replyToId: replyToId || "",
+            // Survives delegate recycling - see the delegate binding.
+            textExpanded: false
         })
+
+        // Follow the conversation only when already at the bottom. Previously
+        // nothing scrolled at all on an incoming message, so a live reply
+        // landed below the fold and simply went unseen.
+        if (!chatViewRoot.isLoadingMore) {
+            if (wasAtBottom) {
+                // Deferred a frame: a bubble's real height (especially a round
+                // video, built by a Loader) is not known in this tick, so
+                // scrolling now would stop short of the true bottom.
+                followNewMessage.restart()
+            } else {
+                chatViewRoot.missedMessageCount++
+            }
+        }
+
         // Keep the sidebar snippet current while this chat is open - own
         // sends never go through onMessageReceived (they're filtered as
         // echoes), and incoming ones used to be skipped for the active chat.
         pushChatListPreview()
+    }
+
+    Timer {
+        id: followNewMessage
+        interval: 60
+        onTriggered: chatViewRoot.smoothScrollToEnd()
     }
 
     // A small non-bubble line inline in the thread (e.g. a security code
@@ -1440,6 +2083,9 @@ Item {
     // mutated in place, because QML only re-evaluates bindings on assignment -
     // push() alone would leave every "is this row selected" binding stale.
     property bool selectionMode: false
+    property string pendingReplyId: ""
+    property string pendingReplyName: ""
+    property string pendingReplyPreview: ""
     property var selectedIds: []
 
     readonly property int selectedCount: selectedIds.length
@@ -1571,7 +2217,14 @@ Item {
             contentType: "",
             thumbnailUrl: "",
             fileName: "",
-            fileSize: 0
+            fileSize: 0,
+            isForwarded: false,
+            replyToId: "",
+            forwardedFromName: "",
+            // Unused by a system notice, but ListModel roles are per-row:
+            // omitting it here would make model.textExpanded undefined on
+            // these rows and warn whenever the delegate reads it.
+            textExpanded: false
         })
     }
 
@@ -1601,16 +2254,233 @@ Item {
         return Qt.formatTime(d, "h:mm AP")
     }
 
+    // TextEdit.copy() is the QML-side clipboard API (no C++ helper needed).
+    function copyTextToClipboard(text) {
+        if (!text || text.length === 0) return
+        clipboardHelper.text = text
+        clipboardHelper.selectAll()
+        clipboardHelper.copy()
+        clipboardHelper.deselect()
+    }
+
+    TextEdit {
+        id: clipboardHelper
+        visible: false
+        width: 1
+        height: 1
+    }
+
     // One menu shared by every row - instantiating a Menu per message would
     // build hundreds of them for a long chat.
     // Styled to match ChatList's context menu - a GlassPanel background and
     // hand-built MenuItem content. The stock QuickControls2 Menu paints an
     // opaque grey system popup that ignores the theme entirely, which looks
     // pasted on over the glass surfaces everything else uses.
+    property var pendingForwardIds: []
+
+    function messageRowById(messageId) {
+        for (var i = 0; i < messagesModel.count; i++) {
+            var row = messagesModel.get(i)
+            if (row.messageId === messageId) return row
+        }
+        return null
+    }
+
+    function buildForwardItems(ids) {
+        var items = []
+        for (var i = 0; i < ids.length; i++) {
+            var row = chatViewRoot.messageRowById(ids[i])
+            if (!row || row.messageKind === "system") continue
+            var fromName = row.forwardedFromName && row.forwardedFromName.length > 0
+                           ? row.forwardedFromName
+                           : (row.isMine ? "Me" : (row.senderName || ""))
+            items.push({
+                messageId: row.messageId,
+                contentType: row.contentType || "",
+                text: row.messageText || "",
+                fileUrl: row.voiceUrl || "",
+                encrypted: row.voiceEncrypted === true || row.rawEncrypted === true,
+                senderId: row.senderId || "",
+                keyVersion: row.rawKeyVersion || 0,
+                fileName: row.fileName || "",
+                fileSize: row.fileSize || 0,
+                durationMs: row.voiceDurationMs || 0,
+                thumbnailUrl: row.thumbnailUrl || "",
+                forwardedFromName: fromName
+            })
+        }
+        return items
+    }
+
+    function openForwardPicker(ids) {
+        if (!ids || ids.length === 0) return
+        pendingForwardIds = ids.slice()
+        forwardChatModel.clear()
+        // Open BEFORE fetching. fetchChats() emits the cached list
+        // synchronously, and the handler below is gated on the dialog being
+        // visible - fetching first meant that emission arrived while the
+        // dialog was still hidden and was dropped, leaving an empty picker.
+        // It also covers the case where a fetch is already in flight and
+        // fetchChats() returns early without emitting at all: that request
+        // will emit on completion, by which point this is open.
+        forwardPicker.open()
+        chatService.fetchChats()
+    }
+
+    function forwardToChat(targetChatId, targetChatType) {
+        var items = chatViewRoot.buildForwardItems(pendingForwardIds)
+        forwardPicker.close()
+        chatViewRoot.clearSelection()
+        pendingForwardIds = []
+        if (items.length === 0) return
+        chatService.forwardMessages(chatViewRoot.currentChatId, targetChatId,
+                                     targetChatType || "direct", items)
+    }
+
+    ListModel {
+        id: forwardChatModel
+    }
+
+    Connections {
+        target: chatService
+        enabled: forwardPicker.visible
+        function onChatsFetched(chats) {
+            forwardChatModel.clear()
+            for (var i = 0; i < chats.length; i++) {
+                var c = chats[i]
+                if (!c.id || c.id === chatViewRoot.currentChatId) continue
+                // For a direct chat always prefer the other person's name.
+                // chat.name is the generic "Direct Chat" placeholder the
+                // backend stamps in at creation (handlers/message.go), so it
+                // is never empty and cannot be used as an "unset" signal -
+                // testing it first is why every row read "Direct Chat".
+                // ChatList.qml resolves it the same way.
+                var type = c.type || "direct"
+                var name = c.name || ""
+                if (type === "direct" && c.other_user) {
+                    name = c.other_user.display_name || c.other_user.username || name
+                }
+                if (!name || name.length === 0) name = (type === "group") ? "Group" : "Chat"
+                forwardChatModel.append({
+                    chatId: c.id,
+                    chatName: name,
+                    chatType: type,
+                    // A group's picture is its own; a direct chat's is the
+                    // other person's - same rule as the sidebar.
+                    avatarUrl: (type === "group")
+                               ? (c.avatar_url || "")
+                               : (c.other_user ? (c.other_user.avatar_url || "") : "")
+                })
+            }
+        }
+    }
+
+    Dialog {
+        id: forwardPicker
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(360, chatViewRoot.width - 40)
+        height: Math.min(420, chatViewRoot.height - 40)
+        padding: 16
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        title: ""
+
+        background: GlassPanel {
+            darkMode: chatViewRoot.darkMode
+            radius: 12
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 10
+
+            Text {
+                Layout.fillWidth: true
+                text: "Forward to…"
+                font.pixelSize: 16
+                font.bold: true
+                color: chatViewRoot.textColor
+            }
+
+            Text {
+                Layout.fillWidth: true
+                visible: forwardChatModel.count === 0
+                text: "Loading chats…"
+                font.pixelSize: 13
+                color: chatViewRoot.textSecondary
+            }
+
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: forwardChatModel
+                spacing: 2
+
+                delegate: Rectangle {
+                    width: ListView.view.width
+                    height: 48
+                    radius: 8
+                    color: fwdMouse.containsMouse
+                           ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g,
+                                     chatViewRoot.accentColor.b, 0.12)
+                           : "transparent"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 8
+                        anchors.rightMargin: 8
+                        spacing: 10
+
+                        Avatar {
+                            Layout.preferredWidth: 34
+                            Layout.preferredHeight: 34
+                            name: model.chatName
+                            avatarUrl: model.avatarUrl
+                            size: 34
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: model.chatName
+                            font.pixelSize: 14
+                            color: chatViewRoot.textColor
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    MouseArea {
+                        id: fwdMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: chatViewRoot.forwardToChat(model.chatId, model.chatType)
+                    }
+                }
+            }
+
+            Text {
+                Layout.alignment: Qt.AlignRight
+                text: "Cancel"
+                font.pixelSize: 13
+                color: chatViewRoot.textSecondary
+                MouseArea {
+                    anchors.fill: parent
+                    anchors.margins: -6
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        forwardPicker.close()
+                        chatViewRoot.pendingForwardIds = []
+                    }
+                }
+            }
+        }
+    }
+
     Menu {
         id: messageMenu
         property string targetMessageId: ""
         property bool targetIsMine: false
+        property string targetMessageText: ""
 
         padding: 6
 
@@ -1622,6 +2492,34 @@ Item {
         }
 
         MenuItem {
+            text: "Copy"
+            enabled: messageMenu.targetMessageText.length > 0
+            onTriggered: chatViewRoot.copyTextToClipboard(messageMenu.targetMessageText)
+            contentItem: Text {
+                text: parent.text
+                font.pixelSize: 13
+                color: parent.enabled ? chatViewRoot.textColor : chatViewRoot.textSecondary
+                opacity: parent.enabled ? 1.0 : 0.5
+                verticalAlignment: Text.AlignVCenter
+                leftPadding: 10
+            }
+            background: Rectangle {
+                implicitHeight: 34
+                radius: 6
+                color: (parent.hovered && parent.enabled)
+                       ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g,
+                                 chatViewRoot.accentColor.b, 0.14)
+                       : "transparent"
+            }
+        }
+
+        
+        MenuItem {
+            text: "Reply"
+            enabled: messageMenu.targetMessageId.length > 0
+            onTriggered: chatViewRoot.beginReply(messageMenu.targetMessageId)
+        }
+MenuItem {
             text: "Select"
             onTriggered: chatViewRoot.enterSelection(messageMenu.targetMessageId)
             contentItem: Text {
@@ -1635,6 +2533,28 @@ Item {
                 implicitHeight: 34
                 radius: 6
                 color: parent.hovered
+                       ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g,
+                                 chatViewRoot.accentColor.b, 0.14)
+                       : "transparent"
+            }
+        }
+
+        MenuItem {
+            text: "Forward"
+            enabled: messageMenu.targetMessageId.length > 0
+            onTriggered: chatViewRoot.openForwardPicker([messageMenu.targetMessageId])
+            contentItem: Text {
+                text: parent.text
+                font.pixelSize: 13
+                color: parent.enabled ? chatViewRoot.textColor : chatViewRoot.textSecondary
+                opacity: parent.enabled ? 1.0 : 0.5
+                verticalAlignment: Text.AlignVCenter
+                leftPadding: 10
+            }
+            background: Rectangle {
+                implicitHeight: 34
+                radius: 6
+                color: (parent.hovered && parent.enabled)
                        ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g,
                                  chatViewRoot.accentColor.b, 0.14)
                        : "transparent"

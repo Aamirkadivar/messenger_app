@@ -498,7 +498,9 @@ class ChatRepository(
         token: String,
         chatId: String,
         chatType: String,
-        plaintext: String
+        plaintext: String,
+        forward: ForwardMeta = ForwardMeta(),
+        replyToId: String = ""
     ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
         try {
             chatTypeMap[chatId] = chatType
@@ -517,7 +519,11 @@ class ChatRepository(
                     chatType = chatType,
                     content = outContent,
                     encrypted = encrypted,
-                    keyVersion = keyVersion
+                    keyVersion = keyVersion,
+                    replyToId = replyToId,
+                    isForwarded = forward.isForwarded,
+                    forwardedFromName = forward.fromName,
+                    forwardedFromMessageId = forward.fromMessageId
                 )
             )
             if (response.isSuccessful && response.body() != null) {
@@ -539,7 +545,11 @@ class ChatRepository(
                         timestamp = parseTimestamp(sent.createdAt),
                         isEncrypted = sent.encrypted,
                         readAt = null,
-                        keyVersion = keyVersion
+                        keyVersion = keyVersion,
+                        replyTo = replyToId.ifBlank { null },
+                        isForwarded = forward.isForwarded,
+                        forwardedFromName = forward.fromName,
+                        forwardedFromMessageId = forward.fromMessageId
                     )
                 )
                 Result.success(sent)
@@ -564,7 +574,9 @@ class ChatRepository(
         fileUrl: String,
         durationMs: Long,
         encrypted: Boolean,
-        keyVersion: Int = 0
+        keyVersion: Int = 0,
+        forward: ForwardMeta = ForwardMeta(),
+        replyToId: String = ""
     ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.sendMessage(
@@ -581,7 +593,11 @@ class ChatRepository(
                     fileUrl = fileUrl,
                     fileType = VOICE_CONTENT_TYPE,
                     durationMs = durationMs,
-                    keyVersion = keyVersion
+                    keyVersion = keyVersion,
+                    replyToId = replyToId,
+                    isForwarded = forward.isForwarded,
+                    forwardedFromName = forward.fromName,
+                    forwardedFromMessageId = forward.fromMessageId
                 )
             )
             if (response.isSuccessful && response.body() != null) {
@@ -609,7 +625,9 @@ class ChatRepository(
         thumbnailUrl: String,
         durationMs: Long,
         encrypted: Boolean,
-        keyVersion: Int = 0
+        keyVersion: Int = 0,
+        forward: ForwardMeta = ForwardMeta(),
+        replyToId: String = ""
     ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.sendMessage(
@@ -627,7 +645,11 @@ class ChatRepository(
                     fileType = VIDEO_NOTE_CONTENT_TYPE,
                     durationMs = durationMs,
                     thumbnailUrl = thumbnailUrl,
-                    keyVersion = keyVersion
+                    keyVersion = keyVersion,
+                    replyToId = replyToId,
+                    isForwarded = forward.isForwarded,
+                    forwardedFromName = forward.fromName,
+                    forwardedFromMessageId = forward.fromMessageId
                 )
             )
             if (response.isSuccessful && response.body() != null) {
@@ -657,7 +679,9 @@ class ChatRepository(
         fileSize: Long,
         contentType: String,
         encrypted: Boolean,
-        keyVersion: Int = 0
+        keyVersion: Int = 0,
+        forward: ForwardMeta = ForwardMeta(),
+        replyToId: String = ""
     ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.sendMessage(
@@ -672,7 +696,11 @@ class ChatRepository(
                     fileType = contentType,
                     fileName = fileName,
                     fileSize = fileSize,
-                    keyVersion = keyVersion
+                    keyVersion = keyVersion,
+                    replyToId = replyToId,
+                    isForwarded = forward.isForwarded,
+                    forwardedFromName = forward.fromName,
+                    forwardedFromMessageId = forward.fromMessageId
                 )
             )
             if (response.isSuccessful && response.body() != null) {
@@ -730,6 +758,10 @@ class ChatRepository(
                 fileSize = e.fileSize,
                 durationMs = e.durationMs,
                 keyVersion = e.keyVersion,
+                replyToId = e.replyTo,
+                isForwarded = e.isForwarded,
+                forwardedFromName = e.forwardedFromName,
+                forwardedFromMessageId = e.forwardedFromMessageId.ifBlank { null },
                 readAt = e.readAt,
                 createdAt = java.time.Instant.ofEpochMilli(e.timestamp).toString()
             )
@@ -760,7 +792,11 @@ class ChatRepository(
                 fileName = dto.fileName,
                 fileSize = dto.fileSize,
                 durationMs = dto.durationMs,
-                keyVersion = dto.keyVersion
+                keyVersion = dto.keyVersion,
+                replyTo = dto.replyToId,
+                isForwarded = dto.isForwarded,
+                forwardedFromName = dto.forwardedFromName,
+                forwardedFromMessageId = dto.forwardedFromMessageId.orEmpty()
             )
         }
         messageDao.insertMessages(entities)

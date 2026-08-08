@@ -3,6 +3,7 @@
 #include <QDebug>
 #include <QMediaDevices>
 #include <QVideoFrame>
+#include <QPainter>
 #include <algorithm>
 #include <cstring>
 
@@ -173,17 +174,22 @@ bool VideoCallEngine::startCapture() {
 
         QImage img = frame.toImage();
         if (img.isNull()) return;
-        // Fit within 640x360 (16:9, Meet-style) keeping aspect. Even
-        // dimensions are required by 4:2:0 chroma subsampling.
+        // Fit inside 640x360 keeping aspect, then centre on a black 16:9
+        // canvas (Meet-style letterbox/pillarbox). Even dims for 4:2:0.
         QImage scaled = img.scaled(640, 360, Qt::KeepAspectRatio, Qt::FastTransformation)
                            .convertToFormat(QImage::Format_RGB32);
-        const int w = scaled.width() & ~1;
-        const int h = scaled.height() & ~1;
+        int w = scaled.width() & ~1;
+        int h = scaled.height() & ~1;
         if (w < 16 || h < 16) return;
         if (w != scaled.width() || h != scaled.height()) {
             scaled = scaled.copy(0, 0, w, h);
         }
-        onCaptureFrame(scaled);
+        QImage canvas(640, 360, QImage::Format_RGB32);
+        canvas.fill(Qt::black);
+        QPainter pad(&canvas);
+        pad.drawImage((640 - w) / 2, (360 - h) / 2, scaled);
+        pad.end();
+        onCaptureFrame(canvas);
     }, Qt::QueuedConnection);
 
     m_camera->start();

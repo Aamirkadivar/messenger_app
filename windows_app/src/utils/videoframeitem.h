@@ -22,8 +22,15 @@ class VideoFrameItem : public QQuickPaintedItem {
     // to behave like a mirror.
     Q_PROPERTY(bool mirror READ mirror WRITE setMirror NOTIFY mirrorChanged)
     Q_PROPERTY(qreal radius READ radius WRITE setRadius NOTIFY radiusChanged)
+    // Cover = centre-crop fill (default historically). Fit = Meet-style
+    // letterbox/pillarbox so a portrait phone feed keeps its full frame
+    // inside a 16:9 tile with black bars on the sides.
+    Q_PROPERTY(FillMode fillMode READ fillMode WRITE setFillMode NOTIFY fillModeChanged)
 
 public:
+    enum FillMode { Cover = 0, Fit = 1 };
+    Q_ENUM(FillMode)
+
     explicit VideoFrameItem(QQuickItem* parent = nullptr);
 
     bool hasFrame() const { return !m_image.isNull(); }
@@ -31,6 +38,8 @@ public:
     void setMirror(bool mirror);
     qreal radius() const { return m_radius; }
     void setRadius(qreal radius);
+    FillMode fillMode() const { return m_fillMode; }
+    void setFillMode(FillMode mode);
 
     Q_INVOKABLE void present(const QVariant& frame);
     Q_INVOKABLE void clear();
@@ -41,9 +50,11 @@ signals:
     void frameChanged();
     void mirrorChanged();
     void radiusChanged();
+    void fillModeChanged();
 
 private:
     QImage m_image;
     bool m_mirror = false;
     qreal m_radius = 0;
+    FillMode m_fillMode = Fit;
 };

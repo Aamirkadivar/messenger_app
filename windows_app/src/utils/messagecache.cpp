@@ -54,6 +54,9 @@ void MessageCache::ensureSchema() {
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN file_name TEXT"));
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0"));
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0"));
+    query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN is_forwarded INTEGER NOT NULL DEFAULT 0"));
+    query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN forwarded_from_name TEXT"));
+    query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN reply_to_id TEXT"));
     query.exec(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS chats ("
         "  id TEXT PRIMARY KEY,"
@@ -70,8 +73,9 @@ void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entri
     query.prepare(QStringLiteral(
         "INSERT OR REPLACE INTO messages "
         "(id, chat_id, sender_id, sender_name, content, encrypted, read_at, created_at, "
-        " file_url, file_type, duration_ms, file_name, file_size, key_version) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " file_url, file_type, duration_ms, file_name, file_size, key_version, "
+        " is_forwarded, forwarded_from_name, reply_to_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ));
 
     m_db.transaction();
@@ -90,6 +94,9 @@ void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entri
         query.addBindValue(e.fileName);
         query.addBindValue(e.fileSize);
         query.addBindValue(e.keyVersion);
+        query.addBindValue(e.isForwarded ? 1 : 0);
+        query.addBindValue(e.forwardedFromName);
+        query.addBindValue(e.replyToId);
         if (!query.exec()) {
             qWarning() << "[MessageCache] Failed to save message:" << query.lastError().text();
         }
@@ -104,7 +111,8 @@ QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int
     QSqlQuery query(m_db);
     query.prepare(QStringLiteral(
         "SELECT id, sender_id, sender_name, content, encrypted, read_at, created_at, "
-        "       file_url, file_type, duration_ms, file_name, file_size, key_version "
+        "       file_url, file_type, duration_ms, file_name, file_size, key_version, "
+        "       is_forwarded, forwarded_from_name, reply_to_id "
         "FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?"
     ));
     query.addBindValue(chatId);
@@ -130,6 +138,9 @@ QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int
         e.fileName = query.value(10).toString();
         e.fileSize = query.value(11).toLongLong();
         e.keyVersion = query.value(12).toInt();
+        e.isForwarded = query.value(13).toInt() != 0;
+        e.forwardedFromName = query.value(14).toString();
+        e.replyToId = query.value(15).toString();
         result.prepend(e); // rows came back newest-first; flip to oldest-first
     }
     return result;
