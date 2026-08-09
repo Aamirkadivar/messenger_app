@@ -569,60 +569,64 @@ fun ChatScreen(
                     .padding(top = 8.dp)
             )
 
-            // Overlaid on the list for the same reason. It now sits above the
-            // LazyColumn's hazeSource, so messages scrolling underneath are
-            // what the glass blurs - in bottomBar the Scaffold reserved space
-            // for it and nothing ever passed behind.
-            if (inSelection) {
-                val selectedText = state.messages
-                    .filter { it.id in selectedIds && it.content.isNotBlank() && !it.isSystem }
-                    .joinToString("\n\n") { it.content }
-                val singleSelected = selectedIds.size == 1
-                MessageActionBar(
-                    visible = true,
-                    hazeState = hazeState,
-                    modifier = Modifier.align(Alignment.BottomCenter),
-                    actions = listOf(
-                        MessageAction(
-                            id = "reply",
-                            label = "Reply",
-                            icon = Icons.AutoMirrored.Filled.Reply,
-                            enabled = singleSelected,
-                            onClick = {
-                                selectedIds.firstOrNull()?.let { viewModel.beginReply(it) }
-                            }
-                        ),
-                        MessageAction(
-                            id = "copy",
-                            label = "Copy",
-                            icon = Icons.Outlined.ContentCopy,
-                            enabled = selectedText.isNotBlank(),
-                            onClick = {
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                clipboard.setPrimaryClip(ClipData.newPlainText("message", selectedText))
-                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
-                                viewModel.clearSelection()
-                            }
-                        ),
-                        MessageAction(
-                            id = "forward",
-                            label = "Forward",
-                            icon = Icons.AutoMirrored.Filled.Forward,
-                            enabled = selectedIds.isNotEmpty(),
-                            onClick = { showForwardPicker = true }
-                        ),
-                        MessageAction(
-                            id = "delete",
-                            label = "Delete",
-                            icon = Icons.Outlined.Delete,
-                            enabled = selectedIds.isNotEmpty(),
-                            destructive = true,
-                            onClick = { pendingBulkDelete = true }
-                        )
-                    )
-                )
-            }
         }
+    }
+
+    // Anchored to the SCREEN, not to the Scaffold's content area.
+    //
+    // Inside the content it was positioned against a box whose height
+    // shrinks and grows as the composer animates in and out, so the bar
+    // slid with it. Out here its bottom edge is the window's, so it holds
+    // still while the composer moves. It still sits above the LazyColumn's
+    // hazeSource, so scrolling messages are what the glass blurs.
+    if (inSelection) {
+        val selectedText = state.messages
+            .filter { it.id in selectedIds && it.content.isNotBlank() && !it.isSystem }
+            .joinToString("\n\n") { it.content }
+        val singleSelected = selectedIds.size == 1
+        MessageActionBar(
+            visible = true,
+            hazeState = hazeState,
+            modifier = Modifier.align(Alignment.BottomCenter),
+            actions = listOf(
+                MessageAction(
+                    id = "reply",
+                    label = "Reply",
+                    icon = Icons.AutoMirrored.Filled.Reply,
+                    enabled = singleSelected,
+                    onClick = {
+                        selectedIds.firstOrNull()?.let { viewModel.beginReply(it) }
+                    }
+                ),
+                MessageAction(
+                    id = "copy",
+                    label = "Copy",
+                    icon = Icons.Outlined.ContentCopy,
+                    enabled = selectedText.isNotBlank(),
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("message", selectedText))
+                        Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                        viewModel.clearSelection()
+                    }
+                ),
+                MessageAction(
+                    id = "forward",
+                    label = "Forward",
+                    icon = Icons.AutoMirrored.Filled.Forward,
+                    enabled = selectedIds.isNotEmpty(),
+                    onClick = { showForwardPicker = true }
+                ),
+                MessageAction(
+                    id = "delete",
+                    label = "Delete",
+                    icon = Icons.Outlined.Delete,
+                    enabled = selectedIds.isNotEmpty(),
+                    destructive = true,
+                    onClick = { pendingBulkDelete = true }
+                )
+            )
+        )
     }
 
     // Floats above the record button. It has to live out here rather than in
