@@ -15,6 +15,16 @@ import androidx.core.content.FileProvider
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import com.messenger.app.ui.theme.Tokens
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -41,8 +51,9 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
-import androidx.compose.material.icons.outlined.SelectAll
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Schedule
+import androidx.compose.material.icons.outlined.SelectAll
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
@@ -70,7 +81,10 @@ import com.messenger.app.data.repository.guessMimeType
 import com.messenger.app.ui.components.AmbientGlow
 import com.messenger.app.ui.components.Avatar
 import com.messenger.app.ui.components.ChatBackground
+import com.messenger.app.ui.components.ConnectionStatusBanner
 import com.messenger.app.ui.components.GlassSurface
+import com.messenger.app.ui.components.MessageAction
+import com.messenger.app.ui.components.MessageActionBar
 import com.messenger.app.ui.components.RecordingIndicator
 import com.messenger.app.ui.components.RecordingLockHint
 import com.messenger.app.ui.components.VoiceBubbleContent
@@ -86,6 +100,10 @@ import com.messenger.app.ui.theme.MessengerExtendedColors
 import com.messenger.app.ui.viewmodel.ChatListItemUi
 import com.messenger.app.ui.viewmodel.ChatMessageUi
 import com.messenger.app.ui.viewmodel.ChatViewModel
+import com.messenger.app.ui.viewmodel.DeliveryStatus
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
+import com.messenger.app.data.remote.websocket.WebSocketManager
 import com.messenger.app.ui.viewmodel.RecordingUiState
 import kotlinx.coroutines.launch
 import java.io.File
@@ -120,6 +138,7 @@ fun ChatScreen(
     val state by viewModel.chatState.collectAsStateWithLifecycle()
     val recording by viewModel.recording.collectAsStateWithLifecycle()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
+    val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
     var messageText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
@@ -189,6 +208,12 @@ fun ChatScreen(
     // every other app uses for a transient modal state.
     BackHandler(enabled = inSelection) { viewModel.clearSelection() }
 
+    // Height the floating action bar occupies over the list while selecting.
+    val actionBarInset by animateDpAsState(
+        targetValue = if (inSelection) 88.dp else 0.dp,
+        label = "actionBarInset"
+    )
+
     val capture by viewModel.capture.collectAsStateWithLifecycle()
     val recorderState by viewModel.recorderState.collectAsStateWithLifecycle()
     val videoStates by viewModel.videoStates.collectAsStateWithLifecycle()
@@ -215,8 +240,35 @@ fun ChatScreen(
         viewModel.openChat(chatId, chatName, isGroup)
     }
 
-    LaunchedEffect(state.messages.size) {
-        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
+    // Snap once history is ready: first unread if any, otherwise the latest
+    // message. Instant positionView - animating through a long history feels
+    // like a harsh scroll.
+    var didInitialSnap by remember(chatId) { mutableStateOf(false) }
+    var trackedLastMessageId by remember(chatId) { mutableStateOf<String?>(null) }
+    LaunchedEffect(chatId, state.historySettled, state.messages.size, state.firstUnreadMessageId) {
+        if (didInitialSnap || !state.historySettled || state.messages.isEmpty()) return@LaunchedEffect
+        val unreadIdx = state.firstUnreadMessageId
+            ?.let { id -> state.messages.indexOfFirst { it.id == id } }
+            ?.takeIf { it >= 0 }
+        val target = unreadIdx ?: state.messages.lastIndex
+        // Yield a frame so LazyColumn has measured items before we jump.
+        kotlinx.coroutines.yield()
+        listState.scrollToItem(target)
+        trackedLastMessageId = state.messages.lastOrNull()?.id
+        didInitialSnap = true
+    }
+
+    // Live messages while already open: only soft-scroll if the user is near
+    // the bottom, otherwise leave them reading history in peace.
+    LaunchedEffect(state.messages.lastOrNull()?.id) {
+        val lastId = state.messages.lastOrNull()?.id ?: return@LaunchedEffect
+        if (!didInitialSnap) return@LaunchedEffect
+        if (lastId == trackedLastMessageId) return@LaunchedEffect
+        trackedLastMessageId = lastId
+        val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: return@LaunchedEffect
+        if (lastVisible >= state.messages.size - 3) {
+            listState.animateScrollToItem(state.messages.lastIndex)
+        }
     }
 
     LaunchedEffect(scrollToMessageId) {
@@ -229,6 +281,7 @@ fun ChatScreen(
     }
 
     val dark = MessengerExtendedColors.isDark
+    val hazeState = remember { HazeState() }
 
     // The recorder is a full-screen layer, so it lives in a Box *around* the
     // Scaffold rather than inside its content slot. Inside, it was clipped to
@@ -242,9 +295,8 @@ fun ChatScreen(
         topBar = {
             GlassSurface(modifier = Modifier.fillMaxWidth(), shape = androidx.compose.ui.graphics.RectangleShape, sheen = false) {
             if (inSelection) {
-                // Takes over the header while selecting, so the count and the
-                // destructive action sit where the title normally is instead
-                // of floating over the conversation.
+                // Telegram-style: header only shows count + exit / select-all.
+                // Destructive and message actions live in the floating bottom bar.
                 TopAppBar(
                     navigationIcon = {
                         IconButton(onClick = { viewModel.clearSelection() }) {
@@ -252,51 +304,18 @@ fun ChatScreen(
                         }
                     },
                     title = {
-                        Text("${selectedIds.size} selected", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (selectedIds.size == 1) "1 selected"
+                            else "${selectedIds.size} selected",
+                            fontWeight = FontWeight.SemiBold
+                        )
                     },
                     actions = {
                         IconButton(onClick = { viewModel.selectAllMessages() }) {
                             Icon(Icons.Outlined.SelectAll, contentDescription = "Select all")
                         }
-                        val selectedText = state.messages
-                            .filter { it.id in selectedIds && it.content.isNotBlank() && !it.isSystem }
-                            .joinToString("\n\n") { it.content }
-                        IconButton(
-                            onClick = {
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                clipboard.setPrimaryClip(ClipData.newPlainText("message", selectedText))
-                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
-                            },
-                            enabled = selectedText.isNotBlank()
-                        ) {
-                            Icon(Icons.Outlined.ContentCopy, contentDescription = "Copy")
-                        }
-                        IconButton(
-                            onClick = {
-                                val id = selectedIds.firstOrNull() ?: return@IconButton
-                                viewModel.beginReply(id)
-                            },
-                            enabled = selectedIds.size == 1
-                        ) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.Reply,
-                                contentDescription = "Reply"
-                            )
-                        }
-                        IconButton(onClick = { showForwardPicker = true }) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.Forward,
-                                contentDescription = "Forward selected"
-                            )
-                        }
-                        IconButton(onClick = { pendingBulkDelete = true }) {
-                            Icon(
-                                Icons.Outlined.Delete,
-                                contentDescription = "Delete selected",
-                                tint = MaterialTheme.colorScheme.error
-                            )
-                        }
-                    }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
                 )
             } else {
             TopAppBar(
@@ -369,6 +388,34 @@ fun ChatScreen(
         },
         containerColor = Color.Transparent,
         bottomBar = {
+            // Slides down out of view when selection starts, and back up when
+            // it ends, instead of vanishing between frames.
+            //
+            // Nothing is left behind while hidden: the Scaffold reserves height
+            // for whatever is in this slot, and the selection action bar is
+            // drawn as an overlay on the message list precisely so messages can
+            // pass behind it - leaving a placeholder here would push the list
+            // back up and give the glass nothing to blur again.
+            // expand/shrinkVertically is what stops the action bar jumping.
+            // With only a slide, the Scaffold keeps reserving the composer's
+            // full height for the whole animation and then drops it to zero in
+            // one frame - the overlaid action bar is anchored to the content's
+            // bottom, so it lurched down at the end. Animating the height means
+            // the content grows at the same rate the composer leaves, and the
+            // bar glides with it.
+            AnimatedVisibility(
+                visible = !inSelection,
+                enter = slideInVertically(
+                    animationSpec = tween(Tokens.Motion.SLOW_MS, easing = Tokens.Motion.easeOut)
+                ) { it } + expandVertically(
+                    animationSpec = tween(Tokens.Motion.SLOW_MS, easing = Tokens.Motion.easeOut)
+                ) + fadeIn(),
+                exit = slideOutVertically(
+                    animationSpec = tween(Tokens.Motion.EXIT_MS, easing = Tokens.Motion.easeIn)
+                ) { it } + shrinkVertically(
+                    animationSpec = tween(Tokens.Motion.EXIT_MS, easing = Tokens.Motion.easeIn)
+                ) + fadeOut()
+            ) {
             GlassSurface(modifier = Modifier.fillMaxWidth(), shape = androidx.compose.ui.graphics.RectangleShape, sheen = false) {
             Column(modifier = Modifier.fillMaxWidth()) {
                 pendingReply?.let { reply ->
@@ -436,24 +483,48 @@ fun ChatScreen(
             )
             }
             }
+            }
         }
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
             AmbientGlow(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .hazeSource(state = hazeState, zIndex = 0f),
                 baseColor = MaterialTheme.colorScheme.background,
                 primaryGlow = MaterialTheme.colorScheme.primary,
                 secondaryGlow = if (dark) Color(0xFF7A5C22) else Color(0xFF8A6A2E),
                 intensity = if (dark) 0.7f else 0.4f
             )
-            ChatBackground(modifier = Modifier.fillMaxSize(), baseOpacity = 0f)
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
+            ChatBackground(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .hazeSource(state = hazeState, zIndex = 0.5f),
+                baseOpacity = 0f
+            )
+            Column(modifier = Modifier.fillMaxSize()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .hazeSource(state = hazeState, zIndex = 1f),
+                    // Extra room at the bottom while the floating action bar
+                    // is up, so the last messages can still be scrolled clear
+                    // of it. Animated, so the list eases rather than jumping
+                    // as selection starts and ends.
+                    contentPadding = PaddingValues(
+                        start = 12.dp,
+                        end = 12.dp,
+                        top = 8.dp,
+                        bottom = 8.dp + actionBarInset
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
                 items(state.messages, key = { it.id }) { message ->
+                    if (message.id == state.firstUnreadMessageId && state.openUnreadCount > 0) {
+                        UnreadMessagesDivider(count = state.openUnreadCount)
+                    }
                     if (message.isSystem) {
                         SystemMessageRow(message.content)
                     } else {
@@ -461,6 +532,7 @@ fun ChatScreen(
                             message = message,
                             replyParent = state.messages.firstOrNull { it.id == message.replyToId },
                             isPlaying = playback.messageId == message.id && playback.isPlaying,
+
                             positionMs = if (playback.messageId == message.id) playback.positionMs else 0,
                             onTogglePlay = { viewModel.toggleVoicePlayback(message) },
                             onFetchAttachment = { viewModel.fetchAttachmentFile(message) },
@@ -482,6 +554,73 @@ fun ChatScreen(
                         }
                     }
                 }
+                }
+            }
+
+            // Overlaid rather than placed in the Column above: in the flow it
+            // took a full-width row, pushing the whole conversation down each
+            // time it appeared and leaving a band around the pill. Floating it
+            // means everything around the pill is the chat itself.
+            ConnectionStatusBanner(
+                state = connectionState,
+                hazeState = hazeState,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 8.dp)
+            )
+
+            // Overlaid on the list for the same reason. It now sits above the
+            // LazyColumn's hazeSource, so messages scrolling underneath are
+            // what the glass blurs - in bottomBar the Scaffold reserved space
+            // for it and nothing ever passed behind.
+            if (inSelection) {
+                val selectedText = state.messages
+                    .filter { it.id in selectedIds && it.content.isNotBlank() && !it.isSystem }
+                    .joinToString("\n\n") { it.content }
+                val singleSelected = selectedIds.size == 1
+                MessageActionBar(
+                    visible = true,
+                    hazeState = hazeState,
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                    actions = listOf(
+                        MessageAction(
+                            id = "reply",
+                            label = "Reply",
+                            icon = Icons.AutoMirrored.Filled.Reply,
+                            enabled = singleSelected,
+                            onClick = {
+                                selectedIds.firstOrNull()?.let { viewModel.beginReply(it) }
+                            }
+                        ),
+                        MessageAction(
+                            id = "copy",
+                            label = "Copy",
+                            icon = Icons.Outlined.ContentCopy,
+                            enabled = selectedText.isNotBlank(),
+                            onClick = {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("message", selectedText))
+                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                                viewModel.clearSelection()
+                            }
+                        ),
+                        MessageAction(
+                            id = "forward",
+                            label = "Forward",
+                            icon = Icons.AutoMirrored.Filled.Forward,
+                            enabled = selectedIds.isNotEmpty(),
+                            onClick = { showForwardPicker = true }
+                        ),
+                        MessageAction(
+                            id = "delete",
+                            label = "Delete",
+                            icon = Icons.Outlined.Delete,
+                            enabled = selectedIds.isNotEmpty(),
+                            destructive = true,
+                            onClick = { pendingBulkDelete = true }
+                        )
+                    )
+                )
             }
         }
     }
@@ -595,6 +734,39 @@ private fun SystemMessageRow(text: String) {
             modifier = Modifier
                 .widthIn(max = 280.dp)
                 .padding(vertical = 4.dp, horizontal = 12.dp)
+        )
+    }
+}
+
+/** Thin accent divider marking where unread messages begin for this open. */
+@Composable
+private fun UnreadMessagesDivider(count: Int) {
+    val accent = MaterialTheme.colorScheme.primary
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(accent.copy(alpha = 0.35f))
+        )
+        Text(
+            text = if (count <= 1) "Unread message" else "$count unread messages",
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = accent,
+            maxLines = 1
+        )
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(accent.copy(alpha = 0.35f))
         )
     }
 }
@@ -792,12 +964,26 @@ private fun MessageBubble(
                 )
                 if (message.isMine) {
                     Spacer(modifier = Modifier.width(4.dp))
-                    Icon(
-                        imageVector = if (message.isRead) Icons.Filled.DoneAll else Icons.Filled.Done,
-                        contentDescription = if (message.isRead) "Seen" else "Sent",
-                        tint = if (message.isRead) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.7f),
-                        modifier = Modifier.size(14.dp)
-                    )
+                    when {
+                        message.deliveryStatus == DeliveryStatus.PENDING -> Icon(
+                            imageVector = Icons.Outlined.Schedule,
+                            contentDescription = "Sending",
+                            tint = Color.White.copy(alpha = 0.7f),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        message.isRead -> Icon(
+                            imageVector = Icons.Filled.DoneAll,
+                            contentDescription = "Seen",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        else -> Icon(
+                            imageVector = Icons.Filled.Done,
+                            contentDescription = "Sent",
+                            tint = Color.White.copy(alpha = 0.7f),
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
                 }
             }
         }

@@ -6,13 +6,13 @@ Popup {
     id: newGroupDialog
 
     property bool darkMode: true
-    property color bgColor: "#15152B"
-    property color surfaceColor: "#1B1B36"
-    property color surfaceColorHover: "#22224A"
-    property color textColor: "#EDEDF2"
-    property color textSecondary: "#9494AC"
+    property color bgColor: "#050403"
+    property color surfaceColor: "#0C0A08"
+    property color surfaceColorHover: "#16120E"
+    property color textColor: "#F0EAD6"
+    property color textSecondary: "#A39A8A"
     property color borderColor: Qt.rgba(1, 1, 1, 0.08)
-    property color accentColor: "#6C63FF"
+    property color accentColor: "#C9A961"
     property color onlineColor: "#4CAF50"
 
     // Emitted once the server confirms creation, so the caller can jump
@@ -21,13 +21,21 @@ Popup {
 
     property var selectedMembers: [] // [{id, name}]
 
-    modal: true
+    // Modeless + title-bar pass-through - see Settings.qml. Otherwise the
+    // modal Overlay covers min/max/close and window drag while this is open.
+    modal: false
+    dim: false
     focus: true
     width: 440
     height: 580
     x: (parent ? parent.width - width : 0) / 2
     y: (parent ? parent.height - height : 0) / 2
-    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    closePolicy: Popup.CloseOnEscape
+
+    Overlay.modeless: FrostedScrim {
+        darkMode: newGroupDialog.darkMode
+        onDismissed: newGroupDialog.close()
+    }
 
     onOpened: {
         nameField.text = ""
@@ -42,7 +50,8 @@ Popup {
 
     background: GlassPanel {
         darkMode: newGroupDialog.darkMode
-        radius: 12
+        elevated: true
+        radius: 16
     }
 
     Connections {
@@ -368,7 +377,7 @@ Popup {
             height: 44
             radius: 12
             property bool canCreate: nameField.text.trim().length > 0 && newGroupDialog.selectedMembers.length > 0 && !newGroupDialog.creating
-            color: !canCreate ? (newGroupDialog.darkMode ? "#2A2A4A" : "#E0E0E5")
+            color: !canCreate ? (newGroupDialog.darkMode ? "#2A2418" : "#E0E0E5")
                    : createMouse.pressed ? Qt.darker(newGroupDialog.accentColor, 1.15) : (createMouse.containsMouse ? Qt.lighter(newGroupDialog.accentColor, 1.08) : newGroupDialog.accentColor)
 
             RowLayout {

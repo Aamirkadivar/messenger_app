@@ -18,8 +18,7 @@ Item {
     // colors regardless of the app's actual theme. Declared properly now,
     // and main.qml's authLoader binds the real value in.
     property bool darkMode: true
-    // Matches the rest of the app's champagne-gold accent instead of this
-    // file's old flat purple (#6C63FF), which predates the luxury palette.
+    // Champagne-gold accent (same family as Android AccentGoldDark/Light).
     property color accentColor: darkMode ? "#C9A961" : "#A6803A"
 
     property bool isLoading: false
@@ -27,10 +26,10 @@ Item {
     // Ambient colour behind the glass card, same treatment as the main window.
     AmbientGlow {
         anchors.fill: parent
-        baseColor: darkMode ? "#0A0A0F" : "#FAF6EE"
+        baseColor: darkMode ? "#050403" : "#FAF6EE"
         primaryGlow: loginPage.accentColor
         secondaryGlow: darkMode ? "#A6863F" : "#8A6A2E"
-        intensity: darkMode ? 1.0 : 0.6
+        intensity: darkMode ? 0.85 : 0.65
     }
 
     // Login card
@@ -390,7 +389,7 @@ Item {
                 }
                 background: Rectangle {
                     radius: 13
-                    color: !loginButton.enabled ? (darkMode ? "#2A2A4A" : "#E0E0E5")
+                    color: !loginButton.enabled ? (darkMode ? "#2A2418" : "#E0E0E5")
                            : loginMouse.pressed ? Qt.darker(loginPage.accentColor, 1.15) : (loginMouse.containsMouse ? Qt.lighter(loginPage.accentColor, 1.1) : loginPage.accentColor)
                     Behavior on color {
                         enabled: !loginPage.instantThemeActive

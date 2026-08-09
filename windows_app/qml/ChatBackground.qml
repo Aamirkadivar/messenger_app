@@ -6,7 +6,7 @@ import QtQuick 2.15
 Item {
     id: root
 
-    property color baseColor: "#0A0A0F"
+    property color baseColor: "#050403"
     property color patternColor: "#C9A961"
     property real patternOpacity: 0.05
     property real tileSize: 48

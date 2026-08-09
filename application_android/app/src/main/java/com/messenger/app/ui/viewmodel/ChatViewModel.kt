@@ -55,6 +55,14 @@ data class ChatMessageUi(
     val timestamp: Long,
     val isMine: Boolean,
     val isRead: Boolean = false,
+    /**
+     * Outgoing delivery. PENDING shows a clock (not yet on the server);
+     * SENT shows a single tick; READ is [isRead] with double ticks.
+     * Incoming / history rows are always SENT.
+     */
+    val deliveryStatus: DeliveryStatus = DeliveryStatus.SENT,
+    /** Incoming read receipt timestamp; null means still unread for us. */
+    val readAt: String? = null,
     /** "message" for a normal bubble, "system" for a centered notice (e.g. security code changed). */
     val messageKind: String = "message",
     /** Non-null for voice notes; the bubble renders a player instead of text. */
@@ -83,7 +91,12 @@ data class ChatMessageUi(
     val isAttachment: Boolean get() = !attachmentUrl.isNullOrBlank()
     val isVideoNote: Boolean get() = !videoUrl.isNullOrBlank()
     val isSystem: Boolean get() = messageKind == "system"
+    /** Incoming message that had not been marked read when history was loaded. */
+    val isUnreadIncoming: Boolean get() = !isMine && !isSystem && readAt.isNullOrBlank()
 }
+
+/** Wire status for an outgoing bubble: clock while pending, ticks after ACK. */
+enum class DeliveryStatus { PENDING, SENT }
 
 data class ChatUiState(
     val chatId: String? = null,
@@ -94,7 +107,15 @@ data class ChatUiState(
     val otherUserId: String = "",
     val messages: List<ChatMessageUi> = emptyList(),
     val isSending: Boolean = false,
-    val error: String? = null
+    val error: String? = null,
+    /**
+     * First incoming unread message when this chat was opened (captured before
+     * markAsRead). Used to snap the list and draw the unread divider.
+     */
+    val firstUnreadMessageId: String? = null,
+    val openUnreadCount: Int = 0,
+    /** True after openChat finishes its cache/network history pass. */
+    val historySettled: Boolean = false
 )
 
 data class UserSearchUiState(
@@ -175,6 +196,9 @@ class ChatViewModel @Inject constructor(
 
     private val _chatState = MutableStateFlow(ChatUiState())
     val chatState: StateFlow<ChatUiState> = _chatState.asStateFlow()
+
+    /** Live WebSocket status for the Connecting… / Reconnecting… banners. */
+    val connectionState = chatRepository.connectionState
 
     private val _userSearchState = MutableStateFlow(UserSearchUiState())
     val userSearchState: StateFlow<UserSearchUiState> = _userSearchState.asStateFlow()
@@ -417,7 +441,19 @@ class ChatViewModel @Inject constructor(
                 val state = _chatState.value
                 if (receipt.chatId != state.chatId) return@onEach
                 _chatState.update {
-                    it.copy(messages = it.messages.map { m -> if (m.isMine) m.copy(isRead = true) else m })
+                    it.copy(messages = it.messages.map { m ->
+                        // Never paint double-ticks on a message that never left the device.
+                        if (m.isMine && m.deliveryStatus == DeliveryStatus.SENT) m.copy(isRead = true) else m
+                    })
+                }
+            }
+            .launchIn(viewModelScope)
+
+        // Flush text that was queued while the socket / network was down.
+        connectionState
+            .onEach { state ->
+                if (state == com.messenger.app.data.remote.websocket.WebSocketManager.ConnectionState.CONNECTED) {
+                    flushPendingOutgoing()
                 }
             }
             .launchIn(viewModelScope)
@@ -499,7 +535,12 @@ class ChatViewModel @Inject constructor(
                     toChatMessageUi(chatId, dto, myId)
                 }
                 if (_chatState.value.chatId == chatId) {
-                    _chatState.update { it.copy(messages = cachedHistory) }
+                    _chatState.update {
+                        it.copy(
+                            messages = cachedHistory,
+                            historySettled = false
+                        ).withUnreadAnchor(cachedHistory)
+                    }
                 }
             }
 
@@ -508,16 +549,64 @@ class ChatViewModel @Inject constructor(
                     // Server returns newest-first; reverse so oldest is first for display
                     val history = response.data.asReversed().map { dto -> toChatMessageUi(chatId, dto, myId) }
                     if (_chatState.value.chatId == chatId) {
-                        _chatState.update { it.copy(messages = history) }
+                        _chatState.update {
+                            it.copy(messages = history, historySettled = true)
+                                .withUnreadAnchor(history)
+                        }
                     }
                 }
                 .onFailure { e ->
                     Log.e(TAG, "getMessages failed", e)
-                    _chatState.update { it.copy(error = e.message ?: "Failed to load messages") }
+                    if (_chatState.value.chatId == chatId) {
+                        _chatState.update {
+                            it.copy(
+                                error = e.message ?: "Failed to load messages",
+                                historySettled = true
+                            )
+                        }
+                    }
                 }
 
+            // After anchoring unread for the open animation - marking read now
+            // would otherwise wipe readAt before we could find the divider.
             chatRepository.markAsRead(token, chatId)
+
+            // Re-show any still-queued outgoing text for this chat (history
+            // replace would otherwise hide them until reconnect flush).
+            rehydratePendingForChat(chatId)
+            flushPendingOutgoing()
         }
+    }
+
+    private fun rehydratePendingForChat(chatId: String) {
+        val pending = synchronized(pendingOutgoing) {
+            pendingOutgoing.filter { it.chatId == chatId }
+        }
+        if (pending.isEmpty()) return
+        val existing = _chatState.value.messages.map { it.id }.toSet()
+        val myId = _currentUserId.value ?: return
+        val extras = pending.filter { it.localId !in existing }.map { o ->
+            ChatMessageUi(
+                id = o.localId,
+                senderId = myId,
+                senderName = "Me",
+                content = o.content,
+                timestamp = System.currentTimeMillis(),
+                isMine = true,
+                deliveryStatus = DeliveryStatus.PENDING,
+                replyToId = o.replyToId
+            )
+        }
+        if (extras.isEmpty()) return
+        _chatState.update { it.copy(messages = it.messages + extras) }
+    }
+
+    private fun ChatUiState.withUnreadAnchor(history: List<ChatMessageUi>): ChatUiState {
+        val unread = history.filter { it.isUnreadIncoming }
+        return copy(
+            firstUnreadMessageId = unread.firstOrNull()?.id,
+            openUnreadCount = unread.size
+        )
     }
 
     /** Appends a small centered system notice - doesn't touch cache/server, display-only. */
@@ -556,6 +645,7 @@ class ChatViewModel @Inject constructor(
             timestamp = parseMessageTimestamp(dto.createdAt),
             isMine = isMine,
             isRead = isMine && !dto.readAt.isNullOrEmpty(),
+            readAt = dto.readAt,
             voiceUrl = if (isVoice) dto.fileUrl else null,
             voiceDurationMs = dto.durationMs,
             voiceEncrypted = isVoice && dto.encrypted,
@@ -610,48 +700,116 @@ class ChatViewModel @Inject constructor(
         if (content.isBlank()) return
 
         viewModelScope.launch {
-            _chatState.update { it.copy(isSending = true) }
-            val token = tokenManager.getAccessToken().getOrNull()
-            if (token.isNullOrEmpty()) {
-                _chatState.update { it.copy(isSending = false, error = "Not signed in") }
-                return@launch
-            }
             val myId = resolveCurrentUserId()
             val replyToId = _pendingReply.value?.id.orEmpty()
+            val chatType = _chatState.value.chatType
+            val localId = "local-${System.currentTimeMillis()}-${pendingOutgoing.size}"
 
-            // Shown immediately; the real-time echo from the server is filtered
-            // out in the incomingMessages collector above (see resolveCurrentUserId).
+            // Shown immediately with a clock; ticks only after the server ACKs.
             val optimistic = ChatMessageUi(
-                id = "local-${System.currentTimeMillis()}",
+                id = localId,
                 senderId = myId,
                 senderName = "Me",
                 content = content,
                 timestamp = System.currentTimeMillis(),
                 isMine = true,
+                deliveryStatus = DeliveryStatus.PENDING,
                 replyToId = replyToId
             )
-            _chatState.update { it.copy(messages = it.messages + optimistic) }
+            _chatState.update { it.copy(messages = it.messages + optimistic, isSending = true) }
             clearReply()
 
-            chatRepository.sendMessage(
-                token = token,
-                chatId = chatId,
-                chatType = _chatState.value.chatType,
-                plaintext = content,
-                replyToId = replyToId
-            )
-                .onSuccess {
-                    _chatState.update { it.copy(isSending = false) }
+            val outgoing = OutgoingText(localId, chatId, chatType, content, replyToId)
+            synchronized(pendingOutgoing) { pendingOutgoing.add(outgoing) }
+
+            if (connectionState.value !=
+                com.messenger.app.data.remote.websocket.WebSocketManager.ConnectionState.CONNECTED
+            ) {
+                _chatState.update { it.copy(isSending = false) }
+                return@launch
+            }
+            dispatchOutgoing(outgoing)
+        }
+    }
+
+    private data class OutgoingText(
+        val localId: String,
+        val chatId: String,
+        val chatType: String,
+        val content: String,
+        val replyToId: String
+    )
+
+    private val pendingOutgoing = mutableListOf<OutgoingText>()
+    private var flushingOutgoing = false
+
+    private suspend fun dispatchOutgoing(outgoing: OutgoingText) {
+        val token = tokenManager.getAccessToken().getOrNull()
+        if (token.isNullOrEmpty()) {
+            _chatState.update { it.copy(isSending = false, error = "Not signed in") }
+            return
+        }
+        chatRepository.sendMessage(
+            token = token,
+            chatId = outgoing.chatId,
+            chatType = outgoing.chatType,
+            plaintext = outgoing.content,
+            replyToId = outgoing.replyToId
+        )
+            .onSuccess { sent ->
+                synchronized(pendingOutgoing) {
+                    pendingOutgoing.removeAll { it.localId == outgoing.localId }
                 }
-                .onFailure { e ->
-                    Log.e(TAG, "sendMessage failed", e)
-                    _chatState.update { it.copy(isSending = false, error = e.message ?: "Failed to send") }
+                _chatState.update { state ->
+                    state.copy(
+                        isSending = false,
+                        messages = state.messages.map { m ->
+                            if (m.id == outgoing.localId) {
+                                m.copy(
+                                    id = sent.id,
+                                    deliveryStatus = DeliveryStatus.SENT,
+                                    isRead = false,
+                                    timestamp = parseMessageTimestamp(sent.createdAt)
+                                )
+                            } else m
+                        }
+                    )
                 }
+            }
+            .onFailure { e ->
+                Log.e(TAG, "sendMessage failed", e)
+                // Leave PENDING + keep queued so reconnect can retry.
+                _chatState.update {
+                    it.copy(isSending = false, error = e.message ?: "Failed to send")
+                }
+            }
+    }
+
+    private fun flushPendingOutgoing() {
+        if (flushingOutgoing) return
+        viewModelScope.launch {
+            flushingOutgoing = true
+            try {
+                while (true) {
+                    val next = synchronized(pendingOutgoing) { pendingOutgoing.firstOrNull() } ?: break
+                    if (connectionState.value !=
+                        com.messenger.app.data.remote.websocket.WebSocketManager.ConnectionState.CONNECTED
+                    ) break
+                    dispatchOutgoing(next)
+                    // If still pending after dispatch, stop to avoid a tight fail loop.
+                    val stillThere = synchronized(pendingOutgoing) {
+                        pendingOutgoing.any { it.localId == next.localId }
+                    }
+                    if (stillThere) break
+                }
+            } finally {
+                flushingOutgoing = false
+            }
         }
     }
 
     /**
-     * Flips a chat's mute flag (long-press menu). Mute is local-only - it lives
+     * Flips a chat's mute flag (long-press menu). Mute is a local-only flag - it lives
      * in the Room conversation row, so nothing is sent to the server and the
      * new value is reflected in the list right away.
      */

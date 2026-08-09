@@ -13,13 +13,13 @@ Item {
 
     // External properties from parent
     property bool darkMode: true
-    property color bgColor: "#15152B"
-    property color surfaceColor: "#1B1B36"
-    property color surfaceColorHover: "#22224A"
-    property color textColor: "#EDEDF2"
-    property color textSecondary: "#9494AC"
+    property color bgColor: "#050403"
+    property color surfaceColor: "#0C0A08"
+    property color surfaceColorHover: "#16120E"
+    property color textColor: "#F0EAD6"
+    property color textSecondary: "#A39A8A"
     property color borderColor: Qt.rgba(1, 1, 1, 0.08)
-    property color accentColor: "#6C63FF"
+    property color accentColor: "#C9A961"
     property color onlineColor: "#4CAF50"
     property color offlineColor: "#9E9E9E"
 
@@ -30,6 +30,65 @@ Item {
         anchors.fill: parent
         radius: 0
         darkMode: chatListRoot.darkMode
+    }
+
+    // Soft top light wash - modern depth cue over the glass plate.
+    Rectangle {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        height: 120
+        z: 0
+        gradient: Gradient {
+            GradientStop {
+                position: 0.0
+                color: chatListRoot.darkMode ? Qt.rgba(1, 1, 1, 0.06)
+                                             : Qt.rgba(1, 1, 1, 0.35)
+            }
+            GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0) }
+        }
+    }
+
+    // Right-edge light seam separating sidebar from the chat pane.
+    Rectangle {
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.right: parent.right
+        width: 1
+        z: 2
+        gradient: Gradient {
+            GradientStop {
+                position: 0.0
+                color: Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                               chatListRoot.accentColor.b, chatListRoot.darkMode ? 0.22 : 0.18)
+            }
+            GradientStop {
+                position: 0.5
+                color: chatListRoot.darkMode ? Qt.rgba(1, 1, 1, 0.10) : Qt.rgba(43 / 255, 36 / 255, 24 / 255, 0.12)
+            }
+            GradientStop {
+                position: 1.0
+                color: Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                               chatListRoot.accentColor.b, chatListRoot.darkMode ? 0.08 : 0.06)
+            }
+        }
+    }
+
+    // Soft shadow cast onto the chat view from the sidebar edge.
+    Rectangle {
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.left: parent.right
+        width: 18
+        z: 1
+        gradient: Gradient {
+            orientation: Gradient.Horizontal
+            GradientStop {
+                position: 0.0
+                color: chatListRoot.darkMode ? Qt.rgba(0, 0, 0, 0.45) : Qt.rgba(43 / 255, 36 / 255, 24 / 255, 0.14)
+            }
+            GradientStop { position: 1.0; color: Qt.rgba(0, 0, 0, 0) }
+        }
     }
 
     // Signals
@@ -641,20 +700,124 @@ Item {
 
                     Item {
                         width: parent.width
-                        height: 76
+                        height: 80
+                        readonly property bool isActive: model.chatId === chatListRoot.activeChatId
+                        readonly property bool lit: isActive || itemMouse.containsMouse
+
+                        // Soft drop shadow under elevated / hovered rows.
+                        Rectangle {
+                            anchors.fill: card
+                            anchors.topMargin: 5
+                            anchors.leftMargin: 3
+                            anchors.rightMargin: 3
+                            anchors.bottomMargin: -3
+                            radius: card.radius
+                            color: chatListRoot.darkMode
+                                   ? Qt.rgba(0, 0, 0, parent.lit ? 0.55 : 0.0)
+                                   : Qt.rgba(43 / 255, 36 / 255, 24 / 255, parent.lit ? 0.16 : 0.0)
+                            opacity: parent.lit ? 1 : 0
+                            z: -2
+                            Behavior on opacity { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+                            Behavior on color { ColorAnimation { duration: 160 } }
+                        }
+                        Rectangle {
+                            anchors.fill: card
+                            anchors.margins: -1
+                            anchors.topMargin: 1
+                            radius: card.radius + 1
+                            color: chatListRoot.darkMode
+                                   ? Qt.rgba(0, 0, 0, parent.lit ? 0.28 : 0.0)
+                                   : Qt.rgba(43 / 255, 36 / 255, 24 / 255, parent.lit ? 0.08 : 0.0)
+                            opacity: parent.lit ? 1 : 0
+                            z: -1
+                            Behavior on opacity { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+                        }
+
+                        // Active-row gold ambient glow.
+                        Rectangle {
+                            anchors.fill: card
+                            anchors.margins: -4
+                            radius: card.radius + 4
+                            visible: parent.isActive
+                            color: Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                                           chatListRoot.accentColor.b, chatListRoot.darkMode ? 0.14 : 0.26)
+                            z: -1
+                        }
 
                         Rectangle {
+                            id: card
                             anchors.fill: parent
-                            anchors.leftMargin: 8
-                            anchors.rightMargin: 8
-                            anchors.topMargin: 2
-                            anchors.bottomMargin: 2
-                            radius: 14
-                            color: itemMouse.pressed ? Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g, chatListRoot.accentColor.b, 0.16)
-                                   : (itemMouse.containsMouse ? chatListRoot.surfaceColorHover : "transparent")
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 10
+                            anchors.topMargin: 3
+                            anchors.bottomMargin: 3
+                            radius: 16
+                            color: {
+                                if (parent.isActive)
+                                    // Light cream needs a denser bronze wash — 0.12
+                                    // washed out against #FAF6EE.
+                                    return Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                                                   chatListRoot.accentColor.b, chatListRoot.darkMode ? 0.16 : 0.30)
+                                if (itemMouse.pressed)
+                                    return Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                                                   chatListRoot.accentColor.b, chatListRoot.darkMode ? 0.14 : 0.18)
+                                if (itemMouse.containsMouse)
+                                    return chatListRoot.darkMode ? Qt.rgba(1, 1, 1, 0.06)
+                                                                 : Qt.rgba(43 / 255, 36 / 255, 24 / 255, 0.07)
+                                return "transparent"
+                            }
+                            border.width: parent.isActive ? (chatListRoot.darkMode ? 1 : 1.5)
+                                          : (itemMouse.containsMouse ? 1 : 0)
+                            border.color: parent.isActive
+                                          ? Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                                                    chatListRoot.accentColor.b, chatListRoot.darkMode ? 0.35 : 0.72)
+                                          : (chatListRoot.darkMode ? Qt.rgba(1, 1, 1, 0.08)
+                                                                   : Qt.rgba(43 / 255, 36 / 255, 24 / 255, 0.10))
                             Behavior on color {
                                 enabled: !chatListRoot.instantThemeActive
-                                ColorAnimation { duration: 130; easing.type: Easing.OutCubic }
+                                ColorAnimation { duration: 140; easing.type: Easing.OutCubic }
+                            }
+                            Behavior on border.color { ColorAnimation { duration: 140 } }
+
+                            // Top catch-light on the card.
+                            Rectangle {
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.leftMargin: 12
+                                anchors.rightMargin: 12
+                                anchors.topMargin: 1
+                                height: 1
+                                radius: 0.5
+                                visible: parent.parent.lit
+                                color: chatListRoot.darkMode
+                                       ? Qt.rgba(1, 1, 1, parent.parent.isActive ? 0.22 : 0.12)
+                                       : Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                                                 chatListRoot.accentColor.b, parent.parent.isActive ? 0.55 : 0.28)
+                            }
+
+                            // Active indicator light bar.
+                            Rectangle {
+                                anchors.left: parent.left
+                                anchors.top: parent.top
+                                anchors.bottom: parent.bottom
+                                anchors.leftMargin: 5
+                                anchors.topMargin: 14
+                                anchors.bottomMargin: 14
+                                width: chatListRoot.darkMode ? 3 : 3.5
+                                radius: 1.5
+                                visible: parent.parent.isActive
+                                color: chatListRoot.accentColor
+
+                                Rectangle {
+                                    anchors.centerIn: parent
+                                    width: 10
+                                    height: parent.height + 8
+                                    radius: 5
+                                    z: -1
+                                    color: Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                                                   chatListRoot.accentColor.b, chatListRoot.darkMode ? 0.35 : 0.50)
+                                }
                             }
 
                             MouseArea {
@@ -677,7 +840,7 @@ Item {
 
                             RowLayout {
                                 anchors.fill: parent
-                                anchors.leftMargin: 12
+                                anchors.leftMargin: 14
                                 anchors.rightMargin: 14
                                 spacing: 12
 
@@ -685,6 +848,17 @@ Item {
                                 Item {
                                     Layout.preferredWidth: 48
                                     Layout.preferredHeight: 48
+
+                                    // Soft avatar shadow.
+                                    Rectangle {
+                                        anchors.centerIn: parent
+                                        anchors.verticalCenterOffset: 2
+                                        width: parent.width - 2
+                                        height: parent.height - 2
+                                        radius: width / 2
+                                        color: Qt.rgba(0, 0, 0, chatListRoot.darkMode ? 0.4 : 0.12)
+                                        z: -1
+                                    }
 
                                     Avatar {
                                         anchors.fill: parent
@@ -703,14 +877,20 @@ Item {
                                         border.color: chatListRoot.bgColor
                                         border.width: 2.5
                                         visible: model.online
+
+                                        Rectangle {
+                                            anchors.centerIn: parent
+                                            width: 18
+                                            height: 18
+                                            radius: 9
+                                            z: -1
+                                            color: Qt.rgba(chatListRoot.onlineColor.r, chatListRoot.onlineColor.g,
+                                                           chatListRoot.onlineColor.b, 0.35)
+                                            visible: parent.visible
+                                        }
                                     }
                                 }
 
-                                // Name + last message. preferredWidth: 0 is
-                                // required so Layout.fillWidth actually
-                                // constrains the Text - otherwise implicitWidth
-                                // (the full unelided string) expands the row
-                                // and the preview spills past the chat-list tile.
                                 ColumnLayout {
                                     Layout.fillWidth: true
                                     Layout.preferredWidth: 0
@@ -730,8 +910,6 @@ Item {
                                     Text {
                                         Layout.fillWidth: true
                                         Layout.preferredWidth: 0
-                                        // Shift+Enter messages carry newlines;
-                                        // keep the preview a single elided line.
                                         text: (model.lastMessage || "").replace(/\n/g, " ")
                                         font.pixelSize: 13
                                         color: model.unreadCount > 0 ? chatListRoot.textColor : chatListRoot.textSecondary
@@ -741,7 +919,6 @@ Item {
                                     }
                                 }
 
-                                // Time + unread badge
                                 ColumnLayout {
                                     Layout.alignment: Qt.AlignTop
                                     Layout.topMargin: 12
@@ -755,21 +932,39 @@ Item {
                                         color: model.unreadCount > 0 ? chatListRoot.accentColor : chatListRoot.textSecondary
                                     }
 
-                                    Rectangle {
+                                    Item {
                                         Layout.alignment: Qt.AlignRight
-                                        Layout.preferredWidth: Math.max(20, unreadText.implicitWidth + 11)
-                                        Layout.preferredHeight: 20
-                                        radius: 10
-                                        color: chatListRoot.accentColor
-                                        visible: model.unreadCount > 0
+                                        Layout.preferredWidth: unreadBadge.visible ? unreadBadge.width : 0
+                                        Layout.preferredHeight: unreadBadge.visible ? unreadBadge.height : 0
 
-                                        Text {
-                                            id: unreadText
-                                            anchors.centerIn: parent
-                                            text: model.unreadCount > 99 ? "99+" : model.unreadCount
-                                            font.pixelSize: 11
-                                            font.weight: Font.DemiBold
-                                            color: "#FFFFFF"
+                                        Rectangle {
+                                            id: unreadGlow
+                                            anchors.centerIn: unreadBadge
+                                            width: unreadBadge.width + 10
+                                            height: unreadBadge.height + 10
+                                            radius: height / 2
+                                            visible: unreadBadge.visible
+                                            color: Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                                                           chatListRoot.accentColor.b, 0.32)
+                                        }
+
+                                        Rectangle {
+                                            id: unreadBadge
+                                            anchors.right: parent.right
+                                            width: Math.max(20, unreadText.implicitWidth + 11)
+                                            height: 20
+                                            radius: 10
+                                            color: chatListRoot.accentColor
+                                            visible: model.unreadCount > 0
+
+                                            Text {
+                                                id: unreadText
+                                                anchors.centerIn: parent
+                                                text: model.unreadCount > 99 ? "99+" : model.unreadCount
+                                                font.pixelSize: 11
+                                                font.weight: Font.DemiBold
+                                                color: "#FFFFFF"
+                                            }
                                         }
                                     }
                                 }

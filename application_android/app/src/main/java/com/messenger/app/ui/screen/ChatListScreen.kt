@@ -1,18 +1,22 @@
 package com.messenger.app.ui.screen
 
+import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.DarkMode
-import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.GroupAdd
@@ -25,24 +29,35 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.util.lerp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.messenger.app.ui.components.AmbientGlow
 import com.messenger.app.ui.components.Avatar
+import com.messenger.app.ui.components.ConnectionStatusBanner
 import com.messenger.app.ui.components.GlassSurface
+import com.messenger.app.data.remote.websocket.WebSocketManager
 import com.messenger.app.ui.theme.MessengerExtendedColors
 import com.messenger.app.ui.theme.OnlineColor
-import com.messenger.app.ui.theme.ThemeState
+import com.messenger.app.ui.theme.Tokens
+import com.messenger.app.ui.theme.luxuryTween
 import com.messenger.app.ui.viewmodel.ChatListItemUi
 import com.messenger.app.ui.viewmodel.ChatViewModel
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -62,6 +77,7 @@ fun ChatListScreen(
     val listState by chatViewModel.chatListState.collectAsStateWithLifecycle()
     val sessionExpired by chatViewModel.sessionExpired.collectAsStateWithLifecycle()
     val keyTakeover by chatViewModel.keyTakeover.collectAsStateWithLifecycle()
+    val connectionState by chatViewModel.connectionState.collectAsStateWithLifecycle()
 
     // The server no longer accepts our token - hand off to login instead of
     // leaving the user on a list that can never refresh.
@@ -80,9 +96,12 @@ fun ChatListScreen(
     }
 
     val dark = MessengerExtendedColors.isDark
+    val hazeState = remember { HazeState() }
     Box(modifier = Modifier.fillMaxSize()) {
     AmbientGlow(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .hazeSource(state = hazeState, zIndex = 0f),
         baseColor = MaterialTheme.colorScheme.background,
         primaryGlow = MaterialTheme.colorScheme.primary,
         secondaryGlow = if (dark) Color(0xFFA6863F) else Color(0xFF8A6A2E),
@@ -94,12 +113,6 @@ fun ChatListScreen(
                 TopAppBar(
                     title = { Text("Chats", fontWeight = FontWeight.Bold) },
                     actions = {
-                        IconButton(onClick = { ThemeState.isDarkMode = !ThemeState.isDarkMode }) {
-                            Icon(
-                                if (ThemeState.isDarkMode) Icons.Default.LightMode else Icons.Default.DarkMode,
-                                contentDescription = if (ThemeState.isDarkMode) "Switch to light mode" else "Switch to dark mode"
-                            )
-                        }
                         IconButton(onClick = onCreateGroup) {
                             Icon(Icons.Outlined.GroupAdd, contentDescription = "New group")
                         }
@@ -121,35 +134,87 @@ fun ChatListScreen(
         },
         containerColor = Color.Transparent
     ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-        if (keyTakeover) {
-            KeyTakeoverBanner(onDismiss = chatViewModel::dismissKeyTakeover)
-        }
-        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-            when {
-                listState.isLoading && listState.chats.isEmpty() -> {
-                    CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
-                }
-                listState.chats.isEmpty() -> {
-                    Text(
-                        listState.error ?: "No conversations yet",
-                        modifier = Modifier.align(Alignment.Center),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                else -> {
-                    LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        items(listState.chats, key = { it.id }) { chat ->
-                            ChatRow(
-                                chat,
-                                onClick = { onChatClick(chat.id, chat.name, chat.isGroup) },
-                                onLongClick = { menuChat = chat }
+        // Box so the connecting pill can float over the list instead of
+        // taking a row in the Column - in the flow it pushed every chat down
+        // whenever the socket reconnected.
+        // Extra room above the first chat while the connecting pill is up, so
+        // the floating pill never sits on top of a row. animateDpAsState so it
+        // eases in and out rather than snapping on every reconnect.
+        val connecting = connectionState == WebSocketManager.ConnectionState.CONNECTING ||
+            connectionState == WebSocketManager.ConnectionState.RECONNECTING
+        val connectingInset by animateDpAsState(
+            targetValue = if (connecting) 40.dp else 0.dp,
+            label = "connectingInset"
+        )
+
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            if (keyTakeover) {
+                KeyTakeoverBanner(onDismiss = chatViewModel::dismissKeyTakeover)
+            }
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .hazeSource(state = hazeState, zIndex = 1f)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(120.dp)
+                        .align(Alignment.TopCenter)
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(
+                                    Color.White.copy(alpha = if (dark) 0.06f else 0.35f),
+                                    Color.Transparent
+                                )
                             )
+                        )
+                )
+                when {
+                    listState.isLoading && listState.chats.isEmpty() -> {
+                        CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+                    }
+                    listState.chats.isEmpty() -> {
+                        Text(
+                            listState.error ?: "No conversations yet",
+                            modifier = Modifier.align(Alignment.Center),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    else -> {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            // The connecting pill floats over this list, so the
+                            // first row needs to get out from under it while it
+                            // is showing. Animated, so rows ease down and back
+                            // instead of jumping when the socket reconnects.
+                            contentPadding = PaddingValues(
+                                top = 6.dp + connectingInset,
+                                bottom = 88.dp
+                            )
+                        ) {
+                            items(listState.chats, key = { it.id }) { chat ->
+                                ChatRow(
+                                    chat,
+                                    onClick = { onChatClick(chat.id, chat.name, chat.isGroup) },
+                                    onLongClick = { menuChat = chat }
+                                )
+                            }
                         }
                     }
                 }
             }
         }
+
+            ConnectionStatusBanner(
+                state = connectionState,
+                hazeState = hazeState,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 8.dp)
+            )
         }
     }
     }
@@ -270,70 +335,260 @@ private fun KeyTakeoverBanner(onDismiss: () -> Unit) {
 @Composable
 private fun ChatRow(chat: ChatListItemUi, onClick: () -> Unit, onLongClick: () -> Unit) {
     val haptics = LocalHapticFeedback.current
-    Row(
+    val dark = MessengerExtendedColors.isDark
+    val accent = MaterialTheme.colorScheme.primary
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val scope = rememberCoroutineScope()
+
+    // Baseline glow for unread rows; press / click bloom on top of that.
+    val baseline = if (chat.unreadCount > 0) 0.42f else 0f
+    val pressAnim = remember { Animatable(baseline) }
+    var opening by remember { mutableStateOf(false) }
+    val pressInSpec = luxuryTween<Float>(durationMs = 280, easing = Tokens.Motion.easeOut)
+    val releaseSpec = luxuryTween<Float>(durationMs = 460, easing = Tokens.Motion.easeOut)
+    val openSpec = luxuryTween<Float>(durationMs = 340, easing = Tokens.Motion.easeOut)
+
+    LaunchedEffect(pressed, opening, baseline) {
+        if (opening) return@LaunchedEffect
+        val target = if (pressed) 1f else baseline
+        // Press-in is confident; release settles longer so the light eases out.
+        pressAnim.animateTo(target, if (pressed) pressInSpec else releaseSpec)
+    }
+
+    val amount = pressAnim.value
+    val cardShape = RoundedCornerShape(16.dp)
+    val cardColor = accent.copy(
+        alpha = lerp(
+            if (chat.unreadCount > 0) (if (dark) 0.10f else 0.08f) else 0f,
+            0.16f,
+            amount
+        )
+    )
+    val borderAlpha = lerp(
+        if (chat.unreadCount > 0) 0.22f else 0f,
+        0.40f,
+        amount
+    )
+    val scale = lerp(1f, 0.972f, amount)
+    val elevation = lerp(0f, 12f, amount).dp
+    val shadowAlpha = lerp(0f, if (dark) 0.50f else 0.16f, amount)
+    val catchLight = lerp(0f, 0.24f, amount)
+    val barAlpha = lerp(if (chat.unreadCount > 0) 0.55f else 0f, 1f, amount)
+
+    fun openChat() {
+        if (opening) return
+        opening = true
+        scope.launch {
+            // Bloom the card, then navigate so the press reads before the screen changes.
+            pressAnim.animateTo(1f, openSpec)
+            onClick()
+        }
+    }
+
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .combinedClickable(
-                onClick = onClick,
-                onLongClick = {
-                    // A long-press has no visual affordance, so confirm it
-                    // registered before the dialog appears.
-                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                    onLongClick()
-                }
-            )
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .padding(horizontal = 10.dp, vertical = 3.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                // Slight lift toward the finger so the press feels dimensional.
+                translationY = lerp(0f, -1.5f, amount)
+            }
     ) {
-        Box(modifier = Modifier.size(48.dp), contentAlignment = Alignment.BottomEnd) {
-            Avatar(name = chat.name, avatarUrl = chat.avatarUrl, size = 48.dp)
-            if (chat.isOnline) {
+        // Soft drop shadow under elevated rows - opacity tracks the press anim.
+        if (amount > 0.01f) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .offset(y = 5.dp)
+                    .padding(horizontal = 3.dp)
+                    .graphicsLayer { alpha = amount }
+                    .background(
+                        Color.Black.copy(alpha = if (dark) 0.48f else 0.14f),
+                        cardShape
+                    )
+            )
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .offset(y = 2.dp)
+                    .graphicsLayer { alpha = amount * 0.85f }
+                    .background(
+                        Color.Black.copy(alpha = if (dark) 0.24f else 0.07f),
+                        cardShape
+                    )
+            )
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .graphicsLayer { alpha = amount * 0.9f }
+                    .background(
+                        accent.copy(alpha = if (dark) 0.14f else 0.09f),
+                        RoundedCornerShape(18.dp)
+                    )
+            )
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .shadow(
+                    elevation = elevation,
+                    shape = cardShape,
+                    clip = false,
+                    ambientColor = Color.Black.copy(alpha = shadowAlpha),
+                    spotColor = Color.Black.copy(alpha = shadowAlpha * 1.15f)
+                )
+                .clip(cardShape)
+                .background(cardColor, cardShape)
+                .then(
+                    if (borderAlpha > 0.01f) Modifier.border(1.dp, accent.copy(alpha = borderAlpha), cardShape)
+                    else Modifier
+                )
+                .combinedClickable(
+                    interactionSource = interactionSource,
+                    indication = null,
+                    onClick = { openChat() },
+                    onLongClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onLongClick()
+                    }
+                )
+        ) {
+            // Top catch-light blooms with the press.
+            if (catchLight > 0.01f) {
                 Box(
                     modifier = Modifier
-                        .size(14.dp)
-                        .background(MaterialTheme.colorScheme.background, CircleShape)
-                        .padding(2.dp)
-                        .background(OnlineColor, CircleShape)
+                        .align(Alignment.TopCenter)
+                        .padding(horizontal = 12.dp, vertical = 1.dp)
+                        .fillMaxWidth()
+                        .height(1.dp)
+                        .graphicsLayer { alpha = catchLight / 0.24f }
+                        .background(Color.White.copy(alpha = catchLight), RoundedCornerShape(50))
                 )
             }
-        }
 
-        Spacer(Modifier.width(12.dp))
-
-        Column(modifier = Modifier.weight(1f)) {
-            Text(chat.name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(2.dp))
-            Text(
-                chat.lastMessage,
-                style = MaterialTheme.typography.bodyMedium,
-                color = if (chat.unreadCount > 0) MaterialTheme.colorScheme.onBackground else MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-
-        Spacer(Modifier.width(8.dp))
-
-        Column(horizontalAlignment = Alignment.End) {
-            Text(
-                chat.timestamp,
-                style = MaterialTheme.typography.labelSmall,
-                color = if (chat.unreadCount > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            if (chat.unreadCount > 0) {
-                Spacer(Modifier.height(6.dp))
+            // Accent indicator bar eases in with the press amount.
+            if (barAlpha > 0.01f) {
                 Box(
                     modifier = Modifier
-                        .background(MaterialTheme.colorScheme.primary, CircleShape)
-                        .defaultMinSize(minWidth = 20.dp, minHeight = 20.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        if (chat.unreadCount > 99) "99+" else chat.unreadCount.toString(),
-                        color = Color.White,
-                        style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        .align(Alignment.CenterStart)
+                        .padding(start = 1.dp)
+                        .width(10.dp)
+                        .height(52.dp)
+                        .graphicsLayer { alpha = barAlpha * 0.7f }
+                        .background(accent.copy(alpha = 0.32f), RoundedCornerShape(5.dp))
+                )
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(start = 5.dp)
+                        .width(3.dp)
+                        .height(44.dp)
+                        .graphicsLayer {
+                            alpha = barAlpha
+                            scaleY = lerp(0.55f, 1f, amount)
+                        }
+                        .background(accent, RoundedCornerShape(1.5.dp))
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(modifier = Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                    Box(
+                        modifier = Modifier
+                            .size(46.dp)
+                            .offset(y = 2.dp)
+                            .background(
+                                Color.Black.copy(alpha = if (dark) 0.40f else 0.12f),
+                                CircleShape
+                            )
                     )
+                    Avatar(name = chat.name, avatarUrl = chat.avatarUrl, size = 48.dp)
+                    if (chat.isOnline) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .size(18.dp)
+                                .background(OnlineColor.copy(alpha = 0.35f), CircleShape)
+                        )
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .size(14.dp)
+                                .background(MaterialTheme.colorScheme.background, CircleShape)
+                                .padding(2.dp)
+                                .background(OnlineColor, CircleShape)
+                        )
+                    }
+                }
+
+                Spacer(Modifier.width(12.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        chat.name,
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        chat.lastMessage.replace('\n', ' '),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = if (chat.unreadCount > 0) FontWeight.Medium else FontWeight.Normal,
+                        color = if (chat.unreadCount > 0) {
+                            MaterialTheme.colorScheme.onBackground
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Spacer(Modifier.width(8.dp))
+
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        chat.timestamp,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = if (chat.unreadCount > 0) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (chat.unreadCount > 0) accent else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (chat.unreadCount > 0) {
+                        Spacer(Modifier.height(8.dp))
+                        Box(contentAlignment = Alignment.Center) {
+                            Box(
+                                modifier = Modifier
+                                    .size(30.dp)
+                                    .graphicsLayer { alpha = lerp(0.7f, 1f, amount) }
+                                    .background(accent.copy(alpha = 0.32f), CircleShape)
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .background(accent, CircleShape)
+                                    .defaultMinSize(minWidth = 20.dp, minHeight = 20.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    if (chat.unreadCount > 99) "99+" else chat.unreadCount.toString(),
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

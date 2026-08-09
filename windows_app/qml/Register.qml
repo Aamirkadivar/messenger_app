@@ -29,10 +29,10 @@ Item {
 
     AmbientGlow {
         anchors.fill: parent
-        baseColor: darkMode ? "#0A0A0F" : "#FAF6EE"
+        baseColor: darkMode ? "#050403" : "#FAF6EE"
         primaryGlow: registerPage.accentColor
         secondaryGlow: darkMode ? "#A6863F" : "#8A6A2E"
-        intensity: darkMode ? 1.0 : 0.6
+        intensity: darkMode ? 0.85 : 0.65
     }
 
     // Register card
@@ -349,7 +349,7 @@ Item {
                             radius: 1.5
                             color: index < registerPage.passwordStrengthLevel
                                    ? registerPage.strengthColors[registerPage.passwordStrengthLevel - 1]
-                                   : (darkMode ? "#2A2A4A" : "#E0E0E5")
+                                   : (darkMode ? "#2A2418" : "#E0E0E5")
                             Behavior on color {
                                 enabled: !registerPage.instantThemeActive
                                 ColorAnimation { duration: 150 }
@@ -562,7 +562,7 @@ Item {
                          termsCheck.checked
                 background: Rectangle {
                     radius: 13
-                    color: !registerButton.enabled ? (darkMode ? "#2A2A4A" : "#E0E0E5")
+                    color: !registerButton.enabled ? (darkMode ? "#2A2418" : "#E0E0E5")
                            : registerMouse.pressed ? Qt.darker(registerPage.accentColor, 1.15) : (registerMouse.containsMouse ? Qt.lighter(registerPage.accentColor, 1.1) : registerPage.accentColor)
                     Behavior on color {
                         enabled: !registerPage.instantThemeActive

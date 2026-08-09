@@ -68,6 +68,7 @@ glide = "4.16.0"
 permissionLauncher = "0.3.0"
 settingsStorage = "0.7.1"
 kotlinStdlib = "2.1.0"
+haze = "1.5.0"
 
 [libraries]
 # AndroidX Core
@@ -213,6 +214,7 @@ androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version
 androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintLayout" }
 androidx-cardview = { group = "androidx.cardview", name = "cardview", version.ref = "cardView" }
 androidx-recyclerview = { group = "androidx.recyclerview", name = "recyclerview", version.ref = "recyclerView" }
+haze = { group = "dev.chrisbanes.haze", name = "haze", version.ref = "haze" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

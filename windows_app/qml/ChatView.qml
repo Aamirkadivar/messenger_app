@@ -14,18 +14,37 @@ Item {
 
     // External properties from parent
     property bool darkMode: true
-    property color bgColor: "#15152B"
-    property color surfaceColor: "#1B1B36"
-    property color textColor: "#EDEDF2"
-    property color textSecondary: "#9494AC"
+    property color bgColor: "#050403"
+    property color surfaceColor: "#0C0A08"
+    property color textColor: "#F0EAD6"
+    property color textSecondary: "#A39A8A"
     property color borderColor: Qt.rgba(1, 1, 1, 0.08)
-    property color accentColor: "#6C63FF"
-    property color myMessageBg: "#6C63FF"
-    property color theirMessageBg: "#26264A"
+    property color accentColor: "#C9A961"
+    // Deep bronze like Android SentBubbleDark - brighter champagne is the
+    // chrome accent, not the bubble fill (white text needs the darker gold).
+    property color myMessageBg: "#6B511C"
+    property color theirMessageBg: "#12100C"
     property color onlineColor: "#4CAF50"
     property string currentChatId: ""
     property string currentChatName: ""
     property string currentChatType: "direct"
+    // Brief accent flash target after clicking a reply quote.
+    property string highlightMessageId: ""
+    property int highlightNonce: 0
+    Timer {
+        id: highlightClearTimer
+        interval: 1400
+        onTriggered: {
+            chatViewRoot.highlightMessageId = ""
+            chatViewRoot.highlightNonce = 0
+        }
+    }
+    function flashMessage(messageId) {
+        if (!messageId || messageId.length === 0) return
+        chatViewRoot.highlightMessageId = messageId
+        chatViewRoot.highlightNonce += 1
+        highlightClearTimer.restart()
+    }
     property string currentChatAvatarUrl: ""
     property string otherUserId: ""
     property bool isOnline: false
@@ -127,11 +146,20 @@ Item {
             chatViewRoot.isLoadingMore = false
             chatViewRoot.scrollToUnreadOrEnd(firstUnreadIndex)
             chatService.markAsRead(chatId)
+            // Re-show any text still waiting to send (fetch clears the model).
+            chatViewRoot.rehydratePendingOutgoing()
+            chatViewRoot.flushOutgoingText()
         }
 
         function onMessageError(error) {
             console.log("[ChatView] Error:", error)
             chatViewRoot.isLoadingMore = false
+            // Leave sendStatus as pending so reconnect / flushOutgoingText can retry.
+            chatViewRoot.resetOutgoingInFlight()
+        }
+
+        function onMessageSent(chatId, message) {
+            chatViewRoot.markOutgoingSent(chatId, message)
         }
 
         // Voice notes aren't shown optimistically like text - the bubble
@@ -570,7 +598,9 @@ Item {
             // flip every one of our bubbles over to "seen".
             if (readerId === authService.currentUserId) return
             for (var i = 0; i < messagesModel.count; i++) {
-                if (messagesModel.get(i).isMine) {
+                var row = messagesModel.get(i)
+                // Only ACK'd messages can show double ticks.
+                if (row.isMine && row.sendStatus !== "pending") {
                     messagesModel.setProperty(i, "isRead", true)
                 }
             }
@@ -584,6 +614,7 @@ Item {
                 // silently skipping whatever arrived during the outage.
                 chatService.fetchMessages(chatViewRoot.currentChatId)
             }
+            chatViewRoot.flushOutgoingText()
         }
 
         function onPresenceChanged(userId, online) {
@@ -958,8 +989,8 @@ Item {
                 anchors.fill: parent
                 baseColor: chatViewRoot.bgColor
                 primaryGlow: chatViewRoot.accentColor
-                secondaryGlow: Qt.darker(chatViewRoot.accentColor, 1.6)
-                intensity: chatViewRoot.darkMode ? 0.7 : 0.4
+                secondaryGlow: chatViewRoot.darkMode ? "#A6863F" : "#8A6A2E"
+                intensity: chatViewRoot.darkMode ? 0.75 : 0.55
             }
 
             ChatBackground {
@@ -981,7 +1012,10 @@ Item {
             clip: true
             spacing: 2
             model: messagesModel
-            pressDelay: 150
+            // Zero so nested reply-quote / media taps are not eaten by the
+            // Flickable's press-delay (a quick tap never reaches the child).
+            // Drag-to-scroll still works via the drag threshold.
+            pressDelay: 0
             boundsBehavior: Flickable.StopAtBounds
             flickableDirection: Flickable.VerticalFlick
             // More allocated delegates → less wild contentHeight estimates
@@ -1061,6 +1095,11 @@ Item {
                     // call would reveal the old, smaller bounds.
                     selectionMode: chatViewRoot.selectionMode
                     selected: chatViewRoot.isSelected(model.messageId)
+                    flashHighlight: model.messageId.length > 0
+                                    && model.messageId === chatViewRoot.highlightMessageId
+                    flashNonce: (model.messageId.length > 0
+                                 && model.messageId === chatViewRoot.highlightMessageId)
+                                ? chatViewRoot.highlightNonce : 0
                     onToggleSelected: chatViewRoot.toggleSelection(model.messageId)
                     onRequestDelete: {
                         // In selection mode a right-click just adds to the
@@ -1112,6 +1151,7 @@ Item {
                     messageTime: model.messageTime
                     isMine: model.isMine
                     isRead: model.isRead
+                    sendStatus: model.sendStatus || "sent"
                     senderName: model.senderName
                     showSender: model.showSender
                     myMessageBg: chatViewRoot.myMessageBg
@@ -1144,7 +1184,10 @@ Item {
                         var r = chatViewRoot.resolveReplyFields(model.replyToId || "")
                         return r.available
                     }
-                    onReplyQuoteClicked: chatViewRoot.jumpToMessage(model.replyToId || "")
+                    onReplyQuoteClicked: {
+                        // Pure local scroll — never gated on websocket / replyAvailable.
+                        chatViewRoot.jumpToMessage(model.replyToId || "")
+                    }
                     // Restored from the model, so a recycled delegate comes
                     // back expanded - see onTextExpandToggled above.
                     textExpanded: model.textExpanded === true
@@ -1745,7 +1788,7 @@ Item {
                     radius: 21
                     property bool canSend: messageInput.text.trim().length > 0
                     color: voiceService.isRecording ? "#E74C3C"
-                           : !canSend ? (sendMouse.containsMouse ? (darkMode ? "#33335A" : "#D6D6DC") : (darkMode ? "#2A2A4A" : "#E0E0E5"))
+                           : !canSend ? (sendMouse.containsMouse ? (darkMode ? "#3A3222" : "#D6D6DC") : (darkMode ? "#2A2418" : "#E0E0E5"))
                            : sendMouse.pressed ? Qt.darker(chatViewRoot.myMessageBg, 1.15) : (sendMouse.containsMouse ? Qt.lighter(chatViewRoot.myMessageBg, 1.08) : chatViewRoot.myMessageBg)
                     Behavior on color {
                         enabled: !chatViewRoot.instantThemeActive
@@ -1756,11 +1799,12 @@ Item {
                         if (!canSend) return
                         var text = messageInput.text.trim()
                         var replyId = chatViewRoot.pendingReplyId
+                        var localId = "local-" + Date.now()
                         chatViewRoot.addMessage(authService.currentUserId, "Me", text, chatViewRoot.formatTime(new Date().toISOString()), true, false,
-                                                 "", 0, false, "", "", "", 0, "",
+                                                 "", 0, false, localId, "", "", 0, "",
                                                  "", false, 0, false, "", replyId)
-                        chatService.sendMessage(chatViewRoot.currentChatId, text, chatViewRoot.currentChatType)
-                        chatViewRoot.sendMessage(text)
+                        chatViewRoot.queueOutgoingText(localId, chatViewRoot.currentChatId, text,
+                                                       chatViewRoot.currentChatType, replyId)
                         chatViewRoot.clearReply()
                         messageInput.text = ""
                     }
@@ -1984,11 +2028,132 @@ Item {
         chatService.pendingReplyToId = ""
     }
 
+    // Outgoing text waiting for a live connection / successful ACK.
+    property var pendingOutgoing: []
+
+    function queueOutgoingText(localId, chatId, text, chatType, replyToId) {
+        var q = chatViewRoot.pendingOutgoing.slice()
+        q.push({
+            localId: localId,
+            chatId: chatId,
+            text: text,
+            chatType: chatType || "direct",
+            replyToId: replyToId || "",
+            inFlight: false
+        })
+        chatViewRoot.pendingOutgoing = q
+        chatViewRoot.flushOutgoingText()
+    }
+
+    function resetOutgoingInFlight() {
+        var q = chatViewRoot.pendingOutgoing.slice()
+        for (var i = 0; i < q.length; i++) q[i].inFlight = false
+        chatViewRoot.pendingOutgoing = q
+    }
+
+    function flushOutgoingText() {
+        if (typeof websocketService === "undefined" || !websocketService) return
+        if (websocketService.connectionState !== "connected") return
+        var q = chatViewRoot.pendingOutgoing
+        if (!q || q.length === 0) return
+        var item = null
+        for (var i = 0; i < q.length; i++) {
+            if (!q[i].inFlight) { item = q[i]; break }
+        }
+        if (!item) return
+        item.inFlight = true
+        chatViewRoot.pendingOutgoing = q.slice()
+        if (item.replyToId && item.replyToId.length > 0)
+            chatService.pendingReplyToId = item.replyToId
+        else
+            chatService.pendingReplyToId = ""
+        chatService.sendMessage(item.chatId, item.text, item.chatType)
+    }
+
+    function markOutgoingSent(chatId, message) {
+        var content = message.content || message.messageText || ""
+        var serverId = message.id || ""
+        // Prefer matching the head of the queue for this chat.
+        var q = chatViewRoot.pendingOutgoing.slice()
+        var matchedLocal = ""
+        for (var i = 0; i < q.length; i++) {
+            if (q[i].chatId === chatId && q[i].text === content) {
+                matchedLocal = q[i].localId
+                q.splice(i, 1)
+                break
+            }
+        }
+        if (matchedLocal.length === 0 && q.length > 0 && q[0].chatId === chatId && q[0].inFlight) {
+            matchedLocal = q[0].localId
+            q.splice(0, 1)
+        }
+        chatViewRoot.pendingOutgoing = q
+
+        if (chatId === chatViewRoot.currentChatId) {
+            for (var j = 0; j < messagesModel.count; j++) {
+                var row = messagesModel.get(j)
+                if (!row.isMine || row.sendStatus !== "pending") continue
+                if ((matchedLocal.length > 0 && row.messageId === matchedLocal) ||
+                    (matchedLocal.length === 0 && row.messageText === content)) {
+                    if (serverId.length > 0)
+                        messagesModel.setProperty(j, "messageId", serverId)
+                    messagesModel.setProperty(j, "sendStatus", "sent")
+                    messagesModel.setProperty(j, "isRead", false)
+                    break
+                }
+            }
+        }
+        chatViewRoot.flushOutgoingText()
+    }
+
+    function rehydratePendingOutgoing() {
+        if (!chatViewRoot.currentChatId) return
+        var q = chatViewRoot.pendingOutgoing || []
+        for (var i = 0; i < q.length; i++) {
+            var item = q[i]
+            if (item.chatId !== chatViewRoot.currentChatId) continue
+            var exists = false
+            for (var j = 0; j < messagesModel.count; j++) {
+                if (messagesModel.get(j).messageId === item.localId) { exists = true; break }
+            }
+            if (exists) continue
+            item.inFlight = false
+            chatViewRoot.addMessage(authService.currentUserId, "Me", item.text,
+                                    chatViewRoot.formatTime(new Date().toISOString()), true, false,
+                                    "", 0, false, item.localId, "", "", 0, "",
+                                    "", false, 0, false, "", item.replyToId || "")
+        }
+        chatViewRoot.pendingOutgoing = q.slice()
+    }
+
     function jumpToMessage(messageId) {
         if (!messageId || messageId.length === 0) return
         for (var i = 0; i < messagesModel.count; i++) {
             if (messagesModel.get(i).messageId === messageId) {
-                smoothRevealIndex(i)
+                // Always flash — including when the parent is already on screen
+                // and no scroll is needed.
+                chatViewRoot.flashMessage(messageId)
+                // Prefer Beginning so the quoted message lands near the top of
+                // the viewport rather than barely scraping into Contain.
+                if (messagesListView.dragging || messagesListView.flicking) {
+                    messagesListView.positionViewAtIndex(i, ListView.Beginning)
+                    return
+                }
+                var from = messagesListView.contentY
+                messagesListView.positionViewAtIndex(i, ListView.Beginning)
+                var to = messagesListView.contentY
+                if (Math.abs(to - from) < 1) {
+                    // Already positioned - nudge with Contain as a fallback so
+                    // a partially off-screen row still gets revealed.
+                    messagesListView.positionViewAtIndex(i, ListView.Contain)
+                    to = messagesListView.contentY
+                }
+                if (Math.abs(to - from) < 1) return
+                messagesListView.contentY = from
+                revealScrollAnim.stop()
+                revealScrollAnim.from = from
+                revealScrollAnim.to = to
+                revealScrollAnim.start()
                 return
             }
         }
@@ -2035,6 +2200,9 @@ Item {
             messageTime: time,
             isMine: isMine,
             isRead: isRead === true,
+            // Clock until the server ACKs; history / media with real ids are sent.
+            sendStatus: (isMine && (!messageId || ("" + messageId).indexOf("local-") === 0))
+                        ? "pending" : "sent",
             showSender: showSender,
             voiceUrl: fileUrl || "",
             voiceDurationMs: fileDurationMs || 0,
@@ -2210,6 +2378,7 @@ Item {
             messageTime: "",
             isMine: false,
             isRead: false,
+            sendStatus: "sent",
             showSender: false,
             voiceUrl: "",
             voiceDurationMs: 0,

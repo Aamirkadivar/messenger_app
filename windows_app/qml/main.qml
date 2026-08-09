@@ -30,43 +30,45 @@ ApplicationWindow {
     // otherwise a hovered element animates through the full dark<->light
     // jump instead of just snapping, which reads as a jarring flash.
     property bool instantTheme: false
-    // Both themes share one luxury palette now: warm ivory/cream in light
-    // mode, near-black in dark mode, and the same champagne-gold family as
-    // the accent (deepened to a bronze-gold in light mode for contrast on a
-    // pale background) instead of the old flat purple.
+    // Both themes share one luxury palette: warm ivory/cream in light mode,
+    // near-black in dark mode, champagne-gold as the main brand colour
+    // (bronze-gold in light mode for contrast on pale backgrounds).
     property string accentColor: darkMode ? "#C9A961" : "#A6803A"
     property bool isLoggedIn: authService.isLoggedIn
 
-    // Colors
-    property color bgColor: darkMode ? "#0A0A0F" : "#FAF6EE"
-    property color surfaceColor: darkMode ? "#14141F" : "#FFFFFF"
-    // A translucent tint rather than a flat hex: a fixed light hex like
-    // #F0F0F2 sits only a few RGB units from bgColor/surfaceColor, so the
-    // hover highlight was nearly invisible. A tint reliably darkens whatever
-    // it's layered over instead - warm-toned to match the rest of the palette.
-    property color surfaceColorHover: darkMode ? "#1E1E2C" : Qt.rgba(43/255, 36/255, 24/255, 0.06)
+    // Colors - dark mode stays deep near-black; glass plates float over glow.
+    property color bgColor: darkMode ? "#050403" : "#FAF6EE"
+    property color surfaceColor: darkMode ? "#0C0A08" : "#FFFFFF"
+    property color surfaceColorHover: darkMode ? "#16120E" : Qt.rgba(43/255, 36/255, 24/255, 0.06)
     property color primaryColor: darkMode ? "#C9A961" : "#A6803A"
     property color primaryColorDark: darkMode ? "#A6863F" : "#8A6A2E"
     property color textColor: darkMode ? "#F0EAD6" : "#2B2418"
-    property color textSecondary: darkMode ? "#A39A8A" : "#7A6F5C"
-    property color borderColor: darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0"
+    property color textSecondary: darkMode ? "#9A9180" : "#7A6F5C"
+    property color borderColor: darkMode ? Qt.rgba(1, 1, 1, 0.12) : "#E6DFD0"
     property color onlineColor: "#4CAF50"
     property color offlineColor: "#9E9E9E"
-    // Deep bronze-gold bubbles in both themes - dark enough to keep white
-    // bubble text readable, unlike the brighter champagne accent above.
-    property color myMessageBg: darkMode ? "#7A5C22" : "#A6803A"
-    property color theirMessageBg: darkMode ? "#1C1C2A" : "#F1EBDD"
+    // Deep bronze-gold bubbles - darker than chrome accent so white text reads.
+    property color myMessageBg: darkMode ? "#6B511C" : "#A6803A"
+    property color theirMessageBg: darkMode ? "#12100C" : "#F1EBDD"
 
     flags: Qt.FramelessWindowHint | Qt.Window
 
-    // Ambient colour behind every glass surface in the app - see AmbientGlow
-    // for why this is painted rather than a real-time blur of content.
+    // Scene captured by FrostedScrim's MultiEffect GPU blur (must not include
+    // the Popup Overlay, or blur would recurse into itself).
+    property alias blurSource: frostedBlurSource
+
+    Item {
+        id: frostedBlurSource
+        anchors.fill: parent
+
+    // Ambient colour behind every glass surface - restrained in dark mode so
+    // panels stay dark while still catching a liquid gold glow at the edges.
     AmbientGlow {
         anchors.fill: parent
         baseColor: appRoot.bgColor
         primaryGlow: appRoot.accentColor
         secondaryGlow: appRoot.primaryColorDark
-        intensity: appRoot.darkMode ? 1.0 : 0.6
+        intensity: appRoot.darkMode ? 0.85 : 0.7
     }
 
     Item {
@@ -195,61 +197,7 @@ ApplicationWindow {
                     // dialog) - having a second, unconfirmed logout icon
                     // sitting directly beside the window's Close button was
                     // one accidental misclick away from signing the user out.
-
-                    // Theme toggle
-                    Rectangle {
-                        Layout.preferredWidth: 36
-                        Layout.preferredHeight: 36
-                        radius: 8
-                        color: themeMouse.containsPress ? appRoot.borderColor : (themeMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
-                        Behavior on color {
-                            enabled: !appRoot.instantTheme
-                            ColorAnimation { duration: 100 }
-                        }
-
-                        Canvas {
-                            anchors.centerIn: parent
-                            width: 16
-                            height: 16
-                            onPaint: {
-                                var ctx = getContext("2d")
-                                ctx.reset()
-                                ctx.strokeStyle = appRoot.textSecondary
-                                ctx.fillStyle = appRoot.textSecondary
-                                ctx.lineWidth = 1.4
-                                if (appRoot.darkMode) {
-                                    // sun
-                                    ctx.beginPath(); ctx.arc(8, 8, 3.2, 0, Math.PI * 2); ctx.fill()
-                                    for (var i = 0; i < 8; i++) {
-                                        var a = i * Math.PI / 4
-                                        var x1 = 8 + Math.cos(a) * 5.5, y1 = 8 + Math.sin(a) * 5.5
-                                        var x2 = 8 + Math.cos(a) * 7.2, y2 = 8 + Math.sin(a) * 7.2
-                                        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke()
-                                    }
-                                } else {
-                                    // moon
-                                    ctx.beginPath()
-                                    ctx.arc(8, 8, 6, 0, Math.PI * 2)
-                                    ctx.fill()
-                                    ctx.globalCompositeOperation = "destination-out"
-                                    ctx.beginPath()
-                                    ctx.arc(11, 5.5, 5.2, 0, Math.PI * 2)
-                                    ctx.fill()
-                                }
-                            }
-                        }
-                        MouseArea {
-                            id: themeMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                appRoot.instantTheme = true
-                                appRoot.darkMode = !appRoot.darkMode
-                                Qt.callLater(function() { appRoot.instantTheme = false })
-                            }
-                        }
-                    }
+                    // Theme toggle also lives in Settings only.
 
                     // Minimize
                     Rectangle {
@@ -750,6 +698,7 @@ ApplicationWindow {
             }
         }
     }
+    } // frostedBlurSource — Overlay/popups and chrome below stay outside the blur capture
 
     // Resize handles - a frameless window has no native resize border, so we
     // provide thin edge/corner hit-regions that hand off to the OS's own

@@ -13,7 +13,7 @@ Item {
     property bool darkMode: true
     property color accentColor: "#C9A961"
 
-    readonly property color bgColor: darkMode ? "#0A0A0F" : "#FAF6EE"
+    readonly property color bgColor: darkMode ? "#050403" : "#FAF6EE"
     readonly property color textColor: darkMode ? "#F0EAD6" : "#2B2418"
     readonly property color textSecondary: darkMode ? "#A39A8A" : "#7A6F5C"
     readonly property color errorColor: "#FF6B6B"
@@ -421,7 +421,7 @@ Item {
             CallActionButton {
                 glyph: callService.isMuted ? "🔇" : "🎤"
                 label: callService.isMuted ? "Unmute" : "Mute"
-                bgColor: callService.isMuted ? root.accentColor : (root.darkMode ? "#26264A" : "#EDEDF2")
+                bgColor: callService.isMuted ? root.accentColor : (root.darkMode ? "#12100C" : "#F0EAD6")
                 glyphColor: callService.isMuted ? "#FFFFFF" : root.textColor
                 size: 56
                 onClicked: callService.toggleMute()
@@ -430,7 +430,7 @@ Item {
                 visible: callService.isVideoCall
                 glyph: callService.cameraOn ? "🎥" : "🚫"
                 label: callService.cameraOn ? "Camera" : "Cam off"
-                bgColor: callService.cameraOn ? (root.darkMode ? "#26264A" : "#EDEDF2") : root.accentColor
+                bgColor: callService.cameraOn ? (root.darkMode ? "#12100C" : "#F0EAD6") : root.accentColor
                 glyphColor: callService.cameraOn ? root.textColor : "#FFFFFF"
                 size: 56
                 onClicked: callService.toggleCamera()

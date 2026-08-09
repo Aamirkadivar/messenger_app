@@ -126,6 +126,7 @@ dependencies {
     implementation(libs.bundles.compose)
     debugImplementation(libs.bundles.compose.debug)
     implementation(libs.androidx.compose.material.icons.extended)
+    implementation(libs.haze)
 
     // Navigation
     implementation(libs.androidx.navigation.compose)

@@ -15,7 +15,7 @@ import QtQuick 2.15
 Item {
     id: root
 
-    property color baseColor: "#0A0A0F"
+    property color baseColor: "#050403"
     property color primaryGlow: "#C9A961"
     property color secondaryGlow: "#7A5C22"
     property real intensity: 1.0
@@ -36,6 +36,7 @@ Item {
             function blob(cx, cy, r, color, alpha) {
                 var grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
                 grad.addColorStop(0, Qt.rgba(color.r, color.g, color.b, alpha))
+                grad.addColorStop(0.55, Qt.rgba(color.r, color.g, color.b, alpha * 0.35))
                 grad.addColorStop(1, Qt.rgba(color.r, color.g, color.b, 0))
                 ctx.fillStyle = grad
                 ctx.beginPath()
@@ -43,12 +44,16 @@ Item {
                 ctx.fill()
             }
 
-            blob(width * 0.18, height * 0.08, Math.max(width, height) * 0.42,
-                 root.primaryGlow, 0.16 * root.intensity)
-            blob(width * 0.92, height * 0.55, Math.max(width, height) * 0.34,
-                 root.secondaryGlow, 0.12 * root.intensity)
-            blob(width * 0.35, height * 1.02, Math.max(width, height) * 0.30,
-                 root.primaryGlow, 0.08 * root.intensity)
+            // Softer, larger blooms so glass panels catch light at edges
+            // without flooding the darker dark-mode base.
+            blob(width * 0.12, height * 0.0, Math.max(width, height) * 0.48,
+                 root.primaryGlow, 0.14 * root.intensity)
+            blob(width * 0.95, height * 0.48, Math.max(width, height) * 0.38,
+                 root.secondaryGlow, 0.10 * root.intensity)
+            blob(width * 0.42, height * 1.05, Math.max(width, height) * 0.36,
+                 root.primaryGlow, 0.07 * root.intensity)
+            blob(width * 0.7, height * 0.12, Math.max(width, height) * 0.22,
+                 root.primaryGlow, 0.06 * root.intensity)
         }
 
         onWidthChanged: requestPaint()

@@ -11,7 +11,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Find required Qt6 modules
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Qml Quick QuickControls2 Network Sql Multimedia)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Qml Quick QuickControls2 QuickEffects Network Sql Multimedia)
 
 # Qt6 Base Path Configuration
 # Primary: D:/qt, fallback to common locations
@@ -119,6 +119,7 @@ set(PROJECT_QML
     qml/Settings.qml
     qml/Avatar.qml
     qml/GlassPanel.qml
+    qml/FrostedScrim.qml
     qml/AmbientGlow.qml
     qml/CallOverlay.qml
     qml/CallActionButton.qml
@@ -148,6 +149,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::Qml
     Qt6::Quick
     Qt6::QuickControls2
+    Qt6::QuickEffects
     Qt6::Network
     Qt6::Sql
     Qt6::Multimedia

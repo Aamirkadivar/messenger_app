@@ -13,6 +13,7 @@
         <file>../qml/Settings.qml</file>
         <file>../qml/Avatar.qml</file>
         <file>../qml/GlassPanel.qml</file>
+        <file>../qml/FrostedScrim.qml</file>
         <file>../qml/AmbientGlow.qml</file>
         <file>../qml/CallOverlay.qml</file>
         <file>../qml/RoundVideoOverlay.qml</file>

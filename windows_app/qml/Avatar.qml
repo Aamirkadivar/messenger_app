@@ -12,7 +12,7 @@ Item {
     property int size: 40
     // Stable per-name colour, so the same person keeps the same fallback
     // colour everywhere they appear.
-    readonly property var palette: ["#6C63FF", "#4CAF50", "#FF9800", "#E91E63", "#9C27B0", "#00BCD4", "#FF5722", "#795548", "#607D8B", "#3F51B5"]
+    readonly property var palette: ["#C9A961", "#A6803A", "#7A5C22", "#4CAF50", "#FF9800", "#E07A5F", "#00A896", "#795548", "#A39A8A", "#5C4A20"]
     readonly property color fallbackColor: {
         if (!name || name.length === 0) return palette[0]
         var hash = 0

@@ -7,38 +7,44 @@ Popup {
     id: settingsRoot
 
     property bool darkMode: true
-    property color bgColor: "#15152B"
-    property color surfaceColor: "#1B1B36"
-    property color surfaceColorHover: "#22224A"
-    property color textColor: "#EDEDF2"
-    property color textSecondary: "#9494AC"
-    property color borderColor: Qt.rgba(1, 1, 1, 0.08)
-    property color accentColor: "#6C63FF"
+    property color bgColor: "#050403"
+    property color surfaceColor: "#0C0A08"
+    property color surfaceColorHover: "#16120E"
+    property color textColor: "#F0EAD6"
+    property color textSecondary: "#A39A8A"
+    property color borderColor: Qt.rgba(1, 1, 1, 0.12)
+    property color accentColor: "#C9A961"
 
-    // The "off" state of a toggle still needs to read as neutral/inactive,
-    // but a flat iOS-grey (#8E8E93) clashes with the rest of the app's warm
-    // ivory/bronze palette - this stays in the same warm family instead.
-    readonly property color toggleOffColor: darkMode ? "#4A4438" : "#D9CFB8"
+    readonly property color toggleOffColor: darkMode ? "#2A261F" : "#D9CFB8"
+    readonly property color panelHoverColor: darkMode ? "#16120E" : surfaceColorHover
 
-    // Row hover tint - the panel's own background is GlassPanel now (see
-    // `background:` below), which sidesteps the cool blue-leaning cast the
-    // shared surfaceColor had at full opacity; this only needs to stay in
-    // the same warm family for the smaller hover highlight.
-    readonly property color panelHoverColor: darkMode ? "#221E15" : surfaceColorHover
+    // Match Android Tokens.Type: serif for screen/section titles, sans for rows.
+    readonly property string displayFont: "Georgia"
+    readonly property string bodyFont: "Segoe UI"
 
     signal darkModeToggled()
     signal logoutRequested()
 
     property string cacheSizeText: "…"
 
-    modal: true
+    // Modeless so the Overlay does not steal the title-bar strip: drag /
+    // minimize / maximize / close keep working (same idea as CallOverlay).
+    // Scrim dim + outside-click-to-close live in Overlay.modeless below the
+    // 44px custom title bar; the scrim MouseArea also blocks hover behind.
+    modal: false
+    dim: false
     focus: true
-    width: 380
-    height: 600
+    width: 400
+    height: 680
     x: (parent ? parent.width - width : 0) / 2
     y: (parent ? parent.height - height : 0) / 2
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
     padding: 0
+
+    Overlay.modeless: FrostedScrim {
+        darkMode: settingsRoot.darkMode
+        onDismissed: settingsRoot.close()
+    }
 
     onOpened: refreshCacheSize()
 
@@ -52,7 +58,8 @@ Popup {
 
     background: GlassPanel {
         darkMode: settingsRoot.darkMode
-        radius: 12
+        elevated: true
+        radius: 16
     }
 
     FileDialog {
@@ -73,14 +80,17 @@ Popup {
 
         RowLayout {
             Layout.fillWidth: true
-            Layout.margins: 16
+            Layout.leftMargin: 24
+            Layout.rightMargin: 24
+            Layout.topMargin: 20
             Layout.bottomMargin: 8
 
             Text {
                 Layout.fillWidth: true
                 text: "Settings"
-                font.pixelSize: 17
-                font.bold: true
+                font.family: settingsRoot.displayFont
+                font.pixelSize: 20
+                font.weight: Font.Medium
                 color: settingsRoot.textColor
             }
 
@@ -89,7 +99,13 @@ Popup {
                 Layout.preferredHeight: 28
                 radius: 14
                 color: closeSettingsMouse.containsMouse ? settingsRoot.panelHoverColor : "transparent"
-                Text { anchors.centerIn: parent; text: "✕"; font.pixelSize: 13; color: settingsRoot.textSecondary }
+                Text {
+                    anchors.centerIn: parent
+                    text: "✕"
+                    font.family: settingsRoot.bodyFont
+                    font.pixelSize: 13
+                    color: settingsRoot.textSecondary
+                }
                 MouseArea {
                     id: closeSettingsMouse
                     anchors.fill: parent
@@ -176,14 +192,16 @@ Popup {
                     Text {
                         anchors.horizontalCenter: parent.horizontalCenter
                         text: authService.currentUsername || "User"
-                        font.pixelSize: 18
-                        font.bold: true
+                        font.family: settingsRoot.displayFont
+                        font.pixelSize: 20
+                        font.weight: Font.Medium
                         color: settingsRoot.textColor
                     }
 
                     Text {
                         anchors.horizontalCenter: parent.horizontalCenter
                         text: authService.currentUserEmail || ""
+                        font.family: settingsRoot.bodyFont
                         font.pixelSize: 13
                         color: settingsRoot.textSecondary
                     }
@@ -194,58 +212,78 @@ Popup {
                         width: parent.width - 40
                         horizontalAlignment: Text.AlignHCenter
                         text: ""
-                        font.pixelSize: 12
+                        font.family: settingsRoot.bodyFont
+                        font.pixelSize: 13
                         color: "#E74C3C"
                         wrapMode: Text.WordWrap
                         visible: text.length > 0
                     }
                 }
 
-                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+                Rectangle { Layout.fillWidth: true; Layout.leftMargin: 24; Layout.rightMargin: 24; height: 1; color: settingsRoot.borderColor }
+
+                // Section header - serif like Android Tokens.Type.sectionHeader
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 28
+                    Layout.leftMargin: 24
+                    Layout.rightMargin: 24
+                    Layout.bottomMargin: 4
+                    Text {
+                        text: "Display"
+                        font.family: settingsRoot.displayFont
+                        font.pixelSize: 20
+                        font.weight: Font.Medium
+                        color: settingsRoot.textColor
+                    }
+                }
 
                 // ---- Dark mode ----
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 60
+                    height: 64
                     color: darkModeMouse.containsMouse ? settingsRoot.panelHoverColor : "transparent"
 
                     RowLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 16
-                        anchors.rightMargin: 16
+                        anchors.leftMargin: 24
+                        anchors.rightMargin: 24
                         spacing: 14
 
                         ColumnLayout {
-                            // Same reason as the toggle below: unaligned Layout
-                            // children stretch to the row height, which spreads
-                            // the title/subtitle apart instead of keeping the
-                            // pair centred against the control opposite them.
                             Layout.alignment: Qt.AlignVCenter
                             Layout.fillWidth: true
-                            // Anchor the flex basis at 0 so a long subtitle
-                            // cannot inflate this column and push the control
-                            // beside it out of line (or off the panel).
                             Layout.preferredWidth: 0
                             spacing: 2
-                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Dark Mode"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
-                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: settingsRoot.darkMode ? "On" : "Off"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                            Text {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: "Dark Mode"
+                                font.family: settingsRoot.bodyFont
+                                font.pixelSize: 16
+                                color: settingsRoot.textColor
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: settingsRoot.darkMode ? "On" : "Off"
+                                font.family: settingsRoot.bodyFont
+                                font.pixelSize: 13
+                                color: settingsRoot.textSecondary
+                            }
                         }
 
                         Rectangle {
-                            // Without an explicit alignment a Layout child is
-                            // stretched to fill its cell, so this 26px track
-                            // grew to the full 60px row height - a tall pill
-                            // with the knob stranded near the top.
                             Layout.alignment: Qt.AlignVCenter
                             Layout.preferredWidth: 46
-                            Layout.preferredHeight: 26
-                            radius: 13
+                            Layout.preferredHeight: 28
+                            radius: 14
                             color: settingsRoot.darkMode ? settingsRoot.accentColor : settingsRoot.toggleOffColor
 
                             Rectangle {
-                                width: 20
-                                height: 20
-                                radius: 10
+                                width: 22
+                                height: 22
+                                radius: 11
                                 color: "#FFFFFF"
                                 y: 3
                                 x: settingsRoot.darkMode ? parent.width - width - 3 : 3
@@ -263,51 +301,69 @@ Popup {
                     }
                 }
 
-                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+                Rectangle { Layout.fillWidth: true; Layout.leftMargin: 24; Layout.rightMargin: 24; height: 1; color: settingsRoot.borderColor }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 28
+                    Layout.leftMargin: 24
+                    Layout.rightMargin: 24
+                    Layout.bottomMargin: 4
+                    Text {
+                        text: "Notifications"
+                        font.family: settingsRoot.displayFont
+                        font.pixelSize: 20
+                        font.weight: Font.Medium
+                        color: settingsRoot.textColor
+                    }
+                }
 
                 // ---- Notifications ----
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 60
+                    height: 64
                     color: notifSettingsMouse.containsMouse ? settingsRoot.panelHoverColor : "transparent"
 
                     RowLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 16
-                        anchors.rightMargin: 16
+                        anchors.leftMargin: 24
+                        anchors.rightMargin: 24
                         spacing: 14
 
                         ColumnLayout {
-                            // Same reason as the toggle below: unaligned Layout
-                            // children stretch to the row height, which spreads
-                            // the title/subtitle apart instead of keeping the
-                            // pair centred against the control opposite them.
                             Layout.alignment: Qt.AlignVCenter
                             Layout.fillWidth: true
-                            // Anchor the flex basis at 0 so a long subtitle
-                            // cannot inflate this column and push the control
-                            // beside it out of line (or off the panel).
                             Layout.preferredWidth: 0
                             spacing: 2
-                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Notifications"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
-                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Tray pop-ups for new messages"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                            Text {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: "Notifications"
+                                font.family: settingsRoot.bodyFont
+                                font.pixelSize: 16
+                                color: settingsRoot.textColor
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: "Tray pop-ups for new messages"
+                                font.family: settingsRoot.bodyFont
+                                font.pixelSize: 13
+                                color: settingsRoot.textSecondary
+                            }
                         }
 
                         Rectangle {
-                            // Without an explicit alignment a Layout child is
-                            // stretched to fill its cell, so this 26px track
-                            // grew to the full 60px row height - a tall pill
-                            // with the knob stranded near the top.
                             Layout.alignment: Qt.AlignVCenter
                             Layout.preferredWidth: 46
-                            Layout.preferredHeight: 26
-                            radius: 13
+                            Layout.preferredHeight: 28
+                            radius: 14
                             color: trayNotifier.notificationsEnabled ? settingsRoot.accentColor : settingsRoot.toggleOffColor
 
                             Rectangle {
-                                width: 20
-                                height: 20
-                                radius: 10
+                                width: 22
+                                height: 22
+                                radius: 11
                                 color: "#FFFFFF"
                                 y: 3
                                 x: trayNotifier.notificationsEnabled ? parent.width - width - 3 : 3
@@ -325,40 +381,63 @@ Popup {
                     }
                 }
 
-                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+                Rectangle { Layout.fillWidth: true; Layout.leftMargin: 24; Layout.rightMargin: 24; height: 1; color: settingsRoot.borderColor }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 28
+                    Layout.leftMargin: 24
+                    Layout.rightMargin: 24
+                    Layout.bottomMargin: 4
+                    Text {
+                        text: "Storage and data"
+                        font.family: settingsRoot.displayFont
+                        font.pixelSize: 20
+                        font.weight: Font.Medium
+                        color: settingsRoot.textColor
+                    }
+                }
 
                 // ---- Storage ----
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 60
+                    height: 64
                     color: "transparent"
 
                     RowLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 16
-                        anchors.rightMargin: 16
+                        anchors.leftMargin: 24
+                        anchors.rightMargin: 24
                         spacing: 14
 
                         ColumnLayout {
-                            // Same reason as the toggle below: unaligned Layout
-                            // children stretch to the row height, which spreads
-                            // the title/subtitle apart instead of keeping the
-                            // pair centred against the control opposite them.
                             Layout.alignment: Qt.AlignVCenter
                             Layout.fillWidth: true
-                            // Anchor the flex basis at 0 so a long subtitle
-                            // cannot inflate this column and push the control
-                            // beside it out of line (or off the panel).
                             Layout.preferredWidth: 0
                             spacing: 2
-                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Storage"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
-                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: settingsRoot.cacheSizeText + " used for cached chats"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                            Text {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: "Storage"
+                                font.family: settingsRoot.bodyFont
+                                font.pixelSize: 16
+                                color: settingsRoot.textColor
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: settingsRoot.cacheSizeText + " used for cached chats"
+                                font.family: settingsRoot.bodyFont
+                                font.pixelSize: 13
+                                color: settingsRoot.textSecondary
+                            }
                         }
 
                         Text {
                             text: "Clear"
+                            font.family: settingsRoot.bodyFont
                             font.pixelSize: 13
-                            font.weight: Font.DemiBold
+                            font.weight: Font.Medium
                             color: settingsRoot.accentColor
                             MouseArea {
                                 anchors.fill: parent
@@ -373,48 +452,73 @@ Popup {
                     }
                 }
 
-                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+                Rectangle { Layout.fillWidth: true; Layout.leftMargin: 24; Layout.rightMargin: 24; height: 1; color: settingsRoot.borderColor }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 28
+                    Layout.leftMargin: 24
+                    Layout.rightMargin: 24
+                    Layout.bottomMargin: 4
+                    Text {
+                        text: "About"
+                        font.family: settingsRoot.displayFont
+                        font.pixelSize: 20
+                        font.weight: Font.Medium
+                        color: settingsRoot.textColor
+                    }
+                }
 
                 // ---- About ----
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 60
+                    height: 64
                     color: "transparent"
 
                     RowLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 16
-                        anchors.rightMargin: 16
+                        anchors.leftMargin: 24
+                        anchors.rightMargin: 24
                         spacing: 14
 
                         ColumnLayout {
-                            // Same reason as the toggle below: unaligned Layout
-                            // children stretch to the row height, which spreads
-                            // the title/subtitle apart instead of keeping the
-                            // pair centred against the control opposite them.
                             Layout.alignment: Qt.AlignVCenter
                             Layout.fillWidth: true
-                            // Anchor the flex basis at 0 so a long subtitle
-                            // cannot inflate this column and push the control
-                            // beside it out of line (or off the panel).
                             Layout.preferredWidth: 0
                             spacing: 2
-                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "About"; font.pixelSize: 14; font.weight: Font.DemiBold; color: settingsRoot.textColor }
-                            Text { Layout.fillWidth: true; elide: Text.ElideRight; text: "Messenger for Windows — version 1.0.0"; font.pixelSize: 12; color: settingsRoot.textSecondary }
+                            Text {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: "Version"
+                                font.family: settingsRoot.bodyFont
+                                font.pixelSize: 16
+                                color: settingsRoot.textColor
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: "Messenger for Windows — 1.0.0"
+                                font.family: settingsRoot.bodyFont
+                                font.pixelSize: 13
+                                color: settingsRoot.textSecondary
+                            }
                         }
                     }
                 }
 
-                Item { Layout.preferredHeight: 8 }
+                Item { Layout.preferredHeight: 16 }
 
-                Rectangle { Layout.fillWidth: true; height: 1; color: settingsRoot.borderColor }
+                Rectangle { Layout.fillWidth: true; Layout.leftMargin: 24; Layout.rightMargin: 24; height: 1; color: settingsRoot.borderColor }
 
                 // ---- Logout ----
                 Rectangle {
                     Layout.fillWidth: true
-                    Layout.margins: 16
-                    height: 42
-                    radius: 11
+                    Layout.leftMargin: 24
+                    Layout.rightMargin: 24
+                    Layout.topMargin: 16
+                    Layout.bottomMargin: 24
+                    height: 48
+                    radius: 12
                     color: settingsLogoutMouse.containsMouse ? Qt.rgba(231/255, 76/255, 60/255, 0.15) : "transparent"
                     border.color: "#E74C3C"
                     border.width: 1
@@ -422,8 +526,9 @@ Popup {
                     Text {
                         anchors.centerIn: parent
                         text: "Log out"
-                        font.pixelSize: 13
-                        font.weight: Font.DemiBold
+                        font.family: settingsRoot.bodyFont
+                        font.pixelSize: 16
+                        font.weight: Font.Medium
                         color: "#E74C3C"
                     }
 

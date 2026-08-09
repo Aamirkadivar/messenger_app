@@ -6,24 +6,31 @@ Popup {
     id: newChatDialog
 
     property bool darkMode: true
-    property color bgColor: "#15152B"
-    property color surfaceColor: "#1B1B36"
-    property color surfaceColorHover: "#22224A"
-    property color textColor: "#EDEDF2"
-    property color textSecondary: "#9494AC"
+    property color bgColor: "#050403"
+    property color surfaceColor: "#0C0A08"
+    property color surfaceColorHover: "#16120E"
+    property color textColor: "#F0EAD6"
+    property color textSecondary: "#A39A8A"
     property color borderColor: Qt.rgba(1, 1, 1, 0.08)
-    property color accentColor: "#6C63FF"
+    property color accentColor: "#C9A961"
     property color onlineColor: "#4CAF50"
 
     signal userSelected(string userId, string userName)
 
-    modal: true
+    // Modeless + title-bar pass-through - see Settings.qml.
+    modal: false
+    dim: false
     focus: true
     width: 420
     height: 520
     x: (parent ? parent.width - width : 0) / 2
     y: (parent ? parent.height - height : 0) / 2
-    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    closePolicy: Popup.CloseOnEscape
+
+    Overlay.modeless: FrostedScrim {
+        darkMode: newChatDialog.darkMode
+        onDismissed: newChatDialog.close()
+    }
 
     onOpened: {
         searchField.text = ""
@@ -34,7 +41,8 @@ Popup {
 
     background: GlassPanel {
         darkMode: newChatDialog.darkMode
-        radius: 12
+        elevated: true
+        radius: 16
     }
 
     Connections {

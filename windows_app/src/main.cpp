@@ -51,6 +51,11 @@ static void applyRoundedCorners(QQuickWindow* window) {
 #endif
 
 int main(int argc, char* argv[]) {
+    // Prefer Direct3D 11 for Qt Quick Effects (MultiEffect blur). Must be set
+    // before QGuiApplication so the scene graph picks this RHI backend —
+    // software/OpenGL backends were why frosted glass often rendered blank.
+    qputenv("QSG_RHI_BACKEND", "d3d11");
+
     // Use the Basic style so custom background/indicator/contentItem overrides
     // throughout the QML actually apply - the native platform style silently
     // ignores them (this was the root cause of custom checkbox/button styling

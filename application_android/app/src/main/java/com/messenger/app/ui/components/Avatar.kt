@@ -22,8 +22,9 @@ import coil3.compose.SubcomposeAsyncImage
 import com.messenger.app.BuildConfig
 
 private val avatarPalette = listOf(
-    Color(0xFF6C63FF), Color(0xFF4CAF50), Color(0xFFFF9800),
-    Color(0xFFE91E63), Color(0xFF9C27B0), Color(0xFF00BCD4)
+    Color(0xFFC9A961), Color(0xFFA6803A), Color(0xFF7A5C22),
+    Color(0xFF4CAF50), Color(0xFFFF9800), Color(0xFFE07A5F),
+    Color(0xFF00A896), Color(0xFF795548), Color(0xFFA39A8A), Color(0xFF5C4A20)
 )
 
 /** Stable per-name colour, so the same person keeps the same fallback colour. */

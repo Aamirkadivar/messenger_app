@@ -8,11 +8,13 @@ Item {
     property string messageTime: ""
     property bool isMine: true
     property bool isRead: false
+    // "pending" | "sent" — pending shows a clock until the server ACKs.
+    property string sendStatus: "sent"
     property string senderName: ""
     property bool isEncrypted: true
     property bool showSender: false
     property bool darkMode: true
-    property color accentColor: "#6C63FF"
+    property color accentColor: "#C9A961"
 
     // Attachment fields, shared across voice/image/file - voiceUrl empty
     // means this is a plain text bubble. contentType picks which of the
@@ -38,6 +40,9 @@ Item {
     /** True while the chat is in multi-select. */
     property bool selectionMode: false
     property bool selected: false
+    /** Brief accent flash after jumping here from a reply quote. */
+    property bool flashHighlight: false
+    property int flashNonce: 0
     signal toggleSelected()
     /** Display-only forward attribution from the server. */
     property bool isForwarded: false
@@ -96,16 +101,16 @@ Item {
                                           && voiceService.playingMessageId === bubbleRoot.messageId
     readonly property bool isThisPlaying: bubbleRoot.isThisLoaded && voiceService.isPlaying
 
-    property color myMessageBg: "#6C63FF"
-    property color theirMessageBg: darkMode ? "#26264A" : "#EDEDF2"
+    property color myMessageBg: "#6B511C"
+    property color theirMessageBg: darkMode ? "#12100C" : "#F1EBDD"
     property color myTextColor: "#FFFFFF"
-    property color theirTextColor: darkMode ? "#EDEDF2" : "#1A1A2E"
+    property color theirTextColor: darkMode ? "#F0EAD6" : "#2B2418"
     // "Their" bubbles are glass (translucent, over ChatView's AmbientGlow);
     // "my" bubbles stay solid gold - keeps the one clear visual hierarchy a
     // chat thread needs (which side is mine) instead of two competing glass
     // surfaces that would blur together.
-    readonly property color theirGlassFill: Qt.rgba(theirMessageBg.r, theirMessageBg.g, theirMessageBg.b, darkMode ? 0.5 : 0.72)
-    readonly property color theirGlassBorder: darkMode ? Qt.rgba(1, 1, 1, 0.09) : Qt.rgba(43 / 255, 36 / 255, 24 / 255, 0.10)
+    readonly property color theirGlassFill: Qt.rgba(theirMessageBg.r, theirMessageBg.g, theirMessageBg.b, darkMode ? 0.62 : 0.72)
+    readonly property color theirGlassBorder: darkMode ? Qt.rgba(1, 1, 1, 0.12) : Qt.rgba(43 / 255, 36 / 255, 24 / 255, 0.10)
 
     property real maxWidth: parent ? parent.width * 0.68 : 400
     property real minContentWidth: 68
@@ -183,11 +188,73 @@ Item {
         z: -1
     }
 
+    // Reply-jump flash — peaks quickly then fades out while flashHighlight is set.
+    // Text bubbles get a row band behind the chrome; video notes need a ring
+    // on top of the circle (a z:-1 band is completely covered by the opaque video).
+    Item {
+        id: replyFlashRoot
+        anchors.fill: parent
+        anchors.margins: -2
+        z: -1
+        visible: opacity > 0.01
+        opacity: 0
+        SequentialAnimation on opacity {
+            id: replyFlashAnim
+            running: false
+            NumberAnimation { to: 1; duration: 120; easing.type: Easing.OutQuad }
+            PauseAnimation { duration: 700 }
+            NumberAnimation { to: 0; duration: 420; easing.type: Easing.InQuad }
+        }
+        Connections {
+            target: bubbleRoot
+            function onFlashNonceChanged() {
+                if (bubbleRoot.flashNonce > 0 && bubbleRoot.flashHighlight)
+                    replyFlashAnim.restart()
+            }
+            function onFlashHighlightChanged() {
+                if (!bubbleRoot.flashHighlight) {
+                    replyFlashAnim.stop()
+                    replyFlashRoot.opacity = 0
+                } else if (bubbleRoot.flashNonce > 0) {
+                    replyFlashAnim.restart()
+                }
+            }
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            visible: !bubbleRoot.isVideoNote
+            radius: 8
+            color: Qt.rgba(bubbleRoot.accentColor.r, bubbleRoot.accentColor.g,
+                            bubbleRoot.accentColor.b, 0.32)
+        }
+    }
+
+    // Circular highlight for round videos — must sit above the opaque circle.
+    Rectangle {
+        id: videoReplyFlash
+        visible: bubbleRoot.isVideoNote && opacity > 0.01
+        anchors.centerIn: roundVideoLoader
+        width: Math.max(1, roundVideoLoader.width) + 16
+        height: width
+        radius: width / 2
+        z: 40
+        color: Qt.rgba(bubbleRoot.accentColor.r, bubbleRoot.accentColor.g,
+                        bubbleRoot.accentColor.b, 0.28)
+        border.width: 3
+        border.color: bubbleRoot.accentColor
+        opacity: replyFlashRoot.opacity
+        // Don't steal taps meant for play / reply quote.
+        enabled: false
+    }
+
     // Right-click always available. The left button is only claimed while
     // selecting - otherwise this would swallow taps meant for the voice and
-    // video controls inside the bubble.
+    // video controls inside the bubble. Keep behind content (z: -1) so the
+    // reply-quote MouseArea and media controls receive left-clicks first.
     MouseArea {
         anchors.fill: parent
+        z: -1
         acceptedButtons: bubbleRoot.selectionMode ? (Qt.LeftButton | Qt.RightButton) : Qt.RightButton
         onClicked: function(mouse) {
             if (bubbleRoot.selectionMode && mouse.button === Qt.LeftButton) {
@@ -270,10 +337,17 @@ Item {
                 }
             }
         }
+        // Local-only jump — must work offline / when replyAvailable is still false.
         MouseArea {
             anchors.fill: parent
-            enabled: bubbleRoot.replyAvailable
+            z: 100
+            enabled: bubbleRoot.replyToId.length > 0
+            acceptedButtons: Qt.LeftButton
+            hoverEnabled: true
             cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+            preventStealing: true
+            propagateComposedEvents: false
+            onPressed: function(mouse) { mouse.accepted = true }
             onClicked: bubbleRoot.replyQuoteClicked()
         }
     }
@@ -412,10 +486,17 @@ Item {
                         }
                     }
                 }
+                // Local-only jump — must work offline / when replyAvailable is still false.
                 MouseArea {
                     anchors.fill: parent
-                    enabled: bubbleRoot.replyAvailable
-                    cursorShape: Qt.PointingHandCursor
+                    z: 100
+                    enabled: bubbleRoot.replyToId.length > 0
+                    acceptedButtons: Qt.LeftButton
+                    hoverEnabled: true
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    preventStealing: true
+                    propagateComposedEvents: false
+                    onPressed: function(mouse) { mouse.accepted = true }
                     onClicked: bubbleRoot.replyQuoteClicked()
                 }
             }
@@ -772,29 +853,53 @@ Item {
                     Canvas {
                         id: checkmarkCanvas
                         y: (parent.height - height) / 2
-                        width: 14
+                        width: bubbleRoot.sendStatus === "pending" ? 12 : 14
                         height: 10
                         visible: bubbleRoot.isMine
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.reset()
-                            // Grey = sent but not yet seen; gold = the other
-                            // person has read it (matches the accent in both themes).
-                            ctx.strokeStyle = bubbleRoot.isRead ? (darkMode ? "#C9A961" : "#A6803A") : "rgba(255,255,255,0.75)"
-                            ctx.lineWidth = 1.4
                             ctx.lineCap = "round"
                             ctx.lineJoin = "round"
-                            ctx.beginPath()
-                            ctx.moveTo(0, 5); ctx.lineTo(3, 8); ctx.lineTo(8, 2)
-                            ctx.stroke()
-                            ctx.beginPath()
-                            ctx.moveTo(5, 5); ctx.lineTo(8, 8); ctx.lineTo(14, 1)
-                            ctx.stroke()
+                            if (bubbleRoot.sendStatus === "pending") {
+                                // Clock: waiting to reach the server.
+                                ctx.strokeStyle = "rgba(255,255,255,0.75)"
+                                ctx.lineWidth = 1.3
+                                ctx.beginPath()
+                                ctx.arc(6, 5, 4.2, 0, Math.PI * 2)
+                                ctx.stroke()
+                                ctx.beginPath()
+                                ctx.moveTo(6, 5)
+                                ctx.lineTo(6, 2.8)
+                                ctx.moveTo(6, 5)
+                                ctx.lineTo(8.2, 5.8)
+                                ctx.stroke()
+                                return
+                            }
+                            // Single tick = sent; double gold = read.
+                            // Never double-tick a message that is still pending.
+                            ctx.strokeStyle = bubbleRoot.isRead
+                                              ? (darkMode ? "#C9A961" : "#A6803A")
+                                              : "rgba(255,255,255,0.75)"
+                            ctx.lineWidth = 1.4
+                            if (bubbleRoot.isRead) {
+                                ctx.beginPath()
+                                ctx.moveTo(0, 5); ctx.lineTo(3, 8); ctx.lineTo(8, 2)
+                                ctx.stroke()
+                                ctx.beginPath()
+                                ctx.moveTo(5, 5); ctx.lineTo(8, 8); ctx.lineTo(14, 1)
+                                ctx.stroke()
+                            } else {
+                                ctx.beginPath()
+                                ctx.moveTo(3, 5); ctx.lineTo(6, 8); ctx.lineTo(12, 2)
+                                ctx.stroke()
+                            }
                         }
 
                         Connections {
                             target: bubbleRoot
                             function onIsReadChanged() { checkmarkCanvas.requestPaint() }
+                            function onSendStatusChanged() { checkmarkCanvas.requestPaint() }
                         }
                     }
                 }

@@ -7,13 +7,13 @@ Popup {
     id: panel
 
     property bool darkMode: true
-    property color bgColor: "#15152B"
-    property color surfaceColor: "#1B1B36"
-    property color surfaceColorHover: "#22224A"
-    property color textColor: "#EDEDF2"
-    property color textSecondary: "#9494AC"
+    property color bgColor: "#050403"
+    property color surfaceColor: "#0C0A08"
+    property color surfaceColorHover: "#16120E"
+    property color textColor: "#F0EAD6"
+    property color textSecondary: "#A39A8A"
     property color borderColor: Qt.rgba(1, 1, 1, 0.08)
-    property color accentColor: "#6C63FF"
+    property color accentColor: "#C9A961"
 
     property string chatId: ""
     property var groupData: ({ id: "", name: "", avatarUrl: "", description: "", ownerId: "", members: [] })
@@ -38,14 +38,21 @@ Popup {
     property string errorMessage: ""
     property var pendingAction: null // { kind: "leave"|"delete"|"remove", memberId, memberName }
 
-    modal: true
+    // Modeless + title-bar pass-through - see Settings.qml.
+    modal: false
+    dim: false
     focus: true
     width: 400
     height: 600
     x: (parent ? parent.width - width : 0) / 2
     y: (parent ? parent.height - height : 0) / 2
-    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    closePolicy: Popup.CloseOnEscape
     padding: 0
+
+    Overlay.modeless: FrostedScrim {
+        darkMode: panel.darkMode
+        onDismissed: panel.close()
+    }
 
     onOpened: {
         addingMembers = false
@@ -57,7 +64,8 @@ Popup {
 
     background: GlassPanel {
         darkMode: panel.darkMode
-        radius: 12
+        elevated: true
+        radius: 16
     }
 
     FileDialog {

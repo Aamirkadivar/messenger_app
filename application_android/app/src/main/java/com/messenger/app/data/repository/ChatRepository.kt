@@ -827,6 +827,7 @@ class ChatRepository(
     fun disconnectRealtime() = webSocketManager.disconnect()
     fun joinChatRoom(chatId: String) = webSocketManager.joinChat(chatId)
     fun leaveChatRoom(chatId: String) = webSocketManager.leaveChat(chatId)
+    val connectionState get() = webSocketManager.connectionState
     val incomingMessages get() = webSocketManager.incomingMessages
     val typingUpdates get() = webSocketManager.typingUpdates
     val readReceipts get() = webSocketManager.readReceipts
