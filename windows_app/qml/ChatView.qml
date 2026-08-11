@@ -51,6 +51,10 @@ Item {
     readonly property bool isGroupChat: currentChatType === "group"
     property bool typingIndicator: false
     property string typingUser: ""
+    // Telegram-style bar above the first unread incoming message for this open.
+    // Captured before markAsRead; cleared when switching chats.
+    property string firstUnreadMessageId: ""
+    property int openUnreadCount: 0
 
     // Signals
     signal sendMessage(string text)
@@ -73,6 +77,8 @@ Item {
         // one currently open. Leaving on switch would undo that the moment you
         // navigate away from a chat.
         messagesModel.clear()
+        firstUnreadMessageId = ""
+        openUnreadCount = 0
         if (currentChatId && currentChatId.length > 0) {
             isLoadingMore = true
             chatService.fetchMessages(currentChatId)
@@ -123,6 +129,8 @@ Item {
             // it's the last point where we can tell which messages were actually
             // still unread when the chat was opened.
             var firstUnreadIndex = -1
+            var unreadCount = 0
+            var firstUnreadId = ""
             for (var i = 0; i < messages.length; i++) {
                 var m = messages[i]
                 var isMine = m.senderId === authService.currentUserId
@@ -132,10 +140,16 @@ Item {
                                          m.fileType, m.fileName, m.fileSize, m.thumbnailUrl,
                                          m.rawContent, m.encrypted, m.keyVersion,
                                          m.isForwarded === true, m.forwardedFromName || "", m.replyToId || "")
-                if (firstUnreadIndex === -1 && !isMine && (!m.readAt || m.readAt.length === 0)) {
-                    firstUnreadIndex = i
+                if (!isMine && (!m.readAt || m.readAt.length === 0)) {
+                    unreadCount++
+                    if (firstUnreadIndex === -1) {
+                        firstUnreadIndex = i
+                        firstUnreadId = m.id || ""
+                    }
                 }
             }
+            chatViewRoot.firstUnreadMessageId = firstUnreadId
+            chatViewRoot.openUnreadCount = unreadCount
             // A security-code change detected while this chat wasn't open
             // still needs to surface - append it at the end of history now
             // that it's being opened.
@@ -794,10 +808,45 @@ Item {
                         ColorAnimation { duration: 100 }
                     }
 
-                    Text {
+                    Canvas {
+                        id: voiceCallIcon
                         anchors.centerIn: parent
-                        text: "📞"
-                        font.pixelSize: 16
+                        width: 16
+                        height: 16
+                        Connections {
+                            target: chatViewRoot
+                            function onTextSecondaryChanged() { voiceCallIcon.requestPaint() }
+                        }
+                        Component.onCompleted: requestPaint()
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.fillStyle = chatViewRoot.textSecondary
+                            ctx.strokeStyle = chatViewRoot.textSecondary
+                            ctx.lineWidth = 1.6
+                            ctx.lineCap = "round"
+                            ctx.lineJoin = "round"
+                            // Classic handset silhouette, matching the video
+                            // camera glyph's textSecondary fill.
+                            ctx.beginPath()
+                            ctx.moveTo(3.2, 1.8)
+                            ctx.quadraticCurveTo(1.4, 1.8, 1.4, 3.6)
+                            ctx.quadraticCurveTo(1.4, 6.2, 3.5, 8.8)
+                            ctx.quadraticCurveTo(5.8, 11.5, 8.8, 13.2)
+                            ctx.quadraticCurveTo(11.2, 14.6, 13.2, 14.6)
+                            ctx.quadraticCurveTo(15.0, 14.6, 15.0, 12.6)
+                            ctx.quadraticCurveTo(15.0, 11.4, 13.6, 10.8)
+                            ctx.lineTo(11.4, 10.0)
+                            ctx.quadraticCurveTo(10.4, 9.6, 9.8, 10.4)
+                            ctx.lineTo(8.6, 11.6)
+                            ctx.quadraticCurveTo(6.2, 10.0, 4.6, 7.6)
+                            ctx.lineTo(5.8, 6.2)
+                            ctx.quadraticCurveTo(6.6, 5.4, 6.2, 4.4)
+                            ctx.lineTo(5.2, 2.4)
+                            ctx.quadraticCurveTo(4.6, 1.8, 3.2, 1.8)
+                            ctx.closePath()
+                            ctx.fill()
+                        }
                     }
                     MouseArea {
                         id: callMouse
@@ -838,6 +887,7 @@ Item {
                             target: chatViewRoot
                             function onTextSecondaryChanged() { videoCallIcon.requestPaint() }
                         }
+                        Component.onCompleted: requestPaint()
                         onPaint: {
                             var ctx = getContext("2d")
                             ctx.reset()
@@ -1062,10 +1112,56 @@ Item {
             }
 
             delegate: Item {
+                id: messageDelegate
                 width: messagesListView.width
-                height: model.messageKind === "system"
-                        ? systemNotice.implicitHeight + 16
-                        : bubbleItem.height + (model.showSender ? 10 : 2)
+                readonly property bool showUnreadDivider:
+                    model.messageKind !== "system"
+                    && chatViewRoot.openUnreadCount > 0
+                    && model.messageId.length > 0
+                    && model.messageId === chatViewRoot.firstUnreadMessageId
+                height: (showUnreadDivider ? unreadDivider.height : 0)
+                        + (model.messageKind === "system"
+                           ? systemNotice.implicitHeight + 16
+                           : bubbleItem.height + (model.showSender ? 10 : 2))
+
+                // Telegram-style accent bar marking where unread messages begin.
+                Item {
+                    id: unreadDivider
+                    visible: messageDelegate.showUnreadDivider
+                    width: parent.width
+                    height: visible ? 36 : 0
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 16
+                        anchors.rightMargin: 16
+                        spacing: 10
+
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            Layout.alignment: Qt.AlignVCenter
+                            color: Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g,
+                                           chatViewRoot.accentColor.b, 0.35)
+                        }
+                        Text {
+                            text: chatViewRoot.openUnreadCount <= 1
+                                  ? "Unread message"
+                                  : (chatViewRoot.openUnreadCount + " unread messages")
+                            font.pixelSize: 12
+                            font.weight: Font.DemiBold
+                            color: chatViewRoot.accentColor
+                            Layout.alignment: Qt.AlignVCenter
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            Layout.alignment: Qt.AlignVCenter
+                            color: Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g,
+                                           chatViewRoot.accentColor.b, 0.35)
+                        }
+                    }
+                }
 
                 // A tiny centered line, not a real bubble - matches how
                 // WhatsApp shows "security code changed" and similar events
@@ -1075,7 +1171,7 @@ Item {
                     id: systemNotice
                     visible: model.messageKind === "system"
                     anchors.horizontalCenter: parent.horizontalCenter
-                    anchors.top: parent.top
+                    anchors.top: unreadDivider.bottom
                     anchors.topMargin: 8
                     width: parent.width - 64
                     text: model.messageText
@@ -1135,7 +1231,7 @@ Item {
                         onTriggered: chatViewRoot.smoothRevealIndex(index)
                     }
                     x: 16
-                    y: model.showSender ? 10 : 2
+                    y: unreadDivider.height + (model.showSender ? 10 : 2)
                     width: parent.width - 32
                     darkMode: chatViewRoot.darkMode
                     // Reading cryptoRevision makes this binding depend on "a

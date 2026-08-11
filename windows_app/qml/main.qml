@@ -24,6 +24,14 @@ ApplicationWindow {
     readonly property bool windowMaximized: appRoot.visibility === Window.Maximized
                                             || appRoot.visibility === Window.FullScreen
 
+    // True while a modal dialog owns the window — chrome above Overlay
+    // (resize edges) must not stay interactive.
+    readonly property bool modalDialogOpen: (typeof settingsPanel !== "undefined" && settingsPanel.opened)
+                                            || (typeof newChatDialog !== "undefined" && newChatDialog.opened)
+                                            || (typeof newGroupDialog !== "undefined" && newGroupDialog.opened)
+                                            || (typeof groupInfoPanel !== "undefined" && groupInfoPanel.opened)
+                                            || (typeof logoutDialog !== "undefined" && logoutDialog.opened)
+
     property bool darkMode: true
     // Briefly true right when the theme flips, so every hover Behavior on
     // color across the app can skip its transition for that one change -
@@ -60,6 +68,9 @@ ApplicationWindow {
     Item {
         id: frostedBlurSource
         anchors.fill: parent
+        // While Settings (or another modal) owns the Overlay, freeze the whole
+        // scene behind it — no hover, no clicks, no scroll.
+        enabled: !appRoot.modalDialogOpen
 
     // Ambient colour behind every glass surface - restrained in dark mode so
     // panels stay dark while still catching a liquid gold glow at the edges.
@@ -506,27 +517,6 @@ ApplicationWindow {
             }
         }
 
-        Settings {
-            id: settingsPanel
-            parent: appRoot.contentItem
-            darkMode: appRoot.darkMode
-            bgColor: appRoot.bgColor
-            surfaceColor: appRoot.surfaceColor
-            surfaceColorHover: appRoot.surfaceColorHover
-            textColor: appRoot.textColor
-            textSecondary: appRoot.textSecondary
-            borderColor: appRoot.borderColor
-            accentColor: appRoot.accentColor
-
-            onDarkModeToggled: {
-                appRoot.instantTheme = true
-                appRoot.darkMode = !appRoot.darkMode
-                Qt.callLater(function() { appRoot.instantTheme = false })
-            }
-
-            onLogoutRequested: logoutDialog.open()
-        }
-
         GroupInfoPanel {
             id: groupInfoPanel
             parent: appRoot.contentItem
@@ -698,7 +688,28 @@ ApplicationWindow {
             }
         }
     }
-    } // frostedBlurSource — Overlay/popups and chrome below stay outside the blur capture
+    } // frostedBlurSource
+    // Above the main scene and resize chrome so the scrim truly blocks hover.
+    Settings {
+        id: settingsPanel
+        anchors.fill: parent
+        darkMode: appRoot.darkMode
+        bgColor: appRoot.bgColor
+        surfaceColor: appRoot.surfaceColor
+        surfaceColorHover: appRoot.surfaceColorHover
+        textColor: appRoot.textColor
+        textSecondary: appRoot.textSecondary
+        borderColor: appRoot.borderColor
+        accentColor: appRoot.accentColor
+
+        onDarkModeToggled: {
+            appRoot.instantTheme = true
+            appRoot.darkMode = !appRoot.darkMode
+            Qt.callLater(function() { appRoot.instantTheme = false })
+        }
+
+        onLogoutRequested: logoutDialog.open()
+    }
 
     // Resize handles - a frameless window has no native resize border, so we
     // provide thin edge/corner hit-regions that hand off to the OS's own
@@ -709,7 +720,9 @@ ApplicationWindow {
         anchors.fill: parent
         z: 3000
         visible: !appRoot.windowMaximized
-        enabled: visible
+        // Overlay sits below these edges; disable them while a modal dialog
+        // is up so Settings (etc.) is the only active surface.
+        enabled: visible && !appRoot.modalDialogOpen
 
         property int edgeSize: 6
         property int cornerSize: 12

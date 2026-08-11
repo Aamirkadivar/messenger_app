@@ -80,6 +80,24 @@ interface ChatApiService {
         @Path("chatId") chatId: String
     ): Response<Unit>
 
+    /** One-way block. Also hides any direct chat with this user from the caller's list. */
+    @POST("users/{userId}/block")
+    suspend fun blockUser(
+        @Header("Authorization") token: String,
+        @Path("userId") userId: String
+    ): Response<Unit>
+
+    @DELETE("users/{userId}/block")
+    suspend fun unblockUser(
+        @Header("Authorization") token: String,
+        @Path("userId") userId: String
+    ): Response<Unit>
+
+    @GET("users/me/blocks")
+    suspend fun listBlockedUsers(
+        @Header("Authorization") token: String
+    ): Response<BlockedUsersResponse>
+
     /**
      * Removes a message. forEveryone retracts it for both sides and the
      * server only permits it on your own messages; otherwise the server

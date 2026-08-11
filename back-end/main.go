@@ -111,8 +111,11 @@ func main() {
 	userRoutes := protected.Group("/users")
 	userRoutes.Get("/me", userHandler.GetMe)
 	userRoutes.Put("/me", userHandler.UpdateMe)
+	userRoutes.Get("/me/blocks", userHandler.ListBlockedUsers)
 	userRoutes.Get("/search", userHandler.SearchUsers)
 	userRoutes.Get("/:user_id/presence", userHandler.GetUserPresence)
+	userRoutes.Post("/:user_id/block", userHandler.BlockUser)
+	userRoutes.Delete("/:user_id/block", userHandler.UnblockUser)
 	userRoutes.Post("/me/avatar", uploadHandler.UploadMyAvatar)
 
 	// Chat routes

@@ -344,10 +344,26 @@ func (h *UserHandler) SearchUsers(c *fiber.Ctx) error {
 	}
 
 	currentUserID := middleware.GetCurrentUserID(c)
+
+	// Exclude anyone this user has blocked, or who has blocked them.
+	var blockedIDs []uuid.UUID
+	database.DB.Model(&models.UserBlock{}).
+		Where("blocker_id = ?", currentUserID).
+		Pluck("blocked_id", &blockedIDs)
+	var blockedByIDs []uuid.UUID
+	database.DB.Model(&models.UserBlock{}).
+		Where("blocked_id = ?", currentUserID).
+		Pluck("blocker_id", &blockedByIDs)
+	exclude := append(blockedIDs, blockedByIDs...)
+	exclude = append(exclude, currentUserID)
+
 	var users []models.User
-	database.DB.Where("(username ILIKE ? OR display_name ILIKE ? OR email ILIKE ?) AND id != ?",
-		"%"+query+"%", "%"+query+"%", "%"+query+"%", currentUserID).
-		Find(&users)
+	q := database.DB.Where("(username ILIKE ? OR display_name ILIKE ? OR email ILIKE ?)",
+		"%"+query+"%", "%"+query+"%", "%"+query+"%")
+	if len(exclude) > 0 {
+		q = q.Where("id NOT IN ?", exclude)
+	}
+	q.Find(&users)
 
 	type userResponse struct {
 		ID          uuid.UUID `json:"id"`

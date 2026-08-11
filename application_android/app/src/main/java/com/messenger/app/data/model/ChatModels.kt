@@ -174,6 +174,20 @@ data class UserSearchResponse(
     val users: List<UserSearchResult> = emptyList()
 )
 
+@Serializable
+data class BlockedUserDto(
+    val id: String,
+    val username: String = "",
+    @SerialName("display_name") val displayName: String = "",
+    @SerialName("avatar_url") val avatarUrl: String? = null,
+    @SerialName("blocked_at") val blockedAt: String? = null
+)
+
+@Serializable
+data class BlockedUsersResponse(
+    val users: List<BlockedUserDto> = emptyList()
+)
+
 // ==================== Calls ====================
 // Mirrors back-end/handlers/calls.go's GetIceServers/GetCallHistory.
 

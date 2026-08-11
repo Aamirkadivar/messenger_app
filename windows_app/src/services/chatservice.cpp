@@ -1788,6 +1788,90 @@ void ChatService::deleteChat(const QString& chatId) {
     });
 }
 
+void ChatService::blockUser(const QString& userId, const QString& chatId) {
+    if (userId.isEmpty()) {
+        emit blockUserError(QStringLiteral("Cannot block this user"));
+        return;
+    }
+    QString authToken = buildAuthHeader();
+    if (authToken.isEmpty()) return;
+
+    QUrl url(Config::apiBaseUrl() + "/users/" + userId + "/block");
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", authToken.toUtf8());
+
+    QNetworkReply* reply = m_networkManager->post(request, QByteArray());
+    connect(reply, &QNetworkReply::finished, this, [this, reply, userId, chatId]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            emit blockUserError(reply->errorString());
+            return;
+        }
+        // Keep the chat in the list — right-click switches to Unblock.
+        emit userBlocked(userId, chatId);
+    });
+}
+
+void ChatService::unblockUser(const QString& userId) {
+    if (userId.isEmpty()) return;
+    QString authToken = buildAuthHeader();
+    if (authToken.isEmpty()) return;
+
+    QUrl url(Config::apiBaseUrl() + "/users/" + userId + "/block");
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", authToken.toUtf8());
+
+    QNetworkReply* reply = m_networkManager->deleteResource(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, userId]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            emit blockUserError(reply->errorString());
+            return;
+        }
+        emit userUnblocked(userId);
+    });
+}
+
+void ChatService::fetchBlockedUsers() {
+    QString authToken = buildAuthHeader();
+    if (authToken.isEmpty()) {
+        emit blockedUsersFetched(QVariantList());
+        return;
+    }
+
+    QUrl url(Config::apiBaseUrl() + "/users/me/blocks");
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", authToken.toUtf8());
+
+    QNetworkReply* reply = m_networkManager->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            emit blockUserError(reply->errorString());
+            emit blockedUsersFetched(QVariantList());
+            return;
+        }
+
+        const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
+        const QJsonArray arr = doc.object().value(QStringLiteral("users")).toArray();
+        QVariantList out;
+        out.reserve(arr.size());
+        for (const QJsonValue& v : arr) {
+            const QJsonObject o = v.toObject();
+            QVariantMap m;
+            m[QStringLiteral("id")] = o.value(QStringLiteral("id")).toString();
+            m[QStringLiteral("username")] = o.value(QStringLiteral("username")).toString();
+            m[QStringLiteral("display_name")] = o.value(QStringLiteral("display_name")).toString();
+            m[QStringLiteral("avatar_url")] = o.value(QStringLiteral("avatar_url")).toString();
+            out.append(m);
+        }
+        emit blockedUsersFetched(out);
+    });
+}
+
 QVariantMap ChatService::parseChatItem(const QJsonObject& obj) {
     QVariantMap item;
     item["id"] = obj["id"].toString();

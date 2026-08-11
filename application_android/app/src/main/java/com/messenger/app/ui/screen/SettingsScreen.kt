@@ -72,6 +72,7 @@ import com.messenger.app.ui.screen.settings.AboutSection
 import com.messenger.app.ui.screen.settings.Changelog
 import com.messenger.app.ui.screen.settings.NotificationsSection
 import com.messenger.app.ui.screen.settings.OpenSourceLicenses
+import com.messenger.app.ui.screen.settings.PrivacySection
 import com.messenger.app.ui.screen.settings.StorageSection
 import com.messenger.app.ui.theme.Tokens
 import com.messenger.app.ui.theme.isDarkTheme
@@ -99,6 +100,8 @@ fun SettingsScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val storageState by viewModel.storageState.collectAsStateWithLifecycle()
     val mutedChats by viewModel.mutedChats.collectAsStateWithLifecycle()
+    val blockedUsers by viewModel.blockedUsers.collectAsStateWithLifecycle()
+    val blockedUsersLoading by viewModel.blockedUsersLoading.collectAsStateWithLifecycle()
     val toast by viewModel.toast.collectAsStateWithLifecycle()
 
     val profile by viewModel.profile.collectAsStateWithLifecycle()
@@ -119,6 +122,10 @@ fun SettingsScreen(
     // rememberSaveable can only persist Bundle-compatible types.
     var expandedChats by rememberSaveable { mutableStateOf(ArrayList<String>()) }
     var expandedNetworks by rememberSaveable { mutableStateOf(ArrayList<String>()) }
+
+    LaunchedEffect(Unit) {
+        viewModel.loadBlockedUsers()
+    }
 
     LaunchedEffect(toast) {
         toast?.let {
@@ -198,6 +205,12 @@ fun SettingsScreen(
                 onQuietStartClick = { activeDialog = ActiveDialog.QuietStart },
                 onQuietEndClick = { activeDialog = ActiveDialog.QuietEnd },
                 onUnmute = { viewModel.unmuteChat(it.chatId) }
+            )
+
+            PrivacySection(
+                blockedUsers = blockedUsers,
+                loading = blockedUsersLoading,
+                onUnblock = viewModel::unblockUser
             )
 
             StorageSection(

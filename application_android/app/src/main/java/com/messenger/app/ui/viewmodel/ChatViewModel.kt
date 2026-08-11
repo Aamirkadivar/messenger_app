@@ -337,6 +337,15 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    // Declared ABOVE the init block below, and it has to stay there.
+    // Kotlin runs property initialisers and init blocks in declaration order,
+    // and that block starts a connectionState collector that reaches
+    // flushPendingOutgoing immediately - with these declared further down the
+    // class the list was still null when it first ran, and synchronized() on a
+    // null lock crashed the app on every launch.
+    private val pendingOutgoing = mutableListOf<OutgoingText>()
+    private var flushingOutgoing = false
+
     init {
         viewModelScope.launch {
             resolveCurrentUserId()
@@ -740,8 +749,6 @@ class ChatViewModel @Inject constructor(
         val replyToId: String
     )
 
-    private val pendingOutgoing = mutableListOf<OutgoingText>()
-    private var flushingOutgoing = false
 
     private suspend fun dispatchOutgoing(outgoing: OutgoingText) {
         val token = tokenManager.getAccessToken().getOrNull()
@@ -867,6 +874,38 @@ class ChatViewModel @Inject constructor(
                     Log.e(TAG, "deleteChat failed", e)
                     if (e is SessionExpiredException) _sessionExpired.value = true
                     _chatListState.update { it.copy(error = e.message ?: "Failed to delete chat") }
+                }
+        }
+    }
+
+    /**
+     * Blocks the other participant of a direct chat. Removes the chat from
+     * this user's list; they will not receive messages until unblocked.
+     */
+    fun blockUser(chatId: String, userId: String) {
+        if (userId.isBlank()) {
+            _chatListState.update { it.copy(error = "Cannot block this chat") }
+            return
+        }
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull()
+            if (token.isNullOrEmpty()) {
+                _chatListState.update { it.copy(error = "Not signed in") }
+                return@launch
+            }
+            chatRepository.blockUser(token, userId, chatId)
+                .onSuccess {
+                    _chatListState.update { state ->
+                        state.copy(chats = state.chats.filterNot { it.id == chatId })
+                    }
+                    if (_chatState.value.chatId == chatId) {
+                        _chatState.update { ChatUiState() }
+                    }
+                }
+                .onFailure { e ->
+                    Log.e(TAG, "blockUser failed", e)
+                    if (e is SessionExpiredException) _sessionExpired.value = true
+                    _chatListState.update { it.copy(error = e.message ?: "Failed to block user") }
                 }
         }
     }

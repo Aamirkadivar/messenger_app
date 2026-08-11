@@ -97,13 +97,44 @@ Item {
         id: chatContextMenu
         property string chatId: ""
         property string chatName: ""
+        property string otherUserId: ""
         property bool isGroup: false
+        property bool isBlocked: false
 
         background: GlassPanel {
             implicitWidth: 180
             darkMode: chatListRoot.darkMode
             radius: 8
             sheen: false
+        }
+
+        MenuItem {
+            visible: !chatContextMenu.isGroup && chatContextMenu.otherUserId.length > 0
+            height: visible ? implicitHeight : 0
+            text: chatContextMenu.isBlocked ? "Unblock user" : "Block user"
+            onTriggered: {
+                if (chatContextMenu.isBlocked)
+                    chatService.unblockUser(chatContextMenu.otherUserId)
+                else
+                    blockUserConfirm.open()
+            }
+            contentItem: Text {
+                text: parent.text
+                font.pixelSize: 13
+                color: chatContextMenu.isBlocked ? chatListRoot.accentColor : "#FF6B6B"
+                verticalAlignment: Text.AlignVCenter
+                leftPadding: 10
+            }
+            background: Rectangle {
+                implicitHeight: 34
+                color: parent.hovered
+                       ? (chatContextMenu.isBlocked
+                          ? Qt.rgba(chatListRoot.accentColor.r, chatListRoot.accentColor.g,
+                                    chatListRoot.accentColor.b, 0.12)
+                          : Qt.rgba(1, 0.42, 0.42, 0.12))
+                       : "transparent"
+                radius: 6
+            }
         }
 
         MenuItem {
@@ -120,6 +151,77 @@ Item {
                 implicitHeight: 34
                 color: parent.hovered ? Qt.rgba(1, 0.42, 0.42, 0.12) : "transparent"
                 radius: 6
+            }
+        }
+    }
+
+    Dialog {
+        id: blockUserConfirm
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 320
+        padding: 20
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+        background: GlassPanel {
+            darkMode: chatListRoot.darkMode
+            radius: 12
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            Text {
+                Layout.fillWidth: true
+                text: "Block user?"
+                font.pixelSize: 16
+                font.bold: true
+                color: chatListRoot.textColor
+            }
+
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pixelSize: 13
+                color: chatListRoot.textSecondary
+                text: "Block \"" + chatContextMenu.chatName + "\"? They won't be able to message you. "
+                      + "This chat stays in your list — right-click again to unblock."
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                spacing: 10
+
+                Item { Layout.fillWidth: true }
+
+                Text {
+                    text: "Cancel"
+                    font.pixelSize: 13
+                    color: chatListRoot.textSecondary
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -8
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: blockUserConfirm.close()
+                    }
+                }
+
+                Text {
+                    text: "Block"
+                    font.pixelSize: 13
+                    font.bold: true
+                    color: "#FF6B6B"
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -8
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            chatService.blockUser(chatContextMenu.otherUserId, chatContextMenu.chatId)
+                            blockUserConfirm.close()
+                        }
+                    }
+                }
             }
         }
     }
@@ -202,19 +304,46 @@ Item {
     Connections {
         target: typeof chatService !== "undefined" ? chatService : null
         function onChatDeleted(chatId) {
-            for (var i = 0; i < chatModel.count; i++) {
-                if (chatModel.get(i).chatId === chatId) {
-                    chatModel.remove(i)
-                    break
-                }
-            }
-            // originalChats backs the search filter; leaving the row there
-            // would resurrect the chat the moment the user typed a query.
-            for (var j = originalChats.length - 1; j >= 0; j--) {
-                if (originalChats[j].chatId === chatId) originalChats.splice(j, 1)
-            }
+            chatListRoot.removeChatFromList(chatId)
             chatListRoot.chatDeleted(chatId)
         }
+        function onBlockedUsersFetched(users) {
+            var ids = {}
+            var list = users || []
+            for (var i = 0; i < list.length; i++) {
+                if (list[i].id) ids[list[i].id] = true
+            }
+            chatListRoot.blockedUserIds = ids
+        }
+        function onUserBlocked(userId, chatId) {
+            var ids = Object.assign({}, chatListRoot.blockedUserIds)
+            ids[userId] = true
+            chatListRoot.blockedUserIds = ids
+        }
+        function onUserUnblocked(userId) {
+            var ids = Object.assign({}, chatListRoot.blockedUserIds)
+            delete ids[userId]
+            chatListRoot.blockedUserIds = ids
+        }
+    }
+
+    function removeChatFromList(chatId) {
+        if (!chatId) return
+        for (var i = 0; i < chatModel.count; i++) {
+            if (chatModel.get(i).chatId === chatId) {
+                chatModel.remove(i)
+                break
+            }
+        }
+        // originalChats backs the search filter; leaving the row there
+        // would resurrect the chat the moment the user typed a query.
+        for (var j = originalChats.length - 1; j >= 0; j--) {
+            if (originalChats[j].chatId === chatId) originalChats.splice(j, 1)
+        }
+    }
+
+    function isUserBlocked(userId) {
+        return !!(userId && chatListRoot.blockedUserIds[userId])
     }
 
     signal chatDeleted(string chatId)
@@ -226,6 +355,8 @@ Item {
     property var onlineUsers: []
     property var originalChats: []
     property bool chatsLoaded: false
+    // Map of blocked userId -> true (object used as a set for QML).
+    property var blockedUserIds: ({})
     // Whichever chat is currently open in the main window (set by main.qml),
     // so a live-arriving message for it doesn't also bump its own unread badge.
     property string activeChatId: ""
@@ -830,7 +961,9 @@ Item {
                                     if (mouse.button === Qt.RightButton) {
                                         chatContextMenu.chatId = model.chatId
                                         chatContextMenu.chatName = model.chatName
+                                        chatContextMenu.otherUserId = model.otherUserId || ""
                                         chatContextMenu.isGroup = model.chatType === "group"
+                                        chatContextMenu.isBlocked = chatListRoot.isUserBlocked(model.otherUserId)
                                         chatContextMenu.popup()
                                         return
                                     }
@@ -1056,6 +1189,7 @@ Item {
 
         console.log("Fetching chats from backend API...")
         chatService.fetchChats()
+        chatService.fetchBlockedUsers()
     }
 
     // Parse a chat item from the API response
@@ -1265,6 +1399,7 @@ Item {
     // app restarts or the user happens to navigate away and back.
     function onWsReconnected() {
         chatService.fetchChats()
+        chatService.fetchBlockedUsers()
     }
 
     // Live-update a contact's online dot the instant they connect/disconnect,

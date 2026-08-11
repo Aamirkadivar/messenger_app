@@ -42,6 +42,14 @@ import javax.inject.Inject
 /** A conversation the user has muted. */
 data class MutedChatUi(val chatId: String, val name: String)
 
+/** Someone this account has blocked (Settings → Privacy). */
+data class BlockedUserUi(
+    val id: String,
+    val name: String,
+    val username: String = "",
+    val avatarUrl: String? = null
+)
+
 /** The signed-in user, shown in the Settings profile row. */
 data class ProfileUi(
     val name: String = "",
@@ -170,16 +178,59 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    private val _blockedUsers = MutableStateFlow<List<BlockedUserUi>>(emptyList())
+    val blockedUsers: StateFlow<List<BlockedUserUi>> = _blockedUsers.asStateFlow()
+
+    private val _blockedUsersLoading = MutableStateFlow(false)
+    val blockedUsersLoading: StateFlow<Boolean> = _blockedUsersLoading.asStateFlow()
+
     init {
         // Kick off the (slow) scan as soon as Settings is first constructed.
         storageAnalyzer.scan()
         loadProfile()
+        loadBlockedUsers()
     }
 
     fun consumeToast() { _toast.value = null }
 
     /** Surfaces a transient message in the screen's snackbar. */
     fun showMessage(message: String) { _toast.value = message }
+
+    fun loadBlockedUsers() {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            _blockedUsersLoading.value = true
+            chatRepository.listBlockedUsers(token)
+                .onSuccess { list ->
+                    _blockedUsers.value = list.map { dto ->
+                        BlockedUserUi(
+                            id = dto.id,
+                            name = dto.displayName.ifBlank { dto.username }.ifBlank { "Unknown" },
+                            username = dto.username,
+                            avatarUrl = dto.avatarUrl
+                        )
+                    }
+                }
+                .onFailure { e ->
+                    _toast.value = e.message ?: "Failed to load blocked users"
+                }
+            _blockedUsersLoading.value = false
+        }
+    }
+
+    fun unblockUser(user: BlockedUserUi) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            chatRepository.unblockUser(token, user.id)
+                .onSuccess {
+                    _blockedUsers.update { list -> list.filterNot { it.id == user.id } }
+                    _toast.value = "${user.name} unblocked"
+                }
+                .onFailure { e ->
+                    _toast.value = e.message ?: "Failed to unblock"
+                }
+        }
+    }
 
     // ==================== Notifications ====================
 

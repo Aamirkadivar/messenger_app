@@ -572,20 +572,31 @@ fun ChatScreen(
         }
     }
 
-    // Anchored to the SCREEN, not to the Scaffold's content area.
+    // A permanent backdrop for the system navigation bar strip.
     //
-    // Inside the content it was positioned against a box whose height
-    // shrinks and grows as the composer animates in and out, so the bar
-    // slid with it. Out here its bottom edge is the window's, so it holds
-    // still while the composer moves. It still sits above the LazyColumn's
-    // hazeSource, so scrolling messages are what the glass blurs.
-    if (inSelection) {
+    // That strip used to be coloured by the composer, which extends behind it.
+    // Sliding the composer away therefore left it uncovered for the length of
+    // the animation, so the phone's button bar flashed transparent and then
+    // filled back in. Painting it here - always, never animated - stops the
+    // strip's colour depending on whatever is sliding above it.
+    Box(
+        modifier = Modifier
+            .align(Alignment.BottomCenter)
+            .fillMaxWidth()
+            .windowInsetsBottomHeight(WindowInsets.navigationBars)
+            .background(MaterialTheme.colorScheme.background)
+    )
+
+    // Keep composed while exiting so the 100→0 fade / blur collapse can play.
+    // Anchored to the SCREEN, not Scaffold content — otherwise the bar slides
+    // with the composer as selection starts and ends.
+    run {
         val selectedText = state.messages
             .filter { it.id in selectedIds && it.content.isNotBlank() && !it.isSystem }
             .joinToString("\n\n") { it.content }
         val singleSelected = selectedIds.size == 1
         MessageActionBar(
-            visible = true,
+            visible = inSelection,
             hazeState = hazeState,
             modifier = Modifier.align(Alignment.BottomCenter),
             actions = listOf(

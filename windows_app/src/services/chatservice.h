@@ -52,6 +52,15 @@ public:
     // DeleteChat). A later message in a direct chat brings it back.
     Q_INVOKABLE void deleteChat(const QString& chatId);
 
+    // One-way block of a user. Also hides any direct chat with them from this
+    // account's list (same left_at stamp as deleteChat). Messaging either way
+    // is rejected until unblockUser. The chat stays in the list so the
+    // context menu can switch to Unblock.
+    Q_INVOKABLE void blockUser(const QString& userId, const QString& chatId = QString());
+    Q_INVOKABLE void unblockUser(const QString& userId);
+    // Fetches GET /users/me/blocks for Settings. Emits blockedUsersFetched.
+    Q_INVOKABLE void fetchBlockedUsers();
+
     // Removes a single message. forEveryone retracts it for both sides and is
     // only permitted on your own messages; otherwise it is stamped into the
     // server's deleted_for list and disappears from this account's view alone,
@@ -252,6 +261,11 @@ signals:
     void chatRead(const QString& chatId);
     void chatDeleted(const QString& chatId);
     void chatDeleteError(const QString& error);
+    void userBlocked(const QString& userId, const QString& chatId);
+    void userUnblocked(const QString& userId);
+    void blockUserError(const QString& error);
+    // Each entry: id, username, display_name, avatar_url (Settings unblock list).
+    void blockedUsersFetched(const QVariantList& users);
 
     void voiceUploadError(const QString& error);
     void voiceMessageSent(const QString& chatId, const QVariantMap& message);

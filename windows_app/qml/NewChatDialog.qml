@@ -17,17 +17,17 @@ Popup {
 
     signal userSelected(string userId, string userName)
 
-    // Modeless + title-bar pass-through - see Settings.qml.
-    modal: false
+    // Modal so Overlay dims and blocks hover behind the panel.
+    modal: true
     dim: false
     focus: true
     width: 420
     height: 520
     x: (parent ? parent.width - width : 0) / 2
     y: (parent ? parent.height - height : 0) / 2
-    closePolicy: Popup.CloseOnEscape
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
-    Overlay.modeless: FrostedScrim {
+    Overlay.modal: FrostedScrim {
         darkMode: newChatDialog.darkMode
         onDismissed: newChatDialog.close()
     }

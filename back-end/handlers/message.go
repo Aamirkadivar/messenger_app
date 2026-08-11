@@ -65,6 +65,21 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		})
 	}
 
+	// Block check for direct chats — either direction rejects the send so a
+	// blocked contact cannot resurrect a hidden chat via SendMessage.
+	if chat.Type == "direct" {
+		var other models.ChatParticipant
+		if err := database.DB.Where("chat_id = ? AND user_id != ?", chatIDParsed, userID).
+			First(&other).Error; err == nil {
+			if IsEitherBlocked(userID, other.UserID) {
+				return c.Status(http.StatusForbidden).JSON(fiber.Map{
+					"error":   "blocked",
+					"message": "Cannot message this user",
+				})
+			}
+		}
+	}
+
 	// Content is an opaque blob to the server: for E2EE direct messages it's
 	// client-produced ciphertext (hex of nonce||crypto_box); for plaintext
 	// fallback it's the raw text. Either way the server never decrypts it -
@@ -213,6 +228,13 @@ func (s *MessageService) GetDirectChat(c *fiber.Ctx) error {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
 			"error":   "invalid contact ID",
 			"message": "Invalid contact ID format",
+		})
+	}
+
+	if IsEitherBlocked(userID, contactIDParsed) {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "blocked",
+			"message": "Cannot message this user",
 		})
 	}
 

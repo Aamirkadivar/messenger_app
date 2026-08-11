@@ -17,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.outlined.Block
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.GroupAdd
@@ -36,6 +37,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -44,6 +46,7 @@ import androidx.compose.ui.util.lerp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.messenger.app.R
 import com.messenger.app.ui.components.AmbientGlow
 import com.messenger.app.ui.components.Avatar
 import com.messenger.app.ui.components.ConnectionStatusBanner
@@ -74,6 +77,7 @@ fun ChatListScreen(
     // Long-press opens an action sheet; Delete from there raises the confirm dialog.
     var menuChat by remember { mutableStateOf<ChatListItemUi?>(null) }
     var pendingDelete by remember { mutableStateOf<ChatListItemUi?>(null) }
+    var pendingBlock by remember { mutableStateOf<ChatListItemUi?>(null) }
     val listState by chatViewModel.chatListState.collectAsStateWithLifecycle()
     val sessionExpired by chatViewModel.sessionExpired.collectAsStateWithLifecycle()
     val keyTakeover by chatViewModel.keyTakeover.collectAsStateWithLifecycle()
@@ -231,9 +235,39 @@ fun ChatListScreen(
                 chatViewModel.toggleMute(chat.id)
                 menuChat = null
             },
+            onBlock = {
+                menuChat = null
+                pendingBlock = chat
+            },
             onDelete = {
                 menuChat = null
                 pendingDelete = chat
+            }
+        )
+    }
+
+    pendingBlock?.let { chat ->
+        AlertDialog(
+            onDismissRequest = { pendingBlock = null },
+            title = { Text(stringResource(R.string.block_user)) },
+            text = {
+                Text(
+                    "Block ${chat.name}? ${stringResource(R.string.confirm_block_user)} " +
+                        "The chat will also be removed from your list."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    chatViewModel.blockUser(chat.id, chat.otherUserId)
+                    pendingBlock = null
+                }) {
+                    Text(stringResource(R.string.block_user), color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingBlock = null }) {
+                    Text(stringResource(R.string.cancel))
+                }
             }
         )
     }
@@ -607,6 +641,7 @@ private fun ChatActionsSheet(
     onDismiss: () -> Unit,
     onMarkRead: () -> Unit,
     onToggleMute: () -> Unit,
+    onBlock: () -> Unit,
     onDelete: () -> Unit
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
@@ -647,6 +682,14 @@ private fun ChatActionsSheet(
                 label = if (chat.isMuted) "Unmute notifications" else "Mute notifications",
                 onClick = onToggleMute
             )
+            if (!chat.isGroup && chat.otherUserId.isNotBlank()) {
+                ChatActionItem(
+                    icon = Icons.Outlined.Block,
+                    label = stringResource(R.string.block_user),
+                    tint = MaterialTheme.colorScheme.error,
+                    onClick = onBlock
+                )
+            }
             ChatActionItem(
                 icon = Icons.Outlined.Delete,
                 label = "Delete chat",

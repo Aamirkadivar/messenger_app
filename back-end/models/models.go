@@ -67,6 +67,16 @@ type Message struct {
 	DeletedAt              *time.Time `json:"deleted_at" gorm:"index"`
 }
 
+// UserBlock is a one-way block: BlockerID will not receive messages from
+// BlockedID (and messaging is rejected either direction). Distinct from
+// DeleteChat, which only hides a chat until the next message arrives.
+type UserBlock struct {
+	ID        uuid.UUID `json:"id" gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
+	BlockerID uuid.UUID `json:"blocker_id" gorm:"type:uuid;not null;uniqueIndex:idx_user_block_pair"`
+	BlockedID uuid.UUID `json:"blocked_id" gorm:"type:uuid;not null;uniqueIndex:idx_user_block_pair;index"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // ChatParticipant represents a participant in a chat
 type ChatParticipant struct {
 	ID         uuid.UUID  `json:"id" gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
@@ -366,6 +376,7 @@ func MigrateDB(db *gorm.DB) error {
 		&GroupSenderKey{},
 		&CallLog{},
 		&MessageDeletion{},
+		&UserBlock{},
 	); err != nil {
 		return err
 	}

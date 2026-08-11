@@ -38,18 +38,18 @@ Popup {
     property string errorMessage: ""
     property var pendingAction: null // { kind: "leave"|"delete"|"remove", memberId, memberName }
 
-    // Modeless + title-bar pass-through - see Settings.qml.
-    modal: false
+    // Modal so Overlay dims and blocks hover behind the panel.
+    modal: true
     dim: false
     focus: true
     width: 400
     height: 600
     x: (parent ? parent.width - width : 0) / 2
     y: (parent ? parent.height - height : 0) / 2
-    closePolicy: Popup.CloseOnEscape
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
     padding: 0
 
-    Overlay.modeless: FrostedScrim {
+    Overlay.modal: FrostedScrim {
         darkMode: panel.darkMode
         onDismissed: panel.close()
     }

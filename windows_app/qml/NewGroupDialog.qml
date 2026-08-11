@@ -21,18 +21,17 @@ Popup {
 
     property var selectedMembers: [] // [{id, name}]
 
-    // Modeless + title-bar pass-through - see Settings.qml. Otherwise the
-    // modal Overlay covers min/max/close and window drag while this is open.
-    modal: false
+    // Modal so Overlay dims and blocks hover behind the panel.
+    modal: true
     dim: false
     focus: true
     width: 440
     height: 580
     x: (parent ? parent.width - width : 0) / 2
     y: (parent ? parent.height - height : 0) / 2
-    closePolicy: Popup.CloseOnEscape
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
-    Overlay.modeless: FrostedScrim {
+    Overlay.modal: FrostedScrim {
         darkMode: newGroupDialog.darkMode
         onDismissed: newGroupDialog.close()
     }

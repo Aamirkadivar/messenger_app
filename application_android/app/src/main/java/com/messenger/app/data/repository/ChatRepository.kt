@@ -969,6 +969,60 @@ class ChatRepository(
         }
     }
 
+    /**
+     * Blocks [userId]. The server also hides any direct chat with them from
+     * this account's list (same left_at stamp as deleteChat).
+     */
+    suspend fun blockUser(token: String, userId: String, chatId: String? = null): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val response = chatApiService.blockUser(bearer(token), userId)
+                if (!response.isSuccessful) {
+                    return@withContext if (response.code() == 401) Result.failure(SessionExpiredException())
+                    else Result.failure(Exception("Failed to block user: ${response.code()}"))
+                }
+                if (!chatId.isNullOrBlank()) {
+                    messageDao.deleteMessagesByConversation(chatId)
+                    conversationDao.deleteConversation(chatId)
+                    cachedChatDao.deleteCached(chatId)
+                    chatOtherPub.remove(chatId)
+                    chatTypeMap.remove(chatId)
+                }
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Log.e(TAG, "blockUser error", e)
+                Result.failure(e)
+            }
+        }
+
+    suspend fun unblockUser(token: String, userId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val response = chatApiService.unblockUser(bearer(token), userId)
+            if (!response.isSuccessful) {
+                return@withContext if (response.code() == 401) Result.failure(SessionExpiredException())
+                else Result.failure(Exception("Failed to unblock user: ${response.code()}"))
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "unblockUser error", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun listBlockedUsers(token: String): Result<List<BlockedUserDto>> = withContext(Dispatchers.IO) {
+        try {
+            val response = chatApiService.listBlockedUsers(bearer(token))
+            if (!response.isSuccessful) {
+                return@withContext if (response.code() == 401) Result.failure(SessionExpiredException())
+                else Result.failure(Exception("Failed to list blocks: ${response.code()}"))
+            }
+            Result.success(response.body()?.users.orEmpty())
+        } catch (e: Exception) {
+            Log.e(TAG, "listBlockedUsers error", e)
+            Result.failure(e)
+        }
+    }
+
     suspend fun markAsRead(token: String, chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.markAsRead(bearer(token), chatId)

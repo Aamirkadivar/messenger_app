@@ -3,8 +3,15 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Dialogs
 
-Popup {
+// Full-window settings layer (not a Popup). Popup Overlay could not reliably
+// block hover on the chat behind; this Item sits at z:10000 and owns its own
+// scrim so only the panel stays interactive.
+Item {
     id: settingsRoot
+    anchors.fill: parent
+    visible: false
+    z: 10000
+    focus: visible
 
     property bool darkMode: true
     property color bgColor: "#050403"
@@ -17,36 +24,25 @@ Popup {
 
     readonly property color toggleOffColor: darkMode ? "#2A261F" : "#D9CFB8"
     readonly property color panelHoverColor: darkMode ? "#16120E" : surfaceColorHover
-
-    // Match Android Tokens.Type: serif for screen/section titles, sans for rows.
     readonly property string displayFont: "Georgia"
     readonly property string bodyFont: "Segoe UI"
+    readonly property bool opened: visible
 
     signal darkModeToggled()
     signal logoutRequested()
 
-    property string cacheSizeText: "…"
+    property string cacheSizeText: "..."
+    property var blockedUsers: []
 
-    // Modeless so the Overlay does not steal the title-bar strip: drag /
-    // minimize / maximize / close keep working (same idea as CallOverlay).
-    // Scrim dim + outside-click-to-close live in Overlay.modeless below the
-    // 44px custom title bar; the scrim MouseArea also blocks hover behind.
-    modal: false
-    dim: false
-    focus: true
-    width: 400
-    height: 680
-    x: (parent ? parent.width - width : 0) / 2
-    y: (parent ? parent.height - height : 0) / 2
-    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-    padding: 0
-
-    Overlay.modeless: FrostedScrim {
-        darkMode: settingsRoot.darkMode
-        onDismissed: settingsRoot.close()
+    function open() {
+        visible = true
+        forceActiveFocus()
+        refreshCacheSize()
+        refreshBlockedUsers()
     }
-
-    onOpened: refreshCacheSize()
+    function close() {
+        visible = false
+    }
 
     function refreshCacheSize() {
         if (typeof chatService === "undefined") return
@@ -56,26 +52,73 @@ Popup {
                         : (bytes / (1024 * 1024)).toFixed(1) + " MB"
     }
 
-    background: GlassPanel {
+    function refreshBlockedUsers() {
+        if (typeof chatService === "undefined") return
+        chatService.fetchBlockedUsers()
+    }
+
+    function displayBlockedName(u) {
+        if (!u) return "Unknown"
+        return u.display_name || u.username || "Unknown"
+    }
+
+    Keys.onEscapePressed: settingsRoot.close()
+
+    Connections {
+        target: typeof chatService !== "undefined" ? chatService : null
+        function onBlockedUsersFetched(users) {
+            settingsRoot.blockedUsers = users || []
+        }
+        function onUserUnblocked(userId) {
+            var next = []
+            for (var i = 0; i < settingsRoot.blockedUsers.length; i++) {
+                if (settingsRoot.blockedUsers[i].id !== userId)
+                    next.push(settingsRoot.blockedUsers[i])
+            }
+            settingsRoot.blockedUsers = next
+        }
+        function onUserBlocked(userId, chatId) {
+            // Refresh so a just-blocked contact appears under Privacy.
+            settingsRoot.refreshBlockedUsers()
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        color: settingsRoot.darkMode ? Qt.rgba(0, 0, 0, 0.68)
+                                     : Qt.rgba(43 / 255, 36 / 255, 24 / 255, 0.52)
+        MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            preventStealing: true
+            acceptedButtons: Qt.AllButtons
+            cursorShape: Qt.ArrowCursor
+            onPressed: function(mouse) {
+                mouse.accepted = true
+                settingsRoot.close()
+            }
+            onWheel: function(wheel) { wheel.accepted = true }
+        }
+    }
+
+    GlassPanel {
+        id: panel
+        width: 400
+        height: Math.min(680, settingsRoot.height - 48)
+        anchors.centerIn: parent
         darkMode: settingsRoot.darkMode
         elevated: true
         radius: 16
-    }
+        MouseArea {
+            anchors.fill: parent
+            z: -1
+            acceptedButtons: Qt.AllButtons
+            onPressed: function(mouse) { mouse.accepted = true }
+        }
 
-    FileDialog {
-        id: avatarPicker
-        title: "Choose a profile photo"
-        nameFilters: ["Images (*.png *.jpg *.jpeg *.webp)"]
-        onAccepted: authService.uploadAvatar(selectedFile.toString())
-    }
-
-    Connections {
-        target: authService
-        function onAvatarUploadFailed(message) { avatarError.text = message }
-        function onAvatarUploaded() { avatarError.text = "" }
-    }
-
-    contentItem: ColumnLayout {
+ColumnLayout {
+        anchors.fill: parent
+        anchors.margins: 0
         spacing: 0
 
         RowLayout {
@@ -123,7 +166,7 @@ Popup {
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                width: settingsRoot.width
+                width: panel.width
                 spacing: 0
 
                 // ---- Profile ----
@@ -390,6 +433,102 @@ Popup {
                     Layout.rightMargin: 24
                     Layout.bottomMargin: 4
                     Text {
+                        text: "Privacy"
+                        font.family: settingsRoot.displayFont
+                        font.pixelSize: 20
+                        font.weight: Font.Medium
+                        color: settingsRoot.textColor
+                    }
+                    Text {
+                        text: "Blocked users stay out of your chat list"
+                        font.family: settingsRoot.bodyFont
+                        font.pixelSize: 13
+                        color: settingsRoot.textSecondary
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 24
+                    Layout.rightMargin: 24
+                    Layout.topMargin: 8
+                    visible: settingsRoot.blockedUsers.length === 0
+                    text: "No blocked users"
+                    font.family: settingsRoot.bodyFont
+                    font.pixelSize: 13
+                    color: settingsRoot.textSecondary
+                }
+
+                Repeater {
+                    model: settingsRoot.blockedUsers
+                    delegate: Rectangle {
+                        Layout.fillWidth: true
+                        height: 56
+                        color: blockRowMouse.containsMouse ? settingsRoot.panelHoverColor : "transparent"
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 24
+                            anchors.rightMargin: 24
+                            spacing: 14
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredWidth: 0
+                                Layout.alignment: Qt.AlignVCenter
+                                spacing: 2
+                                Text {
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                    text: settingsRoot.displayBlockedName(modelData)
+                                    font.family: settingsRoot.bodyFont
+                                    font.pixelSize: 15
+                                    color: settingsRoot.textColor
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                    visible: !!(modelData.username)
+                                    text: modelData.username ? ("@" + modelData.username) : ""
+                                    font.family: settingsRoot.bodyFont
+                                    font.pixelSize: 12
+                                    color: settingsRoot.textSecondary
+                                }
+                            }
+
+                            Text {
+                                text: "Unblock"
+                                font.family: settingsRoot.bodyFont
+                                font.pixelSize: 13
+                                font.weight: Font.Medium
+                                color: settingsRoot.accentColor
+                                MouseArea {
+                                    anchors.fill: parent
+                                    anchors.margins: -8
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: chatService.unblockUser(modelData.id)
+                                }
+                            }
+                        }
+
+                        MouseArea {
+                            id: blockRowMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            acceptedButtons: Qt.NoButton
+                        }
+                    }
+                }
+
+                Rectangle { Layout.fillWidth: true; Layout.leftMargin: 24; Layout.rightMargin: 24; height: 1; color: settingsRoot.borderColor }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 28
+                    Layout.leftMargin: 24
+                    Layout.rightMargin: 24
+                    Layout.bottomMargin: 4
+                    Text {
                         text: "Storage and data"
                         font.family: settingsRoot.displayFont
                         font.pixelSize: 20
@@ -545,5 +684,19 @@ Popup {
                 }
             }
         }
+    }
+    }
+
+    FileDialog {
+        id: avatarPicker
+        title: "Choose a profile photo"
+        nameFilters: ["Images (*.png *.jpg *.jpeg *.webp)"]
+        onAccepted: authService.uploadAvatar(selectedFile.toString())
+    }
+
+    Connections {
+        target: authService
+        function onAvatarUploadFailed(message) { avatarError.text = message }
+        function onAvatarUploaded() { avatarError.text = "" }
     }
 }
