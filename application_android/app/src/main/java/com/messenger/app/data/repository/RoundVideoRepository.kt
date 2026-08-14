@@ -67,7 +67,9 @@ class RoundVideoRepository @Inject constructor(
         val thumbnailUrl: String,
         val durationMs: Long,
         val encrypted: Boolean,
-        val keyVersion: Int = 0
+        val keyVersion: Int = 0,
+        val encryptionVersion: Int = 1,
+        val sealedContent: String = ""
     )
 
     /**
@@ -78,6 +80,7 @@ class RoundVideoRepository @Inject constructor(
         token: String,
         chatId: String,
         capture: File,
+        forwardedFrom: String = "",
         onStage: (SendStage) -> Unit = {}
     ): Result<Prepared> = withContext(Dispatchers.IO) {
         var compressed: File? = null
@@ -96,9 +99,17 @@ class RoundVideoRepository @Inject constructor(
                 )
             }
 
-            val sealed = chatRepository.encryptBytesFor(token, chatId, raw)
-            if (sealed == null) Log.w(TAG, "No key for chat $chatId - uploading video note unencrypted")
-            val payload = sealed?.bytes ?: raw
+            val chatType = chatRepository.chatTypeFor(chatId)
+            val sealedMeta = chatRepository.sealMessage(
+                token, chatId, chatType, "", forwardedFrom = forwardedFrom, durationMs = durationMs
+            )
+            if (!sealedMeta.encrypted) {
+                return@withContext Result.failure(IOException("Cannot encrypt video note"))
+            }
+
+            val sealed = chatRepository.encryptBytesFor(token, chatId, raw, durationMs = durationMs)
+                ?: return@withContext Result.failure(IOException("Cannot encrypt video note"))
+            val payload = sealed.bytes
 
             val videoUrl = uploadWithRetry(
                 name = "video",
@@ -123,7 +134,7 @@ class RoundVideoRepository @Inject constructor(
                 }.getOrDefault("")
             }
 
-            Result.success(Prepared(videoUrl, thumbUrl, durationMs, sealed != null, sealed?.keyVersion ?: 0))
+            Result.success(Prepared(videoUrl, thumbUrl, durationMs, true, sealed.keyVersion, sealed.encryptionVersion, sealedMeta.content))
         } catch (e: Exception) {
             Log.e(TAG, "prepareAndUpload failed", e)
             Result.failure(e)
@@ -190,6 +201,7 @@ class RoundVideoRepository @Inject constructor(
         encrypted: Boolean,
         senderId: String = "",
         keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
         onProgress: (Float) -> Unit = {}
     ): Result<File> = withContext(Dispatchers.IO) {
         val cached = playbackFile(messageId)
@@ -197,7 +209,7 @@ class RoundVideoRepository @Inject constructor(
             onProgress(1f)
             return@withContext Result.success(cached)
         }
-        download(chatId, fileUrl, encrypted, senderId, keyVersion, onProgress)
+        download(chatId, fileUrl, encrypted, senderId, keyVersion, encryptionVersion, onProgress)
             .mapCatching { bytes -> cached.also { it.writeBytes(bytes) } }
     }
 
@@ -208,11 +220,12 @@ class RoundVideoRepository @Inject constructor(
         thumbnailUrl: String,
         encrypted: Boolean,
         senderId: String = "",
-        keyVersion: Int = 0
+        keyVersion: Int = 0,
+        encryptionVersion: Int = 1
     ): Result<File> = withContext(Dispatchers.IO) {
         val cached = thumbFile(messageId)
         if (cached.exists() && cached.length() > 0) return@withContext Result.success(cached)
-        download(chatId, thumbnailUrl, encrypted, senderId, keyVersion) {}
+        download(chatId, thumbnailUrl, encrypted, senderId, keyVersion, encryptionVersion) {}
             .mapCatching { bytes -> cached.also { it.writeBytes(bytes) } }
     }
 
@@ -222,6 +235,7 @@ class RoundVideoRepository @Inject constructor(
         encrypted: Boolean,
         senderId: String,
         keyVersion: Int,
+        encryptionVersion: Int,
         onProgress: (Float) -> Unit
     ): Result<ByteArray> {
         val absolute = resolveAvatarUrl(url)
@@ -247,7 +261,7 @@ class RoundVideoRepository @Inject constructor(
                 }
                 val bytes = out.toByteArray()
                 val plain = if (encrypted) {
-                    chatRepository.decryptBytesFor(chatId, bytes, senderId, keyVersion)
+                    chatRepository.decryptBytesFor(chatId, bytes, senderId, keyVersion, encryptionVersion)
                         ?: return Result.failure(
                             IOException("This video message can't be decrypted on this device")
                         )

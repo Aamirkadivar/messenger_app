@@ -12,7 +12,6 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 	"messenger-app/config"
-	"messenger-app/crypto"
 	"messenger-app/database"
 	"messenger-app/middleware"
 	"messenger-app/models"
@@ -68,15 +67,8 @@ func (h *AuthService) Register(c *fiber.Ctx) error {
 		})
 	}
 
-	// Generate public/private key pair for E2EE
-	keyPair, err := crypto.GenerateKeyPair()
-	if err != nil {
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to generate encryption keys",
-		})
-	}
-
-	// Create username from email if not provided
+	// E2EE identity keys are generated on the client and published via
+	// POST /crypto/public-key. Never generate or store private keys here.
 	username := input.Username
 	if username == "" {
 		parts := strings.Split(input.Email, "@")
@@ -93,8 +85,6 @@ func (h *AuthService) Register(c *fiber.Ctx) error {
 		Username:     username,
 		DisplayName:  displayName,
 		PasswordHash: string(hashedPassword),
-		PublicKey:    keyPair.PublicKey,
-		PrivateKey:   keyPair.PrivateKey,
 		IsOnline:     false,
 		LastSeen:     time.Now(),
 	}
@@ -130,10 +120,17 @@ func (h *AuthService) Login(c *fiber.Ctx) error {
 	// Normalize so login matches regardless of the case the user types
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
 
+	if loginLocked(input.Email) {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Invalid email or password",
+		})
+	}
+
 	// Find user
 	var user models.User
 	if err := database.DB.Where("email = ?", input.Email).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			noteLoginFailure(input.Email)
 			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
 				"error": "Invalid email or password",
 			})
@@ -145,30 +142,60 @@ func (h *AuthService) Login(c *fiber.Ctx) error {
 
 	// Check password
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(input.Password)); err != nil {
+		noteLoginFailure(input.Email)
 		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
 			"error": "Invalid email or password",
 		})
 	}
+	noteLoginSuccess(input.Email)
 
-	// Generate tokens
 	cfg := config.LoadConfig()
+
+	if user.TotpEnabled && user.TotpSecret != "" {
+		challengeID := issueTotpLoginChallenge(user)
+		return c.JSON(fiber.Map{
+			"message":            "2FA required",
+			"requires_2fa":       true,
+			"challenge_id":       challengeID,
+			"two_factor_method":  "totp",
+			"relay_hint":         "Enter the 6-digit authenticator code or a backup code",
+		})
+	}
+
+	// DEV-only second factor: password OK → challenge; tokens only after Verify2FA.
+	if Dev2FAEnabled(cfg) {
+		challengeID, err := issueDev2FAChallenge(user, cfg)
+		if err != nil {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to issue 2FA challenge",
+			})
+		}
+		return c.JSON(fiber.Map{
+			"message":       "2FA required",
+			"requires_2fa":  true,
+			"challenge_id":  challengeID,
+			"two_factor_method": "dev_otp",
+			"relay_hint":    "DEV: code sent to @" + cfg.Dev2FARelayUsername + " and server log [dev_2fa_relay]",
+		})
+	}
+
+	return issueLoginTokens(c, user, cfg)
+}
+
+func issueLoginTokens(c *fiber.Ctx, user models.User, cfg *config.Config) error {
 	accessToken, err := middleware.GenerateToken(user.ID, user.Email, user.DisplayName, cfg)
 	if err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to generate access token",
 		})
 	}
-
 	refreshToken, err := middleware.GenerateRefreshToken(user.ID, cfg)
 	if err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to generate refresh token",
 		})
 	}
-
-	// Update user last seen
 	database.DB.Model(&user).Update("last_seen", time.Now())
-
 	return c.JSON(fiber.Map{
 		"message": "Login successful",
 		"user": fiber.Map{
@@ -239,6 +266,51 @@ func (h *AuthService) RefreshToken(c *fiber.Ctx) error {
 			"expires_in":    cfg.JWTExpiration * 3600,
 		},
 	})
+}
+
+// ChangePasswordInput is the body for POST /users/me/password.
+type ChangePasswordInput struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// ChangePassword updates the account password. E2EE vault rewrap is client-side.
+func (h *AuthService) ChangePassword(c *fiber.Ctx) error {
+	userID := middleware.GetCurrentUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	var input ChangePasswordInput
+	if err := c.BodyParser(&input); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
+	}
+	input.CurrentPassword = strings.TrimSpace(input.CurrentPassword)
+	input.NewPassword = strings.TrimSpace(input.NewPassword)
+	if len(input.NewPassword) < 8 {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "New password must be at least 8 characters"})
+	}
+	if input.CurrentPassword == "" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Current password is required"})
+	}
+	if input.CurrentPassword == input.NewPassword {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "New password must differ from current password"})
+	}
+
+	var user models.User
+	if err := database.DB.First(&user, "id = ?", userID).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "User not found"})
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(input.CurrentPassword)); err != nil {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "Current password is incorrect"})
+	}
+	hashed, err := bcrypt.GenerateFromPassword([]byte(input.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to hash password"})
+	}
+	if err := database.DB.Model(&user).Update("password_hash", string(hashed)).Error; err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update password"})
+	}
+	return c.JSON(fiber.Map{"message": "Password updated"})
 }
 
 // UserHandler handles user-related operations

@@ -81,17 +81,17 @@ class AttachmentRepository(
         }
     }
 
-    data class Uploaded(val fileUrl: String, val fileSize: Long, val encrypted: Boolean, val keyVersion: Int = 0)
+    data class Uploaded(val fileUrl: String, val fileSize: Long, val encrypted: Boolean, val keyVersion: Int = 0, val encryptionVersion: Int = 1)
 
     /** Encrypts (when possible) and uploads [file]'s bytes, returning its server path. */
     suspend fun upload(token: String, chatId: String, file: PickedFile): Result<Uploaded> =
         withContext(Dispatchers.IO) {
             try {
-                val sealed = chatRepository.encryptBytesFor(token, chatId, file.bytes)
-                val payload = sealed?.bytes ?: file.bytes
-                if (sealed == null) {
-                    Log.w(TAG, "No key for chat $chatId - uploading attachment unencrypted")
-                }
+                val sealed = chatRepository.encryptBytesFor(
+                    token, chatId, file.bytes, fileName = file.name, fileSize = file.size
+                )
+                    ?: return@withContext Result.failure(IOException("Cannot encrypt attachment"))
+                val payload = sealed.bytes
 
                 val body = payload.toRequestBody("application/octet-stream".toMediaTypeOrNull())
                 val part = MultipartBody.Part.createFormData("file", "attachment", body)
@@ -103,7 +103,7 @@ class AttachmentRepository(
                     ?.let { runCatching { it.jsonPrimitive.content.toLong() }.getOrNull() }
                     ?: payload.size.toLong()
                 if (response.isSuccessful && !url.isNullOrBlank()) {
-                    Result.success(Uploaded(url, size, sealed != null, sealed?.keyVersion ?: 0))
+                    Result.success(Uploaded(url, size, true, sealed.keyVersion, sealed.encryptionVersion))
                 } else {
                     Result.failure(Exception(response.errorMessage("Failed to send attachment")))
                 }
@@ -124,10 +124,12 @@ class AttachmentRepository(
         fileName: String,
         encrypted: Boolean,
         senderId: String = "",
-        keyVersion: Int = 0
+        keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
+        senderDeviceId: String = ""
     ): Result<File> = withContext(Dispatchers.IO) {
-        val cached = cacheFile(messageId, fileName)
-        if (cached.exists() && cached.length() > 0) return@withContext Result.success(cached)
+        var dest = cacheFile(messageId, fileName)
+        if (dest.exists() && dest.length() > 0) return@withContext Result.success(dest)
 
         val absolute = resolveAvatarUrl(fileUrl)
             ?: return@withContext Result.failure(IOException("Attachment has no address"))
@@ -143,17 +145,19 @@ class AttachmentRepository(
                 val bytes = response.body?.bytes()
                     ?: return@withContext Result.failure(IOException("Empty attachment"))
 
-                val plain = if (encrypted) {
-                    chatRepository.decryptBytesFor(chatId, bytes, senderId, keyVersion)
+                val env = if (encrypted) {
+                    chatRepository.openBytesFor(chatId, bytes, senderId, keyVersion, encryptionVersion, senderDeviceId)
                         ?: return@withContext Result.failure(
                             IOException("This attachment can't be decrypted on this device")
                         )
                 } else {
-                    bytes
+                    com.messenger.app.data.encryption.E2ECrypto.unwrapEnvelope(bytes)
                 }
-
-                cached.writeBytes(plain)
-                Result.success(cached)
+                val name = fileName.ifBlank { env.fileName }
+                dest = cacheFile(messageId, name)
+                if (dest.exists() && dest.length() > 0) return@withContext Result.success(dest)
+                dest.writeBytes(env.payload)
+                Result.success(dest)
             }
         } catch (e: Exception) {
             Log.e(TAG, "fetchForView error", e)

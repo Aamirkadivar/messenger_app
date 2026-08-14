@@ -11,6 +11,8 @@
 #include <functional>
 #include "../utils/config.h"
 #include "../utils/messagecache.h"
+#include "../crypto/doubleratchet.h"
+#include "../crypto/encryption.h"
 #include "authservice.h"
 #include "groupservice.h"
 
@@ -81,6 +83,12 @@ public:
     // deleting the last visible message - so the view owns the truth there.
     Q_INVOKABLE void notifyChatPreview(const QString& chatId, const QString& preview);
     Q_INVOKABLE QString takePendingSecurityNotice(const QString& chatId);
+    Q_INVOKABLE QString safetyNumberForChat(const QString& chatId) const;
+    Q_INVOKABLE bool hasPendingPeerKeyChange(const QString& chatId) const;
+    Q_INVOKABLE void acceptPeerKeyChange(const QString& chatId);
+    Q_INVOKABLE QString safetyNumberQrUrl(const QString& chatId) const;
+    Q_INVOKABLE bool hasVerifiedSafetyNumber(const QString& chatId) const;
+    Q_INVOKABLE QString compareSafetyNumberScan(const QString& chatId, const QString& scanned);
 
     // Local on-disk cache (SQLite) - exposed for the Settings screen's
     // "storage used" readout and "clear cache" action.
@@ -94,7 +102,9 @@ public:
     // single "other side" key - see the Sender Key scheme on
     // GroupService::PublishSenderKey) and ignored for a direct chat.
     Q_INVOKABLE QString decryptMessage(const QString& chatId, const QString& content, bool encrypted,
-                                       const QString& senderId = QString(), int keyVersion = 0) const;
+                                       const QString& senderId = QString(), int keyVersion = 0,
+                                       int encryptionVersion = 1,
+                                       const QString& senderDeviceId = QString()) const;
 
     // Whether we currently hold a pairwise key for this chat (direct only).
     // Groups use Sender Keys - see hasGroupSenderKey / encryptBytesForChat.
@@ -110,9 +120,15 @@ public:
     // group text). outKeyVersion is set for group sends (0 for direct).
     // Returns empty on failure - callers fall back to cleartext.
     Q_INVOKABLE QByteArray encryptBytesForChat(const QString& chatId, const QByteArray& plain) const;
-    QByteArray encryptBytesForChat(const QString& chatId, const QByteArray& plain, int* outKeyVersion) const;
+    QByteArray encryptBytesForChat(const QString& chatId, const QByteArray& plain,
+                                   int* outKeyVersion, int* outEncVersion = nullptr,
+                                   const QString& fileName = QString(),
+                                   const QString& forwardedFrom = QString(),
+                                   qint64 durationMs = 0,
+                                   qint64 fileSize = 0) const;
     Q_INVOKABLE QByteArray decryptBytesForChat(const QString& chatId, const QByteArray& payload,
-                                               const QString& senderId = QString(), int keyVersion = 0) const;
+                                               const QString& senderId = QString(), int keyVersion = 0,
+                                               int encryptionVersion = 1) const;
 
     // Reads localFilePath (a just-recorded temp file), encrypts it for chatId
     // when possible, uploads it, and posts the message - one call from QML,
@@ -135,14 +151,16 @@ public:
     // decrypted file onto disk. senderId/keyVersion required for group media.
     Q_INVOKABLE void preparePlayableVoice(const QString& chatId, const QString& messageId,
                                            const QString& fileUrl, bool encrypted,
-                                           const QString& senderId = QString(), int keyVersion = 0);
+                                           const QString& senderId = QString(), int keyVersion = 0,
+                                           int encryptionVersion = 1);
     // Posts the message pointing at an already-uploaded voice note.
     void sendVoiceMessage(const QString& chatId, const QString& chatType,
                            const QString& fileUrl, qint64 durationMs, bool encrypted,
-                           int keyVersion = 0,
+                           int keyVersion = 0, int encryptionVersion = 1,
                            bool isForwarded = false,
                            const QString& forwardedFromName = QString(),
-                           const QString& forwardedFromMessageId = QString());
+                           const QString& forwardedFromMessageId = QString(),
+                           const QString& sealedContent = QString());
 
     // Bumped every time a decryption key is learned. QML message rows read
     // this inside their text binding, so a row that rendered as the
@@ -173,13 +191,15 @@ public:
     // preparePlayableVoice: this only gets a playable file onto disk.
     Q_INVOKABLE void preparePlayableVideoNote(const QString& chatId, const QString& messageId,
                                                const QString& fileUrl, bool encrypted,
-                                               const QString& senderId = QString(), int keyVersion = 0);
+                                               const QString& senderId = QString(), int keyVersion = 0,
+                                               int encryptionVersion = 1);
 
     // The poster frame, fetched separately so a bubble fills in before the
     // much larger video has arrived.
     Q_INVOKABLE void prepareVideoNoteThumbnail(const QString& chatId, const QString& messageId,
                                                 const QString& thumbnailUrl, bool encrypted,
-                                                const QString& senderId = QString(), int keyVersion = 0);
+                                                const QString& senderId = QString(), int keyVersion = 0,
+                                                int encryptionVersion = 1);
 
     // Steps of the send, split so the poster-frame grab (which is async) can
     // sit between reading the recording and uploading it.
@@ -191,18 +211,22 @@ public:
                           const QString& forwardedFromMessageId = QString());
     void uploadVideoNoteThumbnail(const QString& chatId, const QString& chatType,
                                    const QString& fileUrl, qint64 durationMs,
-                                   bool encrypted, int keyVersion, const QString& thumbnailPath,
+                                   bool encrypted, int keyVersion, int encryptionVersion,
+                                   const QString& thumbnailPath,
                                    bool isForwarded = false,
                                    const QString& forwardedFromName = QString(),
-                                   const QString& forwardedFromMessageId = QString());
+                                   const QString& forwardedFromMessageId = QString(),
+                                   const QString& sealedContent = QString());
 
     // Posts the message pointing at an already-uploaded round video.
     void sendVideoNoteMessage(const QString& chatId, const QString& chatType,
                                const QString& fileUrl, const QString& thumbnailUrl,
                                qint64 durationMs, bool encrypted, int keyVersion = 0,
+                               int encryptionVersion = 1,
                                bool isForwarded = false,
                                const QString& forwardedFromName = QString(),
-                               const QString& forwardedFromMessageId = QString());
+                               const QString& forwardedFromMessageId = QString(),
+                               const QString& sealedContent = QString());
 
     // ---- File/image attachments ----
     // localFileUrl is whatever FileDialog.selectedFile.toString() hands QML
@@ -227,7 +251,8 @@ public:
     Q_INVOKABLE void prepareAttachment(const QString& chatId, const QString& messageId,
                                         const QString& fileUrl, bool encrypted,
                                         const QString& fileName,
-                                        const QString& senderId = QString(), int keyVersion = 0);
+                                        const QString& senderId = QString(), int keyVersion = 0,
+                                        int encryptionVersion = 1);
 
     // Forward one or more messages into targetChatId. items is a list of
     // QVariantMaps from QML (messageId, contentType, text, fileUrl, ...).
@@ -252,6 +277,7 @@ signals:
     // reset keypair, or - the scenario this exists to catch - a
     // man-in-the-middle substituting their own key).
     void securityCodeChanged(const QString& chatId, const QString& contactName);
+    void peerKeyChangePendingChanged(const QString& chatId);
     void usersFound(const QVariantList& users);
     void searchError(const QString& error);
     void directChatReady(const QString& chatId, const QString& chatName);
@@ -302,6 +328,7 @@ private slots:
 private:
     void setupNetworkManager();
     QString buildAuthHeader() const;
+    void applyAuthHeaders(QNetworkRequest& request) const;
     // Recomputes the chat-list preview from the local message cache and emits
     // chatLastMessageChanged. Called after any path that removes a message.
     void refreshChatListPreview(const QString& chatId);
@@ -310,10 +337,11 @@ private:
     void sendAttachmentMessage(const QString& chatId, const QString& chatType,
                                 const QString& fileUrl, const QString& fileName,
                                 const QString& contentType, qint64 fileSize, bool encrypted,
-                                int keyVersion = 0,
+                                int keyVersion = 0, int encryptionVersion = 1,
                                 bool isForwarded = false,
                                 const QString& forwardedFromName = QString(),
-                                const QString& forwardedFromMessageId = QString());
+                                const QString& forwardedFromMessageId = QString(),
+                                const QString& sealedContent = QString());
 
     // Stamps is_forwarded / forwarded_from_* onto a POST /messages body.
     void appendForwardFields(QJsonObject& body, bool isForwarded,
@@ -331,6 +359,7 @@ private:
         bool encrypted = false;
         QString senderId;
         int keyVersion = 0;
+        int encryptionVersion = 1;
         QString fileName;
         qint64 fileSize = 0;
         qint64 durationMs = 0;
@@ -363,6 +392,7 @@ private:
     QString groupSenderKeyFor(const QString& chatId, const QString& senderId, int keyVersion) const;
     void persistMySenderKey(const QString& chatId, int version, const QString& keyHex);
     void loadMySenderKeyFromDisk(const QString& chatId);
+    void loadPeerSenderKeysFromDisk(const QString& chatId);
 
     AuthService* m_authService = nullptr;
     GroupService* m_groupService = nullptr;
@@ -378,6 +408,19 @@ private:
     // messages and decrypts everything in the thread (box is symmetric in the
     // shared-secret sense), so one key per chat is all we need.
     QHash<QString, QString> m_chatOtherPub;
+    mutable QHash<QString, DoubleRatchet::State> m_dr;
+
+    QByteArray encryptDirectV3(const QString& chatId, const QByteArray& plain) const;
+    QByteArray decryptDirectV3(const QString& chatId, const QByteArray& payload) const;
+    QByteArray decryptToBytes(const QString& chatId, const QByteArray& payload,
+                              const QString& senderId, int keyVersion, int encryptionVersion,
+                              const QString& senderDeviceId = QString()) const;
+    Encryption::MessageEnvelope openCipher(const QString& chatId, const QString& content, bool encrypted,
+                                           const QString& senderId, int keyVersion, int encryptionVersion,
+                                           const QString& senderDeviceId = QString()) const;
+    void applyEnvelopeMeta(QVariantMap& item, const Encryption::MessageEnvelope& env) const;
+    bool loadDr(const QString& chatId, DoubleRatchet::State& st, bool sending) const;
+    void saveDr(const QString& chatId, DoubleRatchet::State& st) const;
 
     // chatId -> "direct"/"group", learned from the chat list - lets
     // decryptMessage() and friends branch to the right scheme without every
@@ -387,19 +430,17 @@ private:
     // membership change - see models.Chat.KeyEpoch).
     QHash<QString, int> m_groupKeyEpoch;
 
-    struct SenderKeyState {
-        int version = 0;
-        QString keyHex;
-    };
-    // chatId -> my own current Sender Key for that group.
-    QHash<QString, SenderKeyState> m_mySenderKeys;
+    QHash<QString, QMap<int, QString>> m_mySenderKeys;
     // "chatId|senderId|version" -> that sender's key, decrypted and cached
-    // after fetchGroupSenderKeys().
-    QHash<QString, QString> m_groupOtherKeys;
+    // after fetchGroupSenderKeys() or disk restore.
+    mutable QHash<QString, QString> m_groupOtherKeys;
 
     // chatId -> contact name, for a security-code-change notice detected
     // while that chat wasn't the one open - see takePendingSecurityNotice().
     QHash<QString, QString> m_pendingSecurityNotices;
+    QHash<QString, QString> m_pendingPeerPub;
+
+    void applyPeerIdentity(const QString& chatId, const QString& serverPub, const QString& contactName);
 
     // Forward queue state - see forwardMessages().
     QList<ForwardItem> m_forwardQueue;

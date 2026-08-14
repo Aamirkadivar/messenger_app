@@ -54,6 +54,7 @@ class AuthRepository(
 
     /**
      * Login with email and password.
+     * When DEV 2FA is on, [AuthResponse.requires2fa] is true and tokens are absent.
      */
     suspend fun login(email: String, password: String): Result<AuthResponse> = withContext(Dispatchers.IO) {
         try {
@@ -61,25 +62,12 @@ class AuthRepository(
 
             if (response.isSuccessful && response.body() != null) {
                 val authResponse = response.body()!!
-                saveAuthData(authResponse)
-
-                userDao.insertUser(
-                    UserEntity(
-                        id = authResponse.user.id,
-                        name = authResponse.user.displayName ?: authResponse.user.username,
-                        username = authResponse.user.username,
-                        email = authResponse.user.email,
-                        avatarUrl = authResponse.user.avatarUrl
-                    )
-                )
-
-                // Generate a local encryption key for this device if one doesn't exist yet
-                val keyGenResult = keyStoreManager.generateEncryptionKey(KeyStoreManager.DEVICE_ENCRYPTION_KEY_ALIAS)
-                if (keyGenResult.isFailure) {
-                    Log.e(TAG, "Failed to generate encryption key", keyGenResult.exceptionOrNull())
+                if (authResponse.requires2fa) {
+                    Log.d(TAG, "Login requires 2FA challenge=${authResponse.challengeId}")
+                    return@withContext Result.success(authResponse)
                 }
-
-                Log.d(TAG, "Login successful for user: ${authResponse.user.username}")
+                persistSuccessfulAuth(authResponse)?.let { return@withContext it }
+                Log.d(TAG, "Login successful for user: ${authResponse.user?.username}")
                 Result.success(authResponse)
             } else {
                 Result.failure(Exception(extractError(response.errorBody())))
@@ -88,6 +76,86 @@ class AuthRepository(
             Log.e(TAG, "Login error", e)
             Result.failure(e)
         }
+    }
+
+    /** Completes DEV 2FA: POST /auth/2fa/verify. */
+    suspend fun verify2FA(challengeId: String, code: String): Result<AuthResponse> =
+        withContext(Dispatchers.IO) {
+            try {
+                val response = authApiService.verify2FA(Verify2FARequest(challengeId, code.trim()))
+                if (response.isSuccessful && response.body() != null) {
+                    val authResponse = response.body()!!
+                    persistSuccessfulAuth(authResponse)?.let { return@withContext it }
+                    Result.success(authResponse)
+                } else {
+                    Result.failure(Exception(extractError(response.errorBody())))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "verify2FA error", e)
+                Result.failure(e)
+            }
+        }
+
+    suspend fun startPasswordReset(email: String): Result<PasswordResetStartResponse> =
+        withContext(Dispatchers.IO) {
+            try {
+                val response = authApiService.startPasswordReset(
+                    PasswordResetStartRequest(email.trim())
+                )
+                if (response.isSuccessful && response.body() != null) {
+                    Result.success(response.body()!!)
+                } else {
+                    Result.failure(Exception(extractError(response.errorBody())))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "startPasswordReset error", e)
+                Result.failure(e)
+            }
+        }
+
+    suspend fun completePasswordReset(
+        challengeId: String,
+        code: String,
+        newPassword: String,
+        totpCode: String = ""
+    ): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val response = authApiService.completePasswordReset(
+                PasswordResetCompleteRequest(challengeId, code.trim(), newPassword, totpCode.trim())
+            )
+            if (response.isSuccessful) {
+                Result.success(response.body()?.message ?: "Password updated. Sign in, then unlock with your recovery key.")
+            } else {
+                Result.failure(Exception(extractError(response.errorBody())))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "completePasswordReset error", e)
+            Result.failure(e)
+        }
+    }
+
+    /** Returns a failure Result if tokens/user are missing; otherwise saves and returns null. */
+    private suspend fun persistSuccessfulAuth(authResponse: AuthResponse): Result<AuthResponse>? {
+        val user = authResponse.user
+        val tokens = authResponse.tokens
+        if (user == null || tokens == null) {
+            return Result.failure(Exception("Login succeeded but response was incomplete"))
+        }
+        saveAuthData(user, tokens)
+        userDao.insertUser(
+            UserEntity(
+                id = user.id,
+                name = user.displayName ?: user.username,
+                username = user.username,
+                email = user.email,
+                avatarUrl = user.avatarUrl
+            )
+        )
+        val keyGenResult = keyStoreManager.generateEncryptionKey(KeyStoreManager.DEVICE_ENCRYPTION_KEY_ALIAS)
+        if (keyGenResult.isFailure) {
+            Log.e(TAG, "Failed to generate encryption key", keyGenResult.exceptionOrNull())
+        }
+        return null
     }
 
     /**
@@ -104,7 +172,15 @@ class AuthRepository(
             val response = authApiService.refreshToken(RefreshTokenRequest(refreshToken))
             if (response.isSuccessful && response.body() != null) {
                 val authResponse = response.body()!!
-                saveAuthData(authResponse)
+                val tokens = authResponse.tokens
+                    ?: return@withContext Result.failure(Exception("Refresh response missing tokens"))
+                val userId = authResponse.user?.id ?: tokenManager.getCurrentUserId().getOrNull().orEmpty()
+                tokenManager.saveAccessToken(tokens.accessToken)
+                tokenManager.saveRefreshToken(tokens.refreshToken)
+                tokenManager.saveAccessTokenExpiresAt(
+                    System.currentTimeMillis() + tokens.expiresIn * 1000
+                )
+                if (userId.isNotBlank()) tokenManager.saveCurrentUserId(userId)
                 Log.d(TAG, "Token refreshed successfully")
                 Result.success(authResponse)
             } else {
@@ -131,15 +207,15 @@ class AuthRepository(
 
     suspend fun getAuthToken(): String? = tokenManager.getAccessToken().getOrNull()
 
-    private suspend fun saveAuthData(authResponse: AuthResponse) {
-        tokenManager.saveAccessToken(authResponse.tokens.accessToken)
+    private suspend fun saveAuthData(user: UserDto, tokens: TokensDto) {
+        tokenManager.saveAccessToken(tokens.accessToken)
             .onFailure { Log.e(TAG, "Failed to save access token", it) }
-        tokenManager.saveRefreshToken(authResponse.tokens.refreshToken)
+        tokenManager.saveRefreshToken(tokens.refreshToken)
             .onFailure { Log.e(TAG, "Failed to save refresh token", it) }
         tokenManager.saveAccessTokenExpiresAt(
-            System.currentTimeMillis() + authResponse.tokens.expiresIn * 1000
+            System.currentTimeMillis() + tokens.expiresIn * 1000
         ).onFailure { Log.e(TAG, "Failed to save token expiry", it) }
-        tokenManager.saveCurrentUserId(authResponse.user.id)
+        tokenManager.saveCurrentUserId(user.id)
             .onFailure { Log.e(TAG, "Failed to save current user id", it) }
     }
 

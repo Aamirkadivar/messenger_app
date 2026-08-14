@@ -1,166 +1,135 @@
-# E2EE Architecture (Phase 0 Audit + Phase 1 Target)
+# E2EE Architecture
 
-Status: **Audit complete. Implementation not started.**  
-Date: 2026-08-11  
-Scope: `back-end/`, `application_android/`, `windows_app/` (no iOS client in repo)
+Status: **Implemented** (Android + Windows + Go relay). iOS / Web are not in this repo.  
+Date: 2026-08-14  
+Scope: `back-end/`, `application_android/`, `windows_app/`
 
----
-
-## 1. Current E2EE architecture
-
-The messenger uses a **client-side NaCl/libsodium** design. The Go backend is intentionally a **dumb relay**: it stores and forwards ciphertext and encrypted sender-key blobs; it does not decrypt message bodies on the live path.
-
-| Layer | Role today |
-|-------|------------|
-| Account auth | Email + bcrypt password → JWT access + refresh. **No 2FA.** |
-| E2EE identity | One X25519 (`crypto_box`) keypair per account, device-local private key |
-| Direct messages | Pairwise `crypto_box` (X25519 + XSalsa20-Poly1305) |
-| Group messages | WhatsApp/Signal-style **Sender Keys** (`crypto_secretbox`) wrapped pairwise to members |
-| Server storage | `users.public_key`, `messages.encrypted_content`, `group_sender_keys.encrypted_key`, `chats.key_epoch` |
-
-Wire format (text): `hex(nonce[24] || ciphertext)`. Binary media: raw `nonce || ciphertext`.
-
-Platforms today: **Android** (LazySodium), **Windows** (libsodium). **No iOS / Web client** in this repository.
+Trust this file and the code. The original Phase 0 audit described a pre-vault system; that world is gone.
 
 ---
 
-## 2. Current key hierarchy
+## 1. What ships today
+
+The messenger uses **client-side NaCl/libsodium**. The Go backend is a **dumb relay**: ciphertext, sender-key wraps, and vault blobs only. It does not decrypt message bodies, attachments, or call audio.
+
+| Layer | Role |
+|-------|------|
+| Account auth | Email + bcrypt → JWT. Optional TOTP (RFC 6238). DEV OTP relay still used when TOTP is off and `DEV_2FA_ENABLED`. Forgot-password resets login bcrypt, not the vault. |
+| E2EE identity | One X25519 (`crypto_box`) keypair per account, shared across devices via the vault |
+| Direct v1 | Pairwise static `crypto_box` (`encryption_version=1`) |
+| Direct v2 | Ephemeral box `eph_pk(32)\|\|nonce(24)\|\|ct` (`encryption_version=2`) |
+| Direct v3 | Double Ratchet (`encryption_version=3`, default for new direct sends) |
+| Groups | Sender Keys (`crypto_secretbox`); `Chat.KeyEpoch` / `Message.KeyVersion` |
+| Vault | JSON AEAD (XChaCha20-Poly1305) under the E2EE Master Key; password + recovery wraps; QR/text pairing; `direct_ratchets` for v3 sessions |
+| Devices | `e2ee_devices` registry; revoke kicks WS and blocks API via `X-Device-Id` |
+| Server storage | `users.public_key`, opaque `messages.encrypted_content`, `group_sender_keys`, `e2ee_vaults` |
+
+Wire (text): v1 `hex(nonce\|\|ct)`; v2 `hex(eph_pk\|\|nonce\|\|ct)`. Binary media: the same layout as raw bytes. Inner plaintext uses an `EM1` envelope so filenames and forward attribution are not stored in server columns.
+
+Platforms: **Android** (LazySodium), **Windows** (libsodium). **No iOS / Web client.**
+
+---
+
+## 2. Key hierarchy (as implemented)
 
 ```
-Account password ──► bcrypt hash (auth only; NOT E2EE)
-JWT session ───────► API / WebSocket auth only
+Account password ──► bcrypt (auth only)
+                 └──► Argon2id (m=64MiB, t=3, p=1) ──► KEK_pw ──► wrap MK
 
-E2EE identity keypair (X25519)     ← generated on client when missing
-  ├── public  → POST /crypto/public-key → users.public_key (ONE per user)
-  └── private → device-local only
+Recovery key ──────► HKDF-SHA256 ──► KEK_rk ──► wrap MK
 
-Direct chat:
-  crypto_box(recipient_pub, sender_priv)
+E2EE Master Key (MK, 256-bit) ──► XChaCha20-Poly1305 ──► vault JSON
+  (MK is also the vault AEAD key; a separate VEK layer was not shipped)
+
+Vault JSON holds:
+  identity_pub_hex / identity_priv_hex
+  own_sender_keys:  "chatId|version" → hex
+  peer_sender_keys: "chatId|senderId|version" → hex
+  peer_pubs:        chatId → peer identity pub hex
+
+Direct:
+  v1 crypto_box(recipient_identity_pub, sender_identity_priv)
+  v2 crypto_box(recipient_identity_pub, ephemeral_sk) + eph_pk on the wire
 
 Group:
-  SenderKey_v (secretbox key for key_version ≈ key_epoch)
-    └── wrapped to each member via crypto_box(member_pub, sender_priv)
-    └── stored server-side as opaque blob in group_sender_keys
+  SenderKey_v (secretbox) wrapped pairwise to each member
 ```
 
-**Missing today (target architecture):** E2EE Master Key, Vault Encryption Key, password-derived KEK (Argon2id), Recovery Key, per-device identity keys, encrypted vault, vault versioning.
+Identity private keys never leave the client except inside vault ciphertext or a pairing MK wrap. `users.private_key` has been **dropped**.
 
 ---
 
-## 3. Current device model
+## 3. Device model
 
-- **One identity public key per user** (`users.public_key`), overwritten on new-device publish.
-- **One live WebSocket** per user id (`Hub.Clients[userID]`); second connection replaces the first.
-- **No** `device_id`, device list, revocation, or multi-device ciphertext fan-out.
-- New login without local private key → **new keypair** → overwrite server public key → **key takeover**.
-
----
-
-## 4. Current message encryption flow
-
-1. Client ensures local identity keys; publishes public key if needed.
-2. Direct: load peer `public_key` from chat list / API; `crypto_box_easy`; send `{ encrypted: true, content: hex(...) }`.
-3. Group: ensure own Sender Key for current `key_epoch`; encrypt with `crypto_secretbox`; set `key_version`; publish wrapped keys to members if rotated.
-4. Backend stores opaque `encrypted_content` and broadcasts over WebSocket.
-
-**Fallback weakness:** if keys are missing, clients may send **plaintext** (`encrypted: false`).
+- Identity public key remains **one per user** (`users.public_key`). New devices restore the same pair from the vault. `POST /crypto/public-key` with a *different* key is **409 identity_locked** if a vault or live device already exists.
+- WebSocket hub allows **multiple live connections per user** (phone + desktop). The same `device_id` replaces its previous socket. Revoke still kicks that device.
+- Each client registers `device_id` (`POST /e2ee/devices`). Settings can list and **revoke** other devices. Revoked devices get API `device_revoked` and a WS close.
+- Pairing: `mp1.<session>.<pub_hex>` (text + QR; scan or paste on Android and Windows). Old device seals MK; new device consumes payload once.
 
 ---
 
-## 5. Current message decryption flow
+## 4. Encrypt / decrypt
 
-1. Load ciphertext from REST or WebSocket.
-2. Direct: `crypto_box_open_easy` with peer pub + my priv.
-3. Group: fetch sender-key blob for `(sender_id, key_version)` if needed; unwrap with crypto_box; `crypto_secretbox_open_easy`.
-4. On failure → UI placeholder ("Encrypted message").
+**Send:** fail closed if keys are missing. `POST /messages` with `encrypted: false` → 400 `encryption_required`.
 
----
+**Direct:** prefer v3 Double Ratchet; still decrypt v2 and v1.
 
-## 6. Current key persistence
+**Group:** own Sender Key for current `key_epoch`; persist own and peer keys by version (disk + vault). Decrypt uses `key_version`, not “latest only”.
 
-| Platform | Private identity key | Own group sender keys | Peer sender keys |
-|----------|----------------------|-----------------------|------------------|
-| Android | Plain SharedPreferences hex | Prefs latest only (`version:hex`) | Memory after fetch |
-| Windows | AppData `credentials.json` hex (DPAPI helpers unused) | Same JSON latest only | Memory after fetch |
-| Server | **Also writes `users.private_key` on Register** via server `crypto.GenerateKeyPair` — unused by live clients but **violates "no private keys on backend"** |
-
-No password wrap, no recovery key, no vault, no cloud backup of private material.
+**Failure:** UI placeholder (“Encrypted message”), not plaintext fallback.
 
 ---
 
-## 7. Why historical messages cannot decrypt on a new device
+## 5. At-rest secrets
 
-Hard requirement failure today:
-
-1. Private keys never leave the old device.
-2. New device generates a **new** X25519 pair and **overwrites** `users.public_key`.
-3. Old direct ciphertext was sealed under the **old** identity; new private key cannot open it.
-4. Group sender-key wraps were sealed to the **old** public key; own historical sender keys lived only on the old device (and disk keeps **latest version only**).
-5. No vault / recovery path exists.
-
-Ciphertext remains on the server; the new device simply lacks the matching secrets.
+| Platform | Identity priv | Own / peer Sender Keys | Session tokens |
+|----------|---------------|------------------------|----------------|
+| Android | Keystore AES-GCM (`ks1:`) + vault | Same wrap; prefs keys `group_senderkey_*` / `peer_senderkey_*` | Refresh token wrapped |
+| Windows | DPAPI user-scope `credentials.json` (`DP1\n`) + vault | Same store | DPAPI |
+| Server | Not stored | Opaque wraps only | JWT secrets in env |
 
 ---
 
-## 8. Security vulnerabilities / gaps
+## 6. New-device history
+
+1. Sign in → download vault → unlock with password, recovery key, or pairing from an old device.
+2. Restore identity + sender-key maps + peer pubs.
+3. Register this `device_id`. Do **not** mint a new identity and overwrite `users.public_key`.
+4. Password reset without recovery/pairing: account works; **history stays locked**.
+
+---
+
+## 7. Gaps that remain
 
 | ID | Issue | Severity |
 |----|-------|----------|
-| V1 | Server stores `users.private_key` at register | High (server-side secret material) |
-| V2 | Android E2EE privkey in **plaintext** SharedPreferences | High |
-| V3 | Windows keys in plain JSON; DPAPI unused | High |
-| V4 | Single pubkey overwrite = silent multi-device break | High (availability of history) |
-| V5 | Plaintext message fallback when keys missing | High (confidentiality) |
-| V6 | No FS for direct chats (static identity box forever) | Medium (protocol property) |
-| V7 | Own group sender key: latest only → can't decrypt own older versions after rotation | Medium |
-| V8 | No 2FA | Medium (account takeover → key takeover) |
-| V9 | Dead `DecryptMessageForUser` helper + server encrypt APIs in `back-end/crypto` | Low/Medium (attack surface / confusion) |
-| V10 | Unused Android `MessageEncryption` AES stub (custom DH) still in DI | Low (must not be wired) |
-| V11 | One WS slot / no device revocation | Medium |
+| V1 | Server `users.private_key` | **Closed** — column dropped |
+| V2 / V3 | Client at-rest identity | Mitigated (Keystore / user DPAPI) |
+| V4 | New device overwriting identity | **Mitigated** — server rejects a different `public_key` once a vault or live device exists |
+| V5 | Cleartext send | Mitigated (API reject + client fail-closed) |
+| V6 | Direct chat FS | **Mitigated** — v3 Double Ratchet (identity SK does not open post-ratchet messages); v2 still sender-only |
+| V7 | Historical own Sender Keys | Mitigated (disk + vault) |
+| V8 | No production 2FA | **Mitigated** — TOTP + backup codes; password reset also requires TOTP when enabled |
+| V11 | One WS slot / revoke | **Mitigated** — multi-device hub; revoke still kicks that device |
+| — | Peer Sender Keys only in RAM | Mitigated (disk Phase 20, vault Phase 21) |
+| — | iOS / Web | Not in repo |
+| — | Full Double Ratchet | **Mitigated** — libsodium DR (`encryption_version=3`); not AGPL libsignal |
+| — | Windows camera QR scan | Mitigated (camera + paste) |
+| — | Multi-device v3 vault | Mitigated — 409 merge by `seq`; pull on reconnect; **FN1** fan-out per device (`GET /e2ee/chats/:id/devices`) so simultaneous send does not share one chain |
+| — | Peer key substitution | Mitigated — TOFU pin; QR/text safety-number verify (`sn1.`) |
+| — | Filename / forward-name / duration / size on server | Mitigated — `EM1` inner envelope (`fn`,`fwd`,`dur`,`sz`); API columns empty/zero on new sends |
+| — | Cross-NAT calls | Needs public TURN / `TURN_EXTERNAL_IP` |
+| — | Windows video loss | Mitigated (RTCP NACK responder + PLI keyframe) |
 
-**Custom protocol risk:** This is **not** Signal Double Ratchet / X3DH. It is a recognized **NaCl box + Sender Keys** construction. Risks are mainly **key management / multi-device / persistence**, not inventing ciphers. Do **not** replace primitives blindly; wrap and migrate state.
-
----
-
-## 9. Compatibility constraints
-
-- Preserve wire formats for existing ciphertext (hex box / raw box / secretbox + `key_version`).
-- Preserve `key_epoch` membership rotation semantics.
-- Preserve REST/WS message shapes where possible.
-- Migration must import existing identity private key + historical sender keys into vault **before** discarding local copies.
-- Android/Windows must stay byte-compatible; future iOS/Web must implement the **same** suite IDs.
+**Custom protocol:** NaCl box + Sender Keys, not Signal. Do not replace primitives; keep suite IDs.
 
 ---
 
-## 10. Recommended migration strategy (high level)
+## 8. Compatibility
 
-**Do not invent a new cipher suite.** Keep libsodium `crypto_box` / `crypto_secretbox` for message traffic (protocol_version 1).
+- Keep v1 ciphertext decryptable forever.
+- Keep `key_epoch` membership rotation.
+- Vault is **JSON** (not CBOR). Field names are stable; unknown fields ignored; `peer_sender_keys` and `direct_ratchets` omitempty.
+- Test vectors: `test-vectors/e2ee/` — `cd back-end && go test ./e2ee/`.
 
-Add a **recoverable vault layer** beside it:
-
-1. Client generates 256-bit **E2EE Master Key** (stable across password changes).
-2. Random **Vault Encryption Key** wrapped by Master Key (envelope encryption; XChaCha20-Poly1305 or AES-256-GCM — choose one suite ID for all platforms).
-3. **Vault** (versioned CBOR) holds: identity sk/pk, historical sender keys by version, known peer pubs needed for history, protocol/suite metadata.
-4. Master Key wrapped by Argon2id(password) KEK **and** independently by Recovery Key KEK; ciphertext + salts/params stored on server as opaque blobs.
-5. New device: login (+ future 2FA) → download vault ciphertext → unlock locally → restore keys → decrypt history → register **device** public key (multi-device) without destroying identity.
-6. Stop writing `users.private_key` on register; clear existing rows in a controlled migration.
-7. Multi-device: identity private key shared via vault; optional per-device signing/auth keys for revocation; message protocol stays identity-based until a later ratchet migration (explicit, not silent).
-
-**Forward secrecy:** Document that protocol_v1 direct chat is **not** FS. Do not claim FS. Future protocol_v2 may adopt an established library (e.g. libsignal) — separate project phase.
-
-**Conflict note:** Requirements demand historical decrypt on every authorized device **and** FS. With static box keys, sharing identity/history keys via vault enables multi-device history but **does not add FS**. Achieving both requires a protocol upgrade for *new* messages while keeping v1 keys in the vault for *old* messages. That is the honest migration path.
-
----
-
-## Target layered concepts (must stay separate)
-
-```
-Account Authentication (password + 2FA + JWT)
-  ≠ E2EE Identity (X25519 long-term)
-  ≠ E2EE Master Key (256-bit root)
-  ≠ Vault Encryption Key (envelope)
-  ≠ Conversation / Sender Keys
-  ≠ Message ciphertext
-```
-
-See also: `e2ee-key-hierarchy.md`, `e2ee-protocol.md`, `e2ee-migration.md`, `e2ee-threat-model.md`, `e2ee-recovery.md`, `e2ee-cross-platform.md`.
+See also: `e2ee-key-hierarchy.md`, `e2ee-protocol.md`, `e2ee-protocol-v2.md`, `e2ee-migration.md`, `e2ee-threat-model.md`, `e2ee-recovery.md`, `e2ee-cross-platform.md`.

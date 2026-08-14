@@ -17,11 +17,14 @@ type User struct {
 	AvatarURL     string    `json:"avatar_url"`
 	PhoneNumber   string    `json:"phone_number"`
 	PublicKey     string    `json:"public_key" gorm:"size:512"`
-	PrivateKey    string    `json:"-" gorm:"size:512"`
 	IsOnline      bool      `json:"is_online" gorm:"default:false"`
 	LastSeen      time.Time `json:"last_seen"`
 	FirebaseToken string    `json:"firebase_token" gorm:"size:512"`
-	CreatedAt     time.Time `json:"created_at"`
+	// TotpSecret is RFC 6238 base32 (never in JSON). TotpEnabled is the login gate.
+	TotpSecret       string `json:"-" gorm:"size:64"`
+	TotpEnabled      bool   `json:"totp_enabled" gorm:"default:false"`
+	TotpBackupHashes string `json:"-" gorm:"type:text"`
+	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
@@ -43,6 +46,9 @@ type Message struct {
 	// this while the video itself is still downloading, so a chat never shows
 	// an empty circle waiting on a multi-megabyte fetch.
 	ThumbnailURL string `json:"thumbnail_url" gorm:"size:512"`
+	// SenderDeviceID is the installing device that sealed a direct v3 fan-out
+	// (FN1). Empty on historical rows; clients fall back to a shared session.
+	SenderDeviceID    string      `json:"sender_device_id" gorm:"size:128"`
 	// KeyVersion identifies which of the sender's group Sender Key versions
 	// (see Chat.KeyEpoch) encrypted this message - meaningless/0 outside a
 	// group chat, where the pairwise crypto_box scheme needs no versioning.
@@ -232,9 +238,12 @@ type MessageCreateRequest struct {
 	ThumbnailURL string `json:"thumbnail_url"`
 	// KeyVersion: see Message.KeyVersion. Only meaningful (and only ever
 	// non-zero) for a group message.
-	KeyVersion int         `json:"key_version"`
-	ReplyToID  *uuid.UUID  `json:"reply_to_id"`
-	MentionIDs []uuid.UUID `json:"mention_ids"`
+	KeyVersion int `json:"key_version"`
+	// EncryptionVersion: 1 = static pairwise crypto_box (legacy);
+	// 2 = ephemeral crypto_box (direct FS). Groups stay at 1.
+	EncryptionVersion int `json:"encryption_version"`
+	ReplyToID         *uuid.UUID  `json:"reply_to_id"`
+	MentionIDs        []uuid.UUID `json:"mention_ids"`
 	// Forward attribution (UI only; content is always re-encrypted for the target).
 	IsForwarded            bool       `json:"is_forwarded"`
 	ForwardedFromName      string     `json:"forwarded_from_name"`
@@ -377,9 +386,16 @@ func MigrateDB(db *gorm.DB) error {
 		&CallLog{},
 		&MessageDeletion{},
 		&UserBlock{},
+		&E2EEVault{},
+		&E2EEDevice{},
+		&E2EEPairingSession{},
 	); err != nil {
 		return err
 	}
+
+	// Legacy: Register used to store an unused server-side private key.
+	// Drop the column so a DB dump cannot expose leftover E2EE material.
+	db.Exec("ALTER TABLE users DROP COLUMN IF EXISTS private_key")
 
 	// messages.deleted_for is abandoned in favour of MessageDeletion, and any
 	// value left in it has to go. []uuid.UUID is only scannable while the

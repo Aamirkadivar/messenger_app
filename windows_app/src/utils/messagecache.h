@@ -40,6 +40,7 @@ public:
         // Which of the sender's group Sender Key versions encrypted this
         // message - 0/unused outside a group chat.
         int keyVersion = 0;
+        int encryptionVersion = 1;
         // Display-only forward attribution (payload is always a fresh
         // ciphertext for this chat; the server never copies source blobs).
         bool isForwarded = false;

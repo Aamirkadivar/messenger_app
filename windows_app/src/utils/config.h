@@ -55,7 +55,7 @@ public:
     static constexpr int messagesPageSize() { return 30; }
     static constexpr int presencePingInterval() { return 30000; } // ms
     static constexpr int typingDebounceMs() { return 500; }
-    static constexpr int reconnectDelayMs() { return 3000; }
-    static constexpr int maxReconnectAttempts() { return 10; }
+    static constexpr int reconnectDelayMs() { return 1000; }
+    // Unused: the socket retries forever with exponential backoff.
     static constexpr int tokenRefreshThreshold() { return 300; } // seconds before expiry
 };

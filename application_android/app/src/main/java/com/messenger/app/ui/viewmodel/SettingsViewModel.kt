@@ -8,9 +8,12 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.messenger.app.BuildConfig
 import android.net.Uri
+import com.messenger.app.data.model.TotpConfirmRequest
+import com.messenger.app.data.model.TotpDisableRequest
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.data.repository.AvatarRepository
 import com.messenger.app.data.repository.ChatRepository
+import com.messenger.app.data.repository.E2EEVaultRepository
 import com.messenger.app.data.settings.AppSettings
 import com.messenger.app.data.settings.AutoDeleteWindow
 import com.messenger.app.data.settings.MediaKind
@@ -50,6 +53,14 @@ data class BlockedUserUi(
     val avatarUrl: String? = null
 )
 
+/** Registered E2EE client device (Settings → Privacy → Devices). */
+data class E2EEDeviceUi(
+    val deviceId: String,
+    val name: String,
+    val platform: String,
+    val revoked: Boolean = false
+)
+
 /** The signed-in user, shown in the Settings profile row. */
 data class ProfileUi(
     val name: String = "",
@@ -84,7 +95,8 @@ class SettingsViewModel @Inject constructor(
     private val chatRepository: ChatRepository,
     private val avatarRepository: AvatarRepository,
     private val chatApiService: ChatApiService,
-    private val tokenManager: TokenManager
+    private val tokenManager: TokenManager,
+    private val e2eeVaultRepository: E2EEVaultRepository
 ) : ViewModel() {
 
     /**
@@ -184,11 +196,22 @@ class SettingsViewModel @Inject constructor(
     private val _blockedUsersLoading = MutableStateFlow(false)
     val blockedUsersLoading: StateFlow<Boolean> = _blockedUsersLoading.asStateFlow()
 
+    private val _e2eeDevices = MutableStateFlow<List<E2EEDeviceUi>>(emptyList())
+    val e2eeDevices: StateFlow<List<E2EEDeviceUi>> = _e2eeDevices.asStateFlow()
+
+    private val _e2eeDevicesLoading = MutableStateFlow(false)
+    val e2eeDevicesLoading: StateFlow<Boolean> = _e2eeDevicesLoading.asStateFlow()
+
+    private val _currentDeviceId = MutableStateFlow<String?>(null)
+    val currentDeviceId: StateFlow<String?> = _currentDeviceId.asStateFlow()
+
     init {
         // Kick off the (slow) scan as soon as Settings is first constructed.
         storageAnalyzer.scan()
         loadProfile()
         loadBlockedUsers()
+        loadE2EEDevices()
+        loadTotpStatus()
     }
 
     fun consumeToast() { _toast.value = null }
@@ -215,6 +238,180 @@ class SettingsViewModel @Inject constructor(
                     _toast.value = e.message ?: "Failed to load blocked users"
                 }
             _blockedUsersLoading.value = false
+        }
+    }
+
+    fun loadE2EEDevices() {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            _e2eeDevicesLoading.value = true
+            _currentDeviceId.value = tokenManager.getOrCreateDeviceId().getOrNull()
+            e2eeVaultRepository.listDevices(token)
+                .onSuccess { list ->
+                    _e2eeDevices.value = list.map { d ->
+                        E2EEDeviceUi(
+                            deviceId = d.deviceId,
+                            name = d.name.ifBlank { d.deviceId },
+                            platform = d.platform,
+                            revoked = !d.revokedAt.isNullOrBlank()
+                        )
+                    }
+                }
+                .onFailure { e ->
+                    _toast.value = e.message ?: "Failed to load devices"
+                }
+            _e2eeDevicesLoading.value = false
+        }
+    }
+
+    fun revokeE2EEDevice(device: E2EEDeviceUi) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            e2eeVaultRepository.revokeDevice(token, device.deviceId)
+                .onSuccess {
+                    _e2eeDevices.update { list ->
+                        list.map {
+                            if (it.deviceId == device.deviceId) it.copy(revoked = true) else it
+                        }
+                    }
+                    _toast.value = "Device revoked"
+                }
+                .onFailure { e ->
+                    _toast.value = e.message ?: "Failed to revoke device"
+                }
+        }
+    }
+
+    private val _changingPassword = MutableStateFlow(false)
+    val changingPassword: StateFlow<Boolean> = _changingPassword.asStateFlow()
+
+    private val _passwordChangeSucceeded = MutableStateFlow(false)
+    val passwordChangeSucceeded: StateFlow<Boolean> = _passwordChangeSucceeded.asStateFlow()
+
+    fun consumePasswordChangeSucceeded() {
+        _passwordChangeSucceeded.value = false
+    }
+
+    fun changePassword(currentPassword: String, newPassword: String) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            _changingPassword.value = true
+            _passwordChangeSucceeded.value = false
+            e2eeVaultRepository.changeAccountPassword(token, currentPassword, newPassword)
+                .onSuccess {
+                    _passwordChangeSucceeded.value = true
+                    _toast.value = "Password updated"
+                }
+                .onFailure { e ->
+                    _toast.value = e.message ?: "Failed to change password"
+                }
+            _changingPassword.value = false
+        }
+    }
+
+    private val _totpEnabled = MutableStateFlow(false)
+    val totpEnabled: StateFlow<Boolean> = _totpEnabled.asStateFlow()
+    private val _totpSecret = MutableStateFlow<String?>(null)
+    val totpSecret: StateFlow<String?> = _totpSecret.asStateFlow()
+    private val _totpBackupCodes = MutableStateFlow<List<String>>(emptyList())
+    val totpBackupCodes: StateFlow<List<String>> = _totpBackupCodes.asStateFlow()
+    private val _totpBusy = MutableStateFlow(false)
+    val totpBusy: StateFlow<Boolean> = _totpBusy.asStateFlow()
+
+    fun loadTotpStatus() {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            chatApiService.totpStatus("Bearer $token").body()?.let {
+                _totpEnabled.value = it.totpEnabled
+            }
+        }
+    }
+
+    fun startTotpSetup() {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            _totpBusy.value = true
+            val r = runCatching { chatApiService.totpSetup("Bearer $token") }.getOrNull()
+            val body = r?.body()
+            if (r?.isSuccessful == true && body != null) {
+                _totpSecret.value = body.secret
+            } else {
+                _toast.value = "Could not start authenticator setup"
+            }
+            _totpBusy.value = false
+        }
+    }
+
+    fun confirmTotp(code: String) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            _totpBusy.value = true
+            val r = runCatching {
+                chatApiService.totpConfirm("Bearer $token", TotpConfirmRequest(code.trim()))
+            }.getOrNull()
+            if (r?.isSuccessful == true && r.body()?.totpEnabled == true) {
+                _totpEnabled.value = true
+                _totpSecret.value = null
+                _totpBackupCodes.value = r.body()?.backupCodes.orEmpty()
+                _toast.value = if (_totpBackupCodes.value.isEmpty())
+                    "Authenticator enabled"
+                else
+                    "Save these backup codes — they are shown once"
+            } else {
+                _toast.value = "Invalid code"
+            }
+            _totpBusy.value = false
+        }
+    }
+
+    fun disableTotp(password: String, code: String) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            _totpBusy.value = true
+            val r = runCatching {
+                chatApiService.totpDisable("Bearer $token", TotpDisableRequest(password, code.trim()))
+            }.getOrNull()
+            if (r?.isSuccessful == true) {
+                _totpEnabled.value = false
+                _toast.value = "Authenticator disabled"
+            } else {
+                _toast.value = "Could not disable (check password and code)"
+            }
+            _totpBusy.value = false
+        }
+    }
+
+    fun regenerateTotpBackupCodes(password: String, code: String) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            _totpBusy.value = true
+            val r = runCatching {
+                chatApiService.totpRegenerateBackupCodes(
+                    "Bearer $token",
+                    TotpDisableRequest(password, code.trim())
+                )
+            }.getOrNull()
+            if (r?.isSuccessful == true) {
+                _totpBackupCodes.value = r.body()?.backupCodes.orEmpty()
+                _toast.value = "Save these backup codes — they are shown once"
+            } else {
+                _toast.value = "Could not regenerate (check password and code)"
+            }
+            _totpBusy.value = false
+        }
+    }
+
+    fun clearTotpSetup() {
+        _totpSecret.value = null
+        _totpBackupCodes.value = emptyList()
+    }
+
+    fun approveDevicePairing(pairingCode: String) {
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            e2eeVaultRepository.approveDevicePairing(token, pairingCode.trim())
+                .onSuccess { _toast.value = "Device linked" }
+                .onFailure { e -> _toast.value = e.message ?: "Failed to link device" }
         }
     }
 

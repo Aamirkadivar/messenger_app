@@ -29,6 +29,7 @@ public:
     bool isConnected() const { return m_webSocket && m_webSocket->state() == QAbstractSocket::ConnectedState; }
     QString connectionState() const { return m_connectionState; }
 
+    Q_INVOKABLE void setDeviceId(const QString& deviceId) { m_deviceId = deviceId; }
     Q_INVOKABLE void connectToServer(const QString& token);
     Q_INVOKABLE void disconnectFromServer();
     Q_INVOKABLE void joinChat(const QString& chatId);
@@ -90,13 +91,16 @@ private:
     // "reconnecting" once we've connected successfully at least once,
     // otherwise "connecting" - so a run of failed first-attempts doesn't
     // flicker between the two labels before ever reaching the server.
+    void scheduleReconnect();
     QString nextRetryState() const { return m_hasConnectedBefore ? QStringLiteral("reconnecting") : QStringLiteral("connecting"); }
 
     QWebSocket* m_webSocket = nullptr;
     QTimer m_reconnectTimer;
     QTimer m_healthTimer;
     qint64 m_lastActivityMs = 0;
+    int m_reconnectAttempts = 0;
     QString m_token;
+    QString m_deviceId;
     QString m_serverUrl;
     QSet<QString> m_joinedChats;
     bool m_autoReconnect = true;

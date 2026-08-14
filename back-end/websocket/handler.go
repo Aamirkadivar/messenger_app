@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"messenger-app/crypto"
 	"messenger-app/database"
 	"messenger-app/firebase"
 	"messenger-app/middleware"
@@ -29,12 +28,13 @@ const (
 
 // Client represents a connected WebSocket client
 type Client struct {
-	ID     string
-	UserID uuid.UUID
-	Conn   *websocket.Conn
-	Send   chan []byte
-	Rooms  map[string]bool
-	mu     sync.RWMutex
+	ID       string
+	UserID   uuid.UUID
+	DeviceID string
+	Conn     *websocket.Conn
+	Send     chan []byte
+	Rooms    map[string]bool
+	mu       sync.RWMutex
 	// writeMu serializes ALL writes to Conn. A websocket connection permits
 	// only one concurrent writer, and there are two here: writePump's
 	// goroutine, and the read goroutine's control-frame replies (the pong
@@ -54,24 +54,26 @@ func (c *Client) writeMessage(messageType int, data []byte) error {
 	return c.Conn.WriteMessage(messageType, data)
 }
 
-// Hub manages all connected WebSocket clients
+// Hub manages all connected WebSocket clients.
+// Multiple live connections per user are allowed (one phone + one desktop).
+// UserClients maps userID -> connectionID -> *Client.
 type Hub struct {
-	Clients    map[uuid.UUID]*Client
-	Rooms      map[string]map[uuid.UUID]bool
-	Register   chan *Client
-	Unregister chan *Client
-	Broadcast  chan []byte
-	mu         sync.RWMutex
+	UserClients map[uuid.UUID]map[string]*Client
+	Rooms       map[string]map[uuid.UUID]bool
+	Register    chan *Client
+	Unregister  chan *Client
+	Broadcast   chan []byte
+	mu          sync.RWMutex
 }
 
 // NewHub creates a new Hub instance
 func NewHub() *Hub {
 	return &Hub{
-		Clients:    make(map[uuid.UUID]*Client),
-		Rooms:      make(map[string]map[uuid.UUID]bool),
-		Register:   make(chan *Client),
-		Unregister: make(chan *Client),
-		Broadcast:  make(chan []byte),
+		UserClients: make(map[uuid.UUID]map[string]*Client),
+		Rooms:       make(map[string]map[uuid.UUID]bool),
+		Register:    make(chan *Client),
+		Unregister:  make(chan *Client),
+		Broadcast:   make(chan []byte),
 	}
 }
 
@@ -85,39 +87,80 @@ var roomScopedTypes = map[string]bool{
 	"message:deleted": true,
 }
 
+// forEachClient runs fn for every live connection (caller must hold lock).
+func (h *Hub) forEachClient(fn func(*Client)) {
+	for _, conns := range h.UserClients {
+		for _, client := range conns {
+			fn(client)
+		}
+	}
+}
+
 // Run starts the Hub event loop
 func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.Register:
 			h.mu.Lock()
-			h.Clients[client.UserID] = client
-			h.mu.Unlock()
-			log.Printf("Client %s connected", client.ID)
-
-		case client := <-h.Unregister:
-			h.mu.Lock()
-			// Only evict this user's slot if it still holds *this* client.
-			// Clients is keyed by user id alone, so a second connection for
-			// the same account replaces the first; when that second one then
-			// disconnected, an unconditional delete tore out the entry
-			// belonging to the connection that was still live. The surviving
-			// client stayed connected but unregistered - silently receiving
-			// nothing at all, with no error and no reconnect, until it was
-			// restarted.
-			if current, ok := h.Clients[client.UserID]; ok && current == client {
-				delete(h.Clients, client.UserID)
-				for room := range client.Rooms {
-					if _, ok := h.Rooms[room]; ok {
-						delete(h.Rooms[room], client.UserID)
+			var stale []*Client
+			if client.DeviceID != "" {
+				for _, c := range h.UserClients[client.UserID] {
+					if c.DeviceID == client.DeviceID {
+						stale = append(stale, c)
 					}
 				}
 			}
-			// Closing Send always belongs to the departing client, registered
-			// or not - its writePump is waiting on that channel either way.
+			if h.UserClients[client.UserID] == nil {
+				h.UserClients[client.UserID] = make(map[string]*Client)
+			}
+			h.UserClients[client.UserID][client.ID] = client
+			h.mu.Unlock()
+			log.Printf("Client %s (user %s device %s) connected", client.ID, client.UserID, client.DeviceID)
+			for _, old := range stale {
+				_ = old.writeMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "replaced"))
+				_ = old.Conn.Close()
+			}
+
+		case client := <-h.Unregister:
+			h.mu.Lock()
+			if conns, ok := h.UserClients[client.UserID]; ok {
+				if current, ok := conns[client.ID]; ok && current == client {
+					delete(conns, client.ID)
+				}
+				if len(conns) == 0 {
+					delete(h.UserClients, client.UserID)
+					for room := range client.Rooms {
+						if members, ok := h.Rooms[room]; ok {
+							delete(members, client.UserID)
+						}
+					}
+				} else {
+					// Drop rooms this connection alone held; keep user in a
+					// room if another of their devices is still joined.
+					for room := range client.Rooms {
+						still := false
+						for _, other := range conns {
+							if other.Rooms[room] {
+								still = true
+								break
+							}
+						}
+						if !still {
+							if members, ok := h.Rooms[room]; ok {
+								delete(members, client.UserID)
+							}
+						}
+					}
+				}
+			}
 			close(client.Send)
+			wasLast := len(h.UserClients[client.UserID]) == 0
 			h.mu.Unlock()
 			log.Printf("Client %s disconnected", client.ID)
+			if wasLast {
+				// Mark offline only when no device remains connected.
+				go leavePresence(h, client.UserID)
+			}
 
 		case message := <-h.Broadcast:
 			var wsMsg models.WebSocketMessage
@@ -128,42 +171,30 @@ func (h *Hub) Run() {
 
 			h.mu.RLock()
 			if wsMsg.Type == "presence" {
-				// Presence isn't scoped to a single chat room - anyone connected
-				// should see it, since the user could appear in several chats.
-				for _, client := range h.Clients {
+				h.forEachClient(func(client *Client) {
 					select {
 					case client.Send <- message:
 					default:
 						close(client.Send)
 					}
-				}
+				})
 			} else if roomScopedTypes[wsMsg.Type] {
-				// Routed purely on room membership.
-				//
-				// This used to branch on chat_type into "direct" and "group"
-				// arms that did exactly the same thing, which achieved nothing
-				// except silently dropping any event whose payload happened to
-				// omit chat_type. Membership of the chat's room is already the
-				// only thing that decides who should receive it.
 				if wsMsg.Data != nil {
 					if data, ok := wsMsg.Data.(map[string]interface{}); ok {
 						chatID, _ := data["chat_id"].(string)
-						for _, client := range h.Clients {
+						h.forEachClient(func(client *Client) {
 							if !client.Rooms[chatID] {
-								continue
+								return
 							}
 							select {
 							case client.Send <- message:
 							default:
 								close(client.Send)
 							}
-						}
+						})
 					}
 				}
 			} else {
-				// An unroutable type is a bug, not a no-op: it means a feature
-				// pushed an event that will never be delivered. message:deleted
-				// spent its first outing being dropped here.
 				log.Printf("hub: no routing rule for broadcast type %q - dropped", wsMsg.Type)
 			}
 			h.mu.RUnlock()
@@ -171,42 +202,54 @@ func (h *Hub) Run() {
 	}
 }
 
-// JoinRoom allows a client to join a room (chat)
-func (h *Hub) JoinRoom(userID uuid.UUID, room string) {
+// JoinRoom marks this connection as subscribed to a chat room.
+func (h *Hub) JoinRoom(client *Client, room string) {
+	if client == nil {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if client, ok := h.Clients[userID]; ok {
-		if client.Rooms == nil {
-			client.Rooms = make(map[string]bool)
-		}
-		client.Rooms[room] = true
-		if h.Rooms[room] == nil {
-			h.Rooms[room] = make(map[uuid.UUID]bool)
-		}
-		h.Rooms[room][userID] = true
+	if client.Rooms == nil {
+		client.Rooms = make(map[string]bool)
 	}
+	client.Rooms[room] = true
+	if h.Rooms[room] == nil {
+		h.Rooms[room] = make(map[uuid.UUID]bool)
+	}
+	h.Rooms[room][client.UserID] = true
 }
 
-// LeaveRoom allows a client to leave a room
-func (h *Hub) LeaveRoom(userID uuid.UUID, room string) {
+// LeaveRoom unsubscribes this connection from a chat room.
+func (h *Hub) LeaveRoom(client *Client, room string) {
+	if client == nil {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if client, ok := h.Clients[userID]; ok {
-		delete(client.Rooms, room)
+	delete(client.Rooms, room)
+	still := false
+	if conns, ok := h.UserClients[client.UserID]; ok {
+		for _, other := range conns {
+			if other.Rooms[room] {
+				still = true
+				break
+			}
+		}
 	}
-	if roomMembers, ok := h.Rooms[room]; ok {
-		delete(roomMembers, userID)
+	if !still {
+		if roomMembers, ok := h.Rooms[room]; ok {
+			delete(roomMembers, client.UserID)
+		}
 	}
 }
 
-// IsUserOnline checks if a user is currently connected
+// IsUserOnline checks if a user has any live connection.
 func (h *Hub) IsUserOnline(userID uuid.UUID) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	_, ok := h.Clients[userID]
-	return ok
+	return len(h.UserClients[userID]) > 0
 }
 
 // GetOnlineUsers returns a list of online user IDs
@@ -214,11 +257,32 @@ func (h *Hub) GetOnlineUsers() []uuid.UUID {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	online := make([]uuid.UUID, 0, len(h.Clients))
-	for userID := range h.Clients {
-		online = append(online, userID)
+	online := make([]uuid.UUID, 0, len(h.UserClients))
+	for userID, conns := range h.UserClients {
+		if len(conns) > 0 {
+			online = append(online, userID)
+		}
 	}
 	return online
+}
+
+// KickDevice closes every live WebSocket for userID+deviceID (used on revoke).
+func (h *Hub) KickDevice(userID uuid.UUID, deviceID string) {
+	if deviceID == "" {
+		return
+	}
+	h.mu.RLock()
+	var targets []*Client
+	for _, c := range h.UserClients[userID] {
+		if c.DeviceID == deviceID {
+			targets = append(targets, c)
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range targets {
+		_ = c.writeMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "device revoked"))
+		_ = c.Conn.Close()
+	}
 }
 
 // HandleWebSocket handles WebSocket connections
@@ -252,19 +316,21 @@ func HandleWebSocket(hub *Hub) fiber.Handler {
 		}
 
 		userID := claims.UserID
+		deviceID := c.Query("device_id")
 
 		clientID := fmt.Sprintf("%s-%d", userID.String(), time.Now().UnixNano())
 		client := &Client{
-			ID:     clientID,
-			UserID: userID,
-			Conn:   c,
-			Send:   make(chan []byte, 256),
-			Rooms:  make(map[string]bool),
+			ID:       clientID,
+			UserID:   userID,
+			DeviceID: deviceID,
+			Conn:     c,
+			Send:     make(chan []byte, 256),
+			Rooms:    make(map[string]bool),
 		}
 
 		// Register client
 		hub.Register <- client
-		hub.JoinRoom(userID, fmt.Sprintf("user:%s", userID.String()))
+		hub.JoinRoom(client, fmt.Sprintf("user:%s", userID.String()))
 
 		// Update presence
 		updatePresence(hub, userID, true)
@@ -299,17 +365,17 @@ func HandleWebSocket(hub *Hub) fiber.Handler {
 				}
 				break
 			}
-			handleClientMessage(hub, userID, message)
+			handleClientMessage(hub, client, message)
 		}
 
-		// Unregister and cleanup
+		// Unregister and cleanup (presence offline is handled in Unregister
+		// when this was the user's last live connection).
 		hub.Unregister <- client
-		leavePresence(hub, userID)
 	})
 }
 
 // handleClientMessage processes messages received from clients
-func handleClientMessage(hub *Hub, userID uuid.UUID, message []byte) {
+func handleClientMessage(hub *Hub, client *Client, message []byte) {
 	var wsMsg models.WebSocketMessage
 	if err := json.Unmarshal(message, &wsMsg); err != nil {
 		log.Printf("Error parsing message: %v", err)
@@ -322,13 +388,13 @@ func handleClientMessage(hub *Hub, userID uuid.UUID, message []byte) {
 	case "join":
 		if data, ok := wsMsg.Data.(map[string]interface{}); ok {
 			if chatID, ok := data["chat_id"].(string); ok {
-				hub.JoinRoom(userID, chatID)
+				hub.JoinRoom(client, chatID)
 			}
 		}
 	case "leave":
 		if data, ok := wsMsg.Data.(map[string]interface{}); ok {
 			if chatID, ok := data["chat_id"].(string); ok {
-				hub.LeaveRoom(userID, chatID)
+				hub.LeaveRoom(client, chatID)
 			}
 		}
 	case "message", "typing", "presence":
@@ -336,7 +402,7 @@ func handleClientMessage(hub *Hub, userID uuid.UUID, message []byte) {
 		hub.Broadcast <- broadcastMsg
 	default:
 		if CallSignalTypes[wsMsg.Type] {
-			handleCallSignal(hub, userID, wsMsg)
+			handleCallSignal(hub, client, wsMsg)
 			return
 		}
 		log.Printf("Unknown message type: %s", wsMsg.Type)
@@ -410,21 +476,54 @@ func WSHandler(hub *Hub) fiber.Handler {
 	return HandleWebSocket(hub)
 }
 
-// BroadcastToUser sends a message to a specific user's WebSocket connection
+// BroadcastToUser sends a message to every live connection for a user.
 func (h *Hub) BroadcastToUser(userID uuid.UUID, message []byte) error {
 	h.mu.RLock()
-	client, ok := h.Clients[userID]
+	conns := h.UserClients[userID]
+	clients := make([]*Client, 0, len(conns))
+	for _, c := range conns {
+		clients = append(clients, c)
+	}
 	h.mu.RUnlock()
 
-	if !ok {
+	if len(clients) == 0 {
 		return fmt.Errorf("user %s is not connected", userID.String())
 	}
 
-	select {
-	case client.Send <- message:
-		return nil
-	default:
-		return fmt.Errorf("send buffer full for user %s", userID.String())
+	var lastErr error
+	sent := 0
+	for _, client := range clients {
+		select {
+		case client.Send <- message:
+			sent++
+		default:
+			lastErr = fmt.Errorf("send buffer full for user %s", userID.String())
+		}
+	}
+	if sent == 0 {
+		return lastErr
+	}
+	return nil
+}
+
+// BroadcastToUserExcept is BroadcastToUser skipping one connection (the device
+// that originated a signal, so siblings can still be told "answered here").
+func (h *Hub) BroadcastToUserExcept(userID uuid.UUID, exceptClientID string, message []byte) {
+	h.mu.RLock()
+	conns := h.UserClients[userID]
+	clients := make([]*Client, 0, len(conns))
+	for _, c := range conns {
+		if c.ID == exceptClientID {
+			continue
+		}
+		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+	for _, client := range clients {
+		select {
+		case client.Send <- message:
+		default:
+		}
 	}
 }
 
@@ -467,9 +566,4 @@ func NotifyPushNotification(recipientID uuid.UUID, senderName, messageContent st
 	}
 
 	return fcm.SendPushNotification(user.FirebaseToken, senderName, messageContent, senderName, map[string]string{"type": "message"})
-}
-
-// DecryptMessageForUser decrypts a message for the given user
-func DecryptMessageForUser(encryptedContent string, recipientPrivateKey string, nonce string) (string, error) {
-	return crypto.DecryptMessage(encryptedContent, recipientPrivateKey, nonce)
 }

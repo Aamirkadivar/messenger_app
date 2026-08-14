@@ -57,6 +57,7 @@ void MessageCache::ensureSchema() {
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN is_forwarded INTEGER NOT NULL DEFAULT 0"));
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN forwarded_from_name TEXT"));
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN reply_to_id TEXT"));
+    query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN encryption_version INTEGER NOT NULL DEFAULT 1"));
     query.exec(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS chats ("
         "  id TEXT PRIMARY KEY,"
@@ -74,8 +75,8 @@ void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entri
         "INSERT OR REPLACE INTO messages "
         "(id, chat_id, sender_id, sender_name, content, encrypted, read_at, created_at, "
         " file_url, file_type, duration_ms, file_name, file_size, key_version, "
-        " is_forwarded, forwarded_from_name, reply_to_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " is_forwarded, forwarded_from_name, reply_to_id, encryption_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ));
 
     m_db.transaction();
@@ -97,6 +98,7 @@ void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entri
         query.addBindValue(e.isForwarded ? 1 : 0);
         query.addBindValue(e.forwardedFromName);
         query.addBindValue(e.replyToId);
+        query.addBindValue(e.encryptionVersion <= 0 ? 1 : e.encryptionVersion);
         if (!query.exec()) {
             qWarning() << "[MessageCache] Failed to save message:" << query.lastError().text();
         }
@@ -112,7 +114,7 @@ QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int
     query.prepare(QStringLiteral(
         "SELECT id, sender_id, sender_name, content, encrypted, read_at, created_at, "
         "       file_url, file_type, duration_ms, file_name, file_size, key_version, "
-        "       is_forwarded, forwarded_from_name, reply_to_id "
+        "       is_forwarded, forwarded_from_name, reply_to_id, encryption_version "
         "FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?"
     ));
     query.addBindValue(chatId);
@@ -141,6 +143,8 @@ QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int
         e.isForwarded = query.value(13).toInt() != 0;
         e.forwardedFromName = query.value(14).toString();
         e.replyToId = query.value(15).toString();
+        e.encryptionVersion = query.value(16).toInt();
+        if (e.encryptionVersion <= 0) e.encryptionVersion = 1;
         result.prepend(e); // rows came back newest-first; flip to oldest-first
     }
     return result;

@@ -30,10 +30,12 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TimePicker
 import androidx.compose.material3.TimePickerDefaults
 import androidx.compose.material3.TopAppBar
@@ -54,6 +56,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -73,7 +76,9 @@ import com.messenger.app.ui.screen.settings.Changelog
 import com.messenger.app.ui.screen.settings.NotificationsSection
 import com.messenger.app.ui.screen.settings.OpenSourceLicenses
 import com.messenger.app.ui.screen.settings.PrivacySection
+import com.messenger.app.ui.screen.settings.DevicesSection
 import com.messenger.app.ui.screen.settings.StorageSection
+import com.messenger.app.ui.pairing.PairingQrScanDialog
 import com.messenger.app.ui.theme.Tokens
 import com.messenger.app.ui.theme.isDarkTheme
 import com.messenger.app.ui.viewmodel.SettingsViewModel
@@ -88,6 +93,12 @@ private sealed interface ActiveDialog {
     data object WhatsNew : ActiveDialog
     data object Licenses : ActiveDialog
     data object ConfirmClearCache : ActiveDialog
+    data object ChangePassword : ActiveDialog
+    data object AuthenticatorSetup : ActiveDialog
+    data object AuthenticatorDisable : ActiveDialog
+    data object AuthenticatorBackupCodes : ActiveDialog
+    data object LinkDevice : ActiveDialog
+    data object ScanPairingQr : ActiveDialog
     data class ConfirmClearChat(val conversation: ConversationStorage) : ActiveDialog
 }
 
@@ -102,6 +113,15 @@ fun SettingsScreen(
     val mutedChats by viewModel.mutedChats.collectAsStateWithLifecycle()
     val blockedUsers by viewModel.blockedUsers.collectAsStateWithLifecycle()
     val blockedUsersLoading by viewModel.blockedUsersLoading.collectAsStateWithLifecycle()
+    val e2eeDevices by viewModel.e2eeDevices.collectAsStateWithLifecycle()
+    val e2eeDevicesLoading by viewModel.e2eeDevicesLoading.collectAsStateWithLifecycle()
+    val currentDeviceId by viewModel.currentDeviceId.collectAsStateWithLifecycle()
+    val changingPassword by viewModel.changingPassword.collectAsStateWithLifecycle()
+    val totpEnabled by viewModel.totpEnabled.collectAsStateWithLifecycle()
+    val totpSecret by viewModel.totpSecret.collectAsStateWithLifecycle()
+    val totpBusy by viewModel.totpBusy.collectAsStateWithLifecycle()
+    val totpBackupCodes by viewModel.totpBackupCodes.collectAsStateWithLifecycle()
+    val passwordChangeSucceeded by viewModel.passwordChangeSucceeded.collectAsStateWithLifecycle()
     val toast by viewModel.toast.collectAsStateWithLifecycle()
 
     val profile by viewModel.profile.collectAsStateWithLifecycle()
@@ -117,6 +137,29 @@ fun SettingsScreen(
     ) { uri -> uri?.let(viewModel::setProfilePhoto) }
 
     var activeDialog by remember { mutableStateOf<ActiveDialog?>(null) }
+
+    LaunchedEffect(totpEnabled, totpBackupCodes) {
+        if (totpEnabled && totpBackupCodes.isEmpty() &&
+            activeDialog == ActiveDialog.AuthenticatorSetup
+        ) {
+            activeDialog = null
+        }
+        if (!totpEnabled && activeDialog == ActiveDialog.AuthenticatorDisable) {
+            activeDialog = null
+        }
+        if (totpBackupCodes.isNotEmpty() &&
+            activeDialog == ActiveDialog.AuthenticatorBackupCodes
+        ) {
+            activeDialog = ActiveDialog.AuthenticatorSetup
+        }
+    }
+
+    LaunchedEffect(passwordChangeSucceeded) {
+        if (passwordChangeSucceeded) {
+            activeDialog = null
+            viewModel.consumePasswordChangeSucceeded()
+        }
+    }
 
     // ArrayList rather than Set so the expansion state survives rotation -
     // rememberSaveable can only persist Bundle-compatible types.
@@ -211,6 +254,24 @@ fun SettingsScreen(
                 blockedUsers = blockedUsers,
                 loading = blockedUsersLoading,
                 onUnblock = viewModel::unblockUser
+            )
+
+            DevicesSection(
+                devices = e2eeDevices,
+                loading = e2eeDevicesLoading,
+                currentDeviceId = currentDeviceId,
+                onChangePassword = { activeDialog = ActiveDialog.ChangePassword },
+                totpEnabled = totpEnabled,
+                onAuthenticator = {
+                    if (totpEnabled) activeDialog = ActiveDialog.AuthenticatorDisable
+                    else {
+                        viewModel.startTotpSetup()
+                        activeDialog = ActiveDialog.AuthenticatorSetup
+                    }
+                },
+                onBackupCodes = { activeDialog = ActiveDialog.AuthenticatorBackupCodes },
+                onLinkDevice = { activeDialog = ActiveDialog.LinkDevice },
+                onRevoke = viewModel::revokeE2EEDevice
             )
 
             StorageSection(
@@ -404,6 +465,54 @@ fun SettingsScreen(
             )
         }
 
+        ActiveDialog.ChangePassword -> ChangePasswordDialog(
+            busy = changingPassword,
+            onDismiss = { if (!changingPassword) activeDialog = null },
+            onConfirm = { current, next -> viewModel.changePassword(current, next) }
+        )
+
+        ActiveDialog.AuthenticatorSetup -> AuthenticatorSetupDialog(
+            secret = totpSecret,
+            backupCodes = totpBackupCodes,
+            busy = totpBusy,
+            onDismiss = {
+                viewModel.clearTotpSetup()
+                activeDialog = null
+            },
+            onConfirm = { code -> viewModel.confirmTotp(code) }
+        )
+
+        ActiveDialog.AuthenticatorDisable -> AuthenticatorDisableDialog(
+            busy = totpBusy,
+            onDismiss = { if (!totpBusy) activeDialog = null },
+            onConfirm = { password, code -> viewModel.disableTotp(password, code) }
+        )
+
+        ActiveDialog.AuthenticatorBackupCodes -> AuthenticatorDisableDialog(
+            title = "New backup codes",
+            confirmLabel = if (totpBusy) "Generating…" else "Replace codes",
+            busy = totpBusy,
+            onDismiss = { if (!totpBusy) activeDialog = null },
+            onConfirm = { password, code -> viewModel.regenerateTotpBackupCodes(password, code) }
+        )
+
+        ActiveDialog.LinkDevice -> LinkDeviceDialog(
+            onDismiss = { activeDialog = null },
+            onScan = { activeDialog = ActiveDialog.ScanPairingQr },
+            onConfirm = { code ->
+                viewModel.approveDevicePairing(code)
+                activeDialog = null
+            }
+        )
+
+        ActiveDialog.ScanPairingQr -> PairingQrScanDialog(
+            onDismiss = { activeDialog = ActiveDialog.LinkDevice },
+            onCode = { code ->
+                viewModel.approveDevicePairing(code)
+                activeDialog = null
+            }
+        )
+
         is ActiveDialog.ConfirmClearChat -> ConfirmDialog(
             title = "Clear media?",
             message = "All photos, videos, voice messages and documents in " +
@@ -420,6 +529,209 @@ fun SettingsScreen(
                 activeDialog = null
             },
             onDismiss = { activeDialog = null }
+        )
+    }
+}
+
+@Composable
+private fun LinkDeviceDialog(
+    onDismiss: () -> Unit,
+    onScan: () -> Unit,
+    onConfirm: (String) -> Unit
+) {
+    var code by remember { mutableStateOf("") }
+    LuxDialog(
+        title = "Link a device",
+        onDismiss = onDismiss,
+        confirmLabel = "Approve",
+        onConfirm = {
+            if (code.isNotBlank()) onConfirm(code.trim())
+        },
+        dismissLabel = "Cancel"
+    ) {
+        Column(Modifier.padding(horizontal = Tokens.Space.lg)) {
+            Text(
+                text = "Scan the QR on the new device, or paste the pairing code.",
+                style = Tokens.Type.rowSubtitle,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(Tokens.Space.sm))
+            TextButton(onClick = onScan) {
+                Text("Scan QR code")
+            }
+            Spacer(Modifier.height(Tokens.Space.sm))
+            OutlinedTextField(
+                value = code,
+                onValueChange = { code = it },
+                label = { Text("Pairing code") },
+                singleLine = false,
+                minLines = 2,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChangePasswordDialog(
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (current: String, newPassword: String) -> Unit
+) {
+    var current by remember { mutableStateOf("") }
+    var next by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var localError by remember { mutableStateOf<String?>(null) }
+
+    LuxDialog(
+        title = "Change password",
+        onDismiss = onDismiss,
+        confirmLabel = if (busy) "Updating…" else "Update",
+        onConfirm = {
+            if (busy) return@LuxDialog
+            localError = when {
+                current.isBlank() -> "Enter your current password"
+                next.length < 8 -> "New password must be at least 8 characters"
+                next != confirm -> "New passwords do not match"
+                next == current -> "New password must differ from current password"
+                else -> null
+            }
+            if (localError == null) onConfirm(current, next)
+        },
+        dismissLabel = "Cancel"
+    ) {
+        Column(Modifier.padding(horizontal = Tokens.Space.lg)) {
+            OutlinedTextField(
+                value = current,
+                onValueChange = { current = it; localError = null },
+                label = { Text("Current password") },
+                singleLine = true,
+                enabled = !busy,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(Tokens.Space.sm))
+            OutlinedTextField(
+                value = next,
+                onValueChange = { next = it; localError = null },
+                label = { Text("New password") },
+                singleLine = true,
+                enabled = !busy,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(Tokens.Space.sm))
+            OutlinedTextField(
+                value = confirm,
+                onValueChange = { confirm = it; localError = null },
+                label = { Text("Confirm new password") },
+                singleLine = true,
+                enabled = !busy,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            localError?.let { err ->
+                Spacer(Modifier.height(Tokens.Space.sm))
+                Text(
+                    text = err,
+                    style = Tokens.Type.rowSubtitle,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AuthenticatorSetupDialog(
+    secret: String?,
+    backupCodes: List<String>,
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit
+) {
+    var code by remember { mutableStateOf("") }
+    val showingCodes = backupCodes.isNotEmpty()
+    LuxDialog(
+        title = if (showingCodes) "Save backup codes" else "Authenticator app",
+        onDismiss = onDismiss,
+        confirmLabel = when {
+            showingCodes -> "I've saved them"
+            busy -> "Checking…"
+            else -> "Enable"
+        },
+        onConfirm = {
+            if (showingCodes) onDismiss()
+            else if (!busy && code.length == 6) onConfirm(code)
+        }
+    ) {
+        if (showingCodes) {
+            Text(
+                "Store these somewhere safe. Each code works once if you lose your authenticator.",
+                style = Tokens.Type.rowSubtitle
+            )
+            Spacer(Modifier.height(Tokens.Space.sm))
+            backupCodes.forEach { c ->
+                Text(c, style = MaterialTheme.typography.bodyLarge)
+            }
+        } else {
+            Text(
+                "Add this secret in Google Authenticator, Aegis, or Authy, then enter a code to confirm.",
+                style = Tokens.Type.rowSubtitle
+            )
+            Spacer(Modifier.height(Tokens.Space.sm))
+            Text(
+                text = secret ?: "Generating…",
+                style = MaterialTheme.typography.bodyLarge
+            )
+            Spacer(Modifier.height(Tokens.Space.sm))
+            OutlinedTextField(
+                value = code,
+                onValueChange = { if (it.length <= 6) code = it.filter { ch -> ch.isDigit() } },
+                label = { Text("6-digit code") },
+                singleLine = true,
+                enabled = !busy && !secret.isNullOrBlank(),
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+    }
+}
+
+@Composable
+private fun AuthenticatorDisableDialog(
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (password: String, code: String) -> Unit,
+    title: String = "Disable authenticator",
+    confirmLabel: String? = null
+) {
+    var password by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
+    LuxDialog(
+        title = title,
+        onDismiss = onDismiss,
+        confirmLabel = confirmLabel ?: if (busy) "Disabling…" else "Disable",
+        onConfirm = {
+            if (!busy && password.isNotBlank() && code.isNotBlank()) onConfirm(password, code)
+        }
+    ) {
+        OutlinedTextField(
+            value = password,
+            onValueChange = { password = it },
+            label = { Text("Account password") },
+            singleLine = true,
+            enabled = !busy,
+            visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(Tokens.Space.sm))
+        OutlinedTextField(
+            value = code,
+            onValueChange = { if (it.length <= 9) code = it.filter { ch -> ch.isLetterOrDigit() || ch == '-' } },
+            label = { Text("Authenticator or backup code") },
+            singleLine = true,
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth()
         )
     }
 }

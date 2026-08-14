@@ -42,7 +42,7 @@ class VoiceRepository(
     private fun playbackFile(messageId: String) =
         File(context.cacheDir, "voice_play_${messageId.replace(Regex("[^A-Za-z0-9_-]"), "_")}.m4a")
 
-    data class Uploaded(val fileUrl: String, val encrypted: Boolean, val keyVersion: Int = 0)
+    data class Uploaded(val fileUrl: String, val encrypted: Boolean, val keyVersion: Int = 0, val encryptionVersion: Int = 1)
 
     /**
      * Encrypts (when possible) and uploads [file], returning its server path.
@@ -59,10 +59,8 @@ class VoiceRepository(
                 }
 
                 val sealed = chatRepository.encryptBytesFor(token, chatId, raw)
-                val payload = sealed?.bytes ?: raw
-                if (sealed == null) {
-                    Log.w(TAG, "No key for chat $chatId - uploading voice note unencrypted")
-                }
+                    ?: return@withContext Result.failure(IOException("Cannot encrypt voice note"))
+                val payload = sealed.bytes
 
                 val body = payload.toRequestBody("application/octet-stream".toMediaTypeOrNull())
                 val part = MultipartBody.Part.createFormData("file", "voice", body)
@@ -74,7 +72,7 @@ class VoiceRepository(
                 val url = response.body()?.get("file_url")
                     ?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
                 if (response.isSuccessful && !url.isNullOrBlank()) {
-                    Result.success(Uploaded(url, sealed != null, sealed?.keyVersion ?: 0))
+                    Result.success(Uploaded(url, true, sealed.keyVersion, sealed.encryptionVersion))
                 } else {
                     Result.failure(Exception(response.errorMessage("Failed to send voice note")))
                 }
@@ -98,7 +96,9 @@ class VoiceRepository(
         fileUrl: String,
         encrypted: Boolean,
         senderId: String = "",
-        keyVersion: Int = 0
+        keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
+        senderDeviceId: String = ""
     ): Result<File> = withContext(Dispatchers.IO) {
         val cached = playbackFile(messageId)
         if (cached.exists() && cached.length() > 0) return@withContext Result.success(cached)
@@ -118,7 +118,7 @@ class VoiceRepository(
                     ?: return@withContext Result.failure(IOException("Empty voice note"))
 
                 val audio = if (encrypted) {
-                    chatRepository.decryptBytesFor(chatId, bytes, senderId, keyVersion)
+                    chatRepository.decryptBytesFor(chatId, bytes, senderId, keyVersion, encryptionVersion, senderDeviceId)
                         ?: return@withContext Result.failure(
                             IOException("This voice note can't be decrypted on this device")
                         )

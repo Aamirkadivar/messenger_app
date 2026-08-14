@@ -20,7 +20,89 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <vector>
+
+namespace {
+void addVp8RtcpFeedback(rtc::Description::Video& media, int payloadType) {
+    if (auto* map = media.rtpMap(payloadType)) {
+        map->addFeedback("nack");
+        map->addFeedback("nack pli");
+        map->addFeedback("ccm fir");
+    }
+}
+
+void chainVideoRtcp(std::shared_ptr<rtc::Track> track, std::function<void()> onPli) {
+    if (!track) return;
+    track->setMediaHandler(std::make_shared<rtc::RtcpReceivingSession>());
+    track->chainMediaHandler(std::make_shared<rtc::RtcpNackResponder>(256));
+    track->chainMediaHandler(std::make_shared<rtc::PliHandler>(std::move(onPli)));
+}
+
+bool appendIceServer(std::vector<rtc::IceServer>& out, const QString& serverUrl,
+                     const QString& username, const QString& credential) {
+    const QString url = serverUrl.trimmed();
+    if (url.isEmpty()) return false;
+    const bool turns = url.startsWith(QStringLiteral("turns:"), Qt::CaseInsensitive);
+    const bool turn = url.startsWith(QStringLiteral("turn:"), Qt::CaseInsensitive);
+    try {
+        if (!turn && !turns) {
+            out.emplace_back(url.toStdString());
+            return true;
+        }
+        if (username.isEmpty()) {
+            out.emplace_back(url.toStdString());
+            return true;
+        }
+        QString rest = url.mid(turns ? 6 : 5);
+        QString transport;
+        const int q = rest.indexOf(QLatin1Char('?'));
+        if (q >= 0) {
+            QUrlQuery query(rest.mid(q + 1));
+            transport = query.queryItemValue(QStringLiteral("transport")).toLower();
+            rest = rest.left(q);
+        }
+        QString host;
+        uint16_t port = turns ? uint16_t(5349) : uint16_t(3478);
+        if (rest.startsWith(QLatin1Char('['))) {
+            const int close = rest.indexOf(QLatin1Char(']'));
+            if (close < 0) return false;
+            host = rest.mid(1, close - 1);
+            if (rest.size() > close + 1 && rest.at(close + 1) == QLatin1Char(':'))
+                port = static_cast<uint16_t>(rest.mid(close + 2).toUShort());
+        } else {
+            const int colon = rest.lastIndexOf(QLatin1Char(':'));
+            if (colon > 0) {
+                host = rest.left(colon);
+                port = static_cast<uint16_t>(rest.mid(colon + 1).toUShort());
+            } else {
+                host = rest;
+            }
+        }
+        if (host.isEmpty() || port == 0) return false;
+        auto relay = rtc::IceServer::RelayType::TurnUdp;
+        if (turns || transport == QLatin1String("tls"))
+            relay = rtc::IceServer::RelayType::TurnTls;
+        else if (transport == QLatin1String("tcp"))
+            relay = rtc::IceServer::RelayType::TurnTcp;
+        out.emplace_back(host.toStdString(), port, username.toStdString(),
+                         credential.toStdString(), relay);
+        return true;
+    } catch (const std::exception& e) {
+        qWarning() << "[CallService] bad ICE server" << url << e.what();
+        return false;
+    }
+}
+
+rtc::Configuration peerIceConfig(const std::vector<rtc::IceServer>& servers) {
+    rtc::Configuration config;
+    config.iceServers = servers;
+    // UDP TURN is preferred; TCP is what gets through hotel/mobile NATs that
+    // drop UDP 3478. libdatachannel leaves this off unless we set it.
+    config.enableIceTcp = true;
+    return config;
+}
+}
 
 // ==================== Audio I/O helpers ====================
 // Qt Multimedia's QAudioSource/QAudioSink move raw PCM through a QIODevice:
@@ -620,7 +702,10 @@ void CallService::handleGroupLeave(const QVariantMap& data) {
         return;
     }
 
-    if (m_authService && fromId == m_authService->currentUserId()) return;
+    if (m_authService && fromId == m_authService->currentUserId()) {
+        teardown(reason.isEmpty() ? QStringLiteral("ended") : reason);
+        return;
+    }
 
     tearEdge(fromId);
     for (int i = 0; i < m_participants.size(); ++i) {
@@ -736,8 +821,7 @@ void CallService::createEdgePeerConnection(PeerEdge* edge) {
     edge->localSsrc = 1000 + static_cast<rtc::SSRC>(QRandomGenerator::global()->bounded(1, 100000));
     edge->videoSsrc = edge->localSsrc + 1;
 
-    rtc::Configuration config;
-    config.iceServers = m_iceServers;
+    rtc::Configuration config = peerIceConfig(m_iceServers);
     edge->peerConnection = std::make_shared<rtc::PeerConnection>(config);
 
     const QString peerId = edge->peerUserId;
@@ -846,6 +930,7 @@ void CallService::addEdgeVideoTrack(PeerEdge* edge) {
     if (!edge || !edge->peerConnection) return;
     rtc::Description::Video videoMedia("video", rtc::Description::Direction::SendRecv);
     videoMedia.addVP8Codec(kVp8PayloadType);
+    addVp8RtcpFeedback(videoMedia, kVp8PayloadType);
     videoMedia.addSSRC(edge->videoSsrc, "windows-group-video");
     edge->videoTrack = edge->peerConnection->addTrack(videoMedia);
     attachEdgeVideoHandlers(edge);
@@ -904,7 +989,11 @@ void CallService::attachEdgeAudioHandlers(PeerEdge* edge) {
 void CallService::attachEdgeVideoHandlers(PeerEdge* edge) {
     if (!edge || !edge->videoTrack || !m_videoEngine) return;
 
-    edge->videoTrack->setMediaHandler(std::make_shared<rtc::RtcpReceivingSession>());
+    chainVideoRtcp(edge->videoTrack, [this]() {
+        QMetaObject::invokeMethod(this, [this]() {
+            if (m_videoEngine) m_videoEngine->requestKeyframe();
+        }, Qt::QueuedConnection);
+    });
 
     edge->negotiatedVp8PayloadType = kVp8PayloadType;
     try {
@@ -1195,21 +1284,7 @@ void CallService::fetchIceServersThen(std::function<void()> onDone) {
                 QString username = obj.value(QStringLiteral("username")).toString();
                 QString credential = obj.value(QStringLiteral("credential")).toString();
                 for (const auto& urlVal : urls) {
-                    QString serverUrl = urlVal.toString();
-                    try {
-                        if (!username.isEmpty()) {
-                            // TURN: "turn:host:port?transport=udp" - parse host/port out
-                            // so we can use the username/password constructor overload.
-                            QUrl parsed(serverUrl.split('?').first());
-                            std::string host = parsed.host().toStdString();
-                            uint16_t port = static_cast<uint16_t>(parsed.port(3478));
-                            m_iceServers.emplace_back(host, port, username.toStdString(), credential.toStdString());
-                        } else {
-                            m_iceServers.emplace_back(serverUrl.toStdString());
-                        }
-                    } catch (const std::exception& e) {
-                        qWarning() << "[CallService] bad ICE server" << serverUrl << e.what();
-                    }
+                    appendIceServer(m_iceServers, urlVal.toString(), username, credential);
                 }
             }
         } else {
@@ -1229,8 +1304,7 @@ void CallService::createPeerConnection() {
     // it (and by payload type; both differ).
     m_videoSsrc = m_localSsrc + 1;
 
-    rtc::Configuration config;
-    config.iceServers = m_iceServers;
+    rtc::Configuration config = peerIceConfig(m_iceServers);
 
     m_peerConnection = std::make_shared<rtc::PeerConnection>(config);
 
@@ -1366,6 +1440,7 @@ void CallService::addAudioTrack() {
 void CallService::addVideoTrack() {
     rtc::Description::Video videoMedia("video", rtc::Description::Direction::SendRecv);
     videoMedia.addVP8Codec(kVp8PayloadType);
+    addVp8RtcpFeedback(videoMedia, kVp8PayloadType);
     videoMedia.addSSRC(m_videoSsrc, "windows-call-video");
 
     m_videoTrack = m_peerConnection->addTrack(videoMedia);
@@ -1377,7 +1452,11 @@ void CallService::attachVideoTrackHandlers() {
 
     // Same as audio: without a media handler libdatachannel never processes
     // inbound RTP at all and onMessage stays silent.
-    m_videoTrack->setMediaHandler(std::make_shared<rtc::RtcpReceivingSession>());
+    chainVideoRtcp(m_videoTrack, [this]() {
+        QMetaObject::invokeMethod(this, [this]() {
+            if (m_videoEngine) m_videoEngine->requestKeyframe();
+        }, Qt::QueuedConnection);
+    });
 
     // Use whatever payload type VP8 actually negotiated to. As the answerer
     // the description came from the far end's offer (Android numbers its

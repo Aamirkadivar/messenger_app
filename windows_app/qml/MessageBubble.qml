@@ -24,6 +24,7 @@ Item {
     property string messageId: ""
     property string senderId: ""
     property int keyVersion: 0
+    property int encryptionVersion: 1
     property string voiceUrl: ""
     property real voiceDurationMs: 0
     property bool voiceEncrypted: false
@@ -86,7 +87,8 @@ Item {
         bubbleRoot.fileError = ""
         chatService.prepareAttachment(bubbleRoot.chatId, bubbleRoot.messageId, bubbleRoot.voiceUrl,
                                        bubbleRoot.voiceEncrypted, bubbleRoot.fileName,
-                                       bubbleRoot.senderId, bubbleRoot.keyVersion)
+                                       bubbleRoot.senderId, bubbleRoot.keyVersion,
+                                       bubbleRoot.encryptionVersion)
     }
 
     // Images load automatically (a thumbnail is the point); files wait for a
@@ -384,6 +386,7 @@ Item {
             encrypted: bubbleRoot.voiceEncrypted
             senderId: bubbleRoot.senderId
             keyVersion: bubbleRoot.keyVersion
+            encryptionVersion: bubbleRoot.encryptionVersion
             durationMs: bubbleRoot.voiceDurationMs
             accentColor: bubbleRoot.myMessageBg
             onPlaybackStarted: bubbleRoot.videoPlaybackStarted()
@@ -779,7 +782,8 @@ Item {
                             bubbleRoot.voiceError = ""
                             chatService.preparePlayableVoice(bubbleRoot.chatId, bubbleRoot.messageId,
                                                               bubbleRoot.voiceUrl, bubbleRoot.voiceEncrypted,
-                                                              bubbleRoot.senderId, bubbleRoot.keyVersion)
+                                                              bubbleRoot.senderId, bubbleRoot.keyVersion,
+                                                              bubbleRoot.encryptionVersion)
                         }
                     }
                 }

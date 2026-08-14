@@ -212,6 +212,18 @@ void VideoCallEngine::stopCapture() {
     m_lastEncodeMs = -1;
 }
 
+void VideoCallEngine::requestKeyframe() {
+    m_forceKeyframe = true;
+}
+
+void VideoCallEngine::maybeRequestRemoteKeyframe(std::shared_ptr<rtc::Track> track, qint64& lastPliMs) {
+    if (!track || !track->isOpen()) return;
+    const qint64 now = m_sendClock.elapsed();
+    if (lastPliMs >= 0 && now - lastPliMs < 400) return;
+    lastPliMs = now;
+    track->requestKeyframe();
+}
+
 void VideoCallEngine::stop() {
     stopCapture();
     destroyEncoder();
@@ -222,6 +234,8 @@ void VideoCallEngine::stop() {
     m_rxParts.clear();
     m_rxActive = false;
     m_waitingForKeyframe = true;
+    m_forceKeyframe = false;
+    m_lastPliMs = -1;
     m_seq = 0;
 }
 
@@ -249,8 +263,7 @@ bool VideoCallEngine::ensureEncoder(int width, int height) {
     cfg.g_lag_in_frames = 0;              // realtime: one frame in, one out
     cfg.g_pass = VPX_RC_ONE_PASS;
     cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
-    // A keyframe every ~2s bounds how long the far end shows a frozen/absent
-    // picture after packet loss - there is no RTCP PLI feedback loop here.
+    // PLI/NACK can force a keyframe sooner; this is the fallback bound.
     cfg.kf_mode = VPX_KF_AUTO;
     cfg.kf_max_dist = kSendFps * 2;
 
@@ -302,8 +315,13 @@ void VideoCallEngine::encodeAndSend(const QImage& image) {
     // clock, so wall time since the engine started maps directly.
     const uint32_t timestamp = static_cast<uint32_t>(m_sendClock.elapsed() * (kRtpClockRate / 1000));
     const unsigned long duration = kRtpClockRate / kSendFps;
+    vpx_enc_frame_flags_t flags = 0;
+    if (m_forceKeyframe) {
+        flags = VPX_EFLAG_FORCE_KF;
+        m_forceKeyframe = false;
+    }
 
-    if (vpx_codec_encode(&m_encoder, &raw, timestamp, duration, 0, VPX_DL_REALTIME) != VPX_CODEC_OK) {
+    if (vpx_codec_encode(&m_encoder, &raw, timestamp, duration, flags, VPX_DL_REALTIME) != VPX_CODEC_OK) {
         qWarning() << "[VideoCallEngine] vpx_codec_encode failed:" << vpx_codec_error(&m_encoder);
         return;
     }
@@ -460,6 +478,8 @@ void VideoCallEngine::handleRtp(const QByteArray& packet) {
     const bool marker = header->marker();
 
     if (!m_rxActive || timestamp != m_rxTimestamp) {
+        if (m_rxActive && !m_rxParts.isEmpty())
+            maybeRequestRemoteKeyframe(m_track, m_lastPliMs);
         m_rxParts.clear();
         m_rxTimestamp = timestamp;
         m_rxActive = true;
@@ -528,6 +548,11 @@ void VideoCallEngine::handleRtpInto(PeerRx& rx, const QByteArray& packet, const 
     const bool marker = header->marker();
 
     if (!rx.rxActive || timestamp != rx.rxTimestamp) {
+        if (rx.rxActive && !rx.rxParts.isEmpty()) {
+            auto dest = m_sendDests.find(peerId);
+            if (dest != m_sendDests.end())
+                maybeRequestRemoteKeyframe(dest.value().track, rx.lastPliMs);
+        }
         rx.rxParts.clear();
         rx.rxTimestamp = timestamp;
         rx.rxActive = true;
@@ -600,7 +625,10 @@ void VideoCallEngine::decodeFrame(const QByteArray& frame) {
     if (!ensureDecoder() || frame.isEmpty()) return;
 
     const bool keyframe = (static_cast<uint8_t>(frame[0]) & 0x01) == 0;
-    if (m_waitingForKeyframe && !keyframe) return;
+    if (m_waitingForKeyframe && !keyframe) {
+        maybeRequestRemoteKeyframe(m_track, m_lastPliMs);
+        return;
+    }
 
     if (vpx_codec_decode(&m_decoder,
                          reinterpret_cast<const uint8_t*>(frame.constData()),
@@ -608,6 +636,7 @@ void VideoCallEngine::decodeFrame(const QByteArray& frame) {
         qWarning() << "[VideoCallEngine] vpx_codec_decode failed:" << vpx_codec_error(&m_decoder)
                    << "- waiting for keyframe";
         m_waitingForKeyframe = true;
+        maybeRequestRemoteKeyframe(m_track, m_lastPliMs);
         return;
     }
     m_waitingForKeyframe = false;
@@ -640,7 +669,12 @@ void VideoCallEngine::decodeFrameInto(PeerRx& rx, const QByteArray& frame, const
     }
 
     const bool keyframe = (static_cast<uint8_t>(frame[0]) & 0x01) == 0;
-    if (rx.waitingForKeyframe && !keyframe) return;
+    if (rx.waitingForKeyframe && !keyframe) {
+        auto dest = m_sendDests.find(peerId);
+        if (dest != m_sendDests.end())
+            maybeRequestRemoteKeyframe(dest.value().track, rx.lastPliMs);
+        return;
+    }
 
     if (vpx_codec_decode(&rx.decoder,
                          reinterpret_cast<const uint8_t*>(frame.constData()),
@@ -648,6 +682,9 @@ void VideoCallEngine::decodeFrameInto(PeerRx& rx, const QByteArray& frame, const
         qWarning() << "[VideoCallEngine] peer decode failed for" << peerId
                    << vpx_codec_error(&rx.decoder);
         rx.waitingForKeyframe = true;
+        auto dest = m_sendDests.find(peerId);
+        if (dest != m_sendDests.end())
+            maybeRequestRemoteKeyframe(dest.value().track, rx.lastPliMs);
         return;
     }
     rx.waitingForKeyframe = false;

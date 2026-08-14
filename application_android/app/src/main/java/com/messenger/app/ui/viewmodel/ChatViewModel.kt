@@ -82,6 +82,9 @@ data class ChatMessageUi(
     val videoEncrypted: Boolean = false,
     /** Sender Key version for group media decrypt; 0 for direct / cleartext. */
     val keyVersion: Int = 0,
+    /** Direct protocol: 1 = static box, 2 = ephemeral box. */
+    val encryptionVersion: Int = 1,
+    val senderDeviceId: String = "",
     val isForwarded: Boolean = false,
     val forwardedFromName: String = "",
     /** Parent message id when this bubble is a reply; resolve quote locally. */
@@ -181,6 +184,9 @@ class ChatViewModel @Inject constructor(
 
     companion object {
         private const val TAG = "ChatViewModel"
+
+        /** How many recent messages an avatar peek shows. */
+        private const val PREVIEW_MESSAGE_COUNT = 12
     }
 
     private val _currentUserId = MutableStateFlow<String?>(null)
@@ -199,6 +205,15 @@ class ChatViewModel @Inject constructor(
 
     /** Live WebSocket status for the Connecting… / Reconnecting… banners. */
     val connectionState = chatRepository.connectionState
+
+    private val _safetyNumber = MutableStateFlow<String?>(null)
+    val safetyNumber: StateFlow<String?> = _safetyNumber.asStateFlow()
+
+    private val _pendingPeerKeyChange = MutableStateFlow(false)
+    val pendingPeerKeyChange: StateFlow<Boolean> = _pendingPeerKeyChange.asStateFlow()
+
+    private val _safetyVerified = MutableStateFlow(false)
+    val safetyVerified: StateFlow<Boolean> = _safetyVerified.asStateFlow()
 
     private val _userSearchState = MutableStateFlow(UserSearchUiState())
     val userSearchState: StateFlow<UserSearchUiState> = _userSearchState.asStateFlow()
@@ -226,6 +241,34 @@ class ChatViewModel @Inject constructor(
 
     fun dismissKeyTakeover() { _keyTakeover.value = false }
 
+    fun reloadSafetyNumber() {
+        val id = _chatState.value.chatId ?: return
+        if (id.isBlank()) return
+        viewModelScope.launch {
+            _safetyNumber.value = chatRepository.safetyNumberForChat(id)
+        }
+    }
+
+    fun acceptPeerKeyChange() {
+        val id = _chatState.value.chatId ?: return
+        if (id.isBlank()) return
+        viewModelScope.launch {
+            chatRepository.acceptPeerKeyChange(id)
+            _pendingPeerKeyChange.value = false
+            _safetyNumber.value = chatRepository.safetyNumberForChat(id)
+            _safetyVerified.value = false
+        }
+    }
+
+    fun onSafetyNumberScanned(raw: String, onResult: (Boolean) -> Unit) {
+        val id = _chatState.value.chatId ?: return
+        viewModelScope.launch {
+            val ok = chatRepository.verifySafetyNumberScan(id, raw)
+            if (ok) _safetyVerified.value = true
+            onResult(ok)
+        }
+    }
+
     fun loadChats() {
         viewModelScope.launch {
             _chatListState.update { it.copy(isLoading = true, error = null) }
@@ -245,7 +288,8 @@ class ChatViewModel @Inject constructor(
                         dto.lastMessage?.content ?: "",
                         dto.lastMessage?.encrypted ?: false,
                         dto.lastMessage?.senderId ?: "",
-                        dto.lastMessage?.keyVersion ?: 0
+                        dto.lastMessage?.keyVersion ?: 0,
+                        dto.lastMessage?.encryptionVersion ?: 1
                     )
                     toChatListItemUi(dto, preview, mutedIds)
                 }
@@ -379,20 +423,42 @@ class ChatViewModel @Inject constructor(
                     (incoming.contentType == ChatRepository.IMAGE_CONTENT_TYPE || incoming.contentType == ChatRepository.FILE_CONTENT_TYPE) &&
                     !incoming.fileUrl.isNullOrBlank()
 
+                var opened = chatRepository.openFor(
+                    incoming.chatId,
+                    incoming.content,
+                    incoming.encrypted,
+                    incoming.senderId,
+                    incoming.keyVersion,
+                    incoming.encryptionVersion,
+                    incoming.senderDeviceId
+                )
                 var text = if (isVoice || isAttachment || isVideoNote) {
                     ""
                 } else {
-                    chatRepository.decryptFor(incoming.chatId, incoming.content, incoming.encrypted, incoming.senderId, incoming.keyVersion)
+                    opened.text
                 }
                 // A group message can arrive for a Sender Key we haven't fetched yet
                 // (e.g. it rotated after we last synced) - one retry after a refetch
                 // covers that without hammering the server on every message.
-                if (!isVoice && !isAttachment && !isVideoNote && incoming.encrypted && text == ChatRepository.ENCRYPTED_PLACEHOLDER &&
-                    chatRepository.chatTypeFor(incoming.chatId).equals("group", ignoreCase = true)
-                ) {
+                val needGroupRetry = incoming.encrypted &&
+                    chatRepository.chatTypeFor(incoming.chatId).equals("group", ignoreCase = true) &&
+                    (
+                        (!isVoice && !isAttachment && !isVideoNote && text == ChatRepository.ENCRYPTED_PLACEHOLDER) ||
+                            (isAttachment && opened.fileName.isBlank() && incoming.content.isNotBlank())
+                    )
+                if (needGroupRetry) {
                     tokenManager.getAccessToken().getOrNull()?.let { token ->
                         chatRepository.fetchGroupSenderKeys(token, incoming.chatId)
-                        text = chatRepository.decryptFor(incoming.chatId, incoming.content, incoming.encrypted, incoming.senderId, incoming.keyVersion)
+                        opened = chatRepository.openFor(
+                            incoming.chatId,
+                            incoming.content,
+                            incoming.encrypted,
+                            incoming.senderId,
+                            incoming.keyVersion,
+                            incoming.encryptionVersion,
+                            incoming.senderDeviceId
+                        )
+                        if (!isVoice && !isAttachment && !isVideoNote) text = opened.text
                     }
                 }
 
@@ -407,19 +473,25 @@ class ChatViewModel @Inject constructor(
                         timestamp = System.currentTimeMillis(),
                         isMine = false,
                         voiceUrl = if (isVoice) incoming.fileUrl else null,
-                        voiceDurationMs = incoming.durationMs,
+                        voiceDurationMs = if (incoming.durationMs > 0) incoming.durationMs else opened.durationMs,
                         voiceEncrypted = isVoice && incoming.encrypted,
                         attachmentUrl = if (isAttachment) incoming.fileUrl else null,
-                        attachmentName = if (isAttachment) incoming.fileName ?: "" else "",
-                        attachmentSize = incoming.fileSize,
+                        attachmentName = if (isAttachment) {
+                            incoming.fileName?.takeIf { it.isNotBlank() } ?: opened.fileName
+                        } else "",
+                        attachmentSize = if (incoming.fileSize > 0) incoming.fileSize else opened.fileSize,
                         attachmentEncrypted = isAttachment && incoming.encrypted,
                         isImageAttachment = isAttachment && incoming.contentType == ChatRepository.IMAGE_CONTENT_TYPE,
                         videoUrl = if (isVideoNote) incoming.fileUrl else null,
-                        videoDurationMs = if (isVideoNote) incoming.durationMs else 0,
+                        videoDurationMs = if (isVideoNote) {
+                            if (incoming.durationMs > 0) incoming.durationMs else opened.durationMs
+                        } else 0,
                         videoEncrypted = isVideoNote && incoming.encrypted,
                         keyVersion = incoming.keyVersion,
+                        encryptionVersion = incoming.encryptionVersion,
+                        senderDeviceId = incoming.senderDeviceId,
                         isForwarded = incoming.isForwarded,
-                        forwardedFromName = incoming.forwardedFromName,
+                        forwardedFromName = incoming.forwardedFromName.ifBlank { opened.forwardedFrom },
                         replyToId = incoming.replyToId
                     )
                     _chatState.update { it.copy(messages = it.messages + message) }
@@ -496,6 +568,9 @@ class ChatViewModel @Inject constructor(
         val initialType = if (isGroupHint) "group" else "direct"
         _chatState.update { ChatUiState(chatId = chatId, chatName = chatName, chatType = initialType) }
         chatRepository.joinChatRoom(chatId)
+        _safetyNumber.value = null
+        _pendingPeerKeyChange.value = false
+        _safetyVerified.value = false
 
         viewModelScope.launch {
             val myId = resolveCurrentUserId()
@@ -537,6 +612,9 @@ class ChatViewModel @Inject constructor(
             if (chatRepository.takePendingSecurityNotice(chatId)) {
                 addSecurityNoticeMessage(chatId)
             }
+            _safetyNumber.value = chatRepository.safetyNumberForChat(chatId)
+            _pendingPeerKeyChange.value = chatRepository.hasPendingPeerKeyChange(chatId)
+            _safetyVerified.value = chatRepository.isSafetyVerified(chatId)
 
             val cachedMessages = chatRepository.loadCachedMessages(chatId)
             if (cachedMessages.isNotEmpty()) {
@@ -641,35 +719,42 @@ class ChatViewModel @Inject constructor(
         val isAttachment = !isVoice && !isVideoNote &&
             (dto.fileType == ChatRepository.IMAGE_CONTENT_TYPE || dto.fileType == ChatRepository.FILE_CONTENT_TYPE) &&
             !dto.fileUrl.isNullOrBlank()
+        val opened = chatRepository.openFor(
+            chatId, dto.content, dto.encrypted, dto.senderId, dto.keyVersion, dto.encryptionVersion, dto.senderDeviceId
+        )
         return ChatMessageUi(
             id = dto.id,
             senderId = dto.senderId,
             senderName = dto.sender?.displayName?.takeIf { it.isNotBlank() }
                 ?: dto.sender?.username ?: "",
-            // A voice note/attachment has no text body; decrypting the empty
-            // content would just yield the "encrypted" placeholder.
-            content = if (isVoice || isAttachment || isVideoNote) "" else {
-                chatRepository.decryptFor(chatId, dto.content, dto.encrypted, dto.senderId, dto.keyVersion)
-            },
+            content = if (isVoice || isAttachment || isVideoNote) "" else opened.text,
             timestamp = parseMessageTimestamp(dto.createdAt),
             isMine = isMine,
             isRead = isMine && !dto.readAt.isNullOrEmpty(),
             readAt = dto.readAt,
             voiceUrl = if (isVoice) dto.fileUrl else null,
-            voiceDurationMs = dto.durationMs,
+            voiceDurationMs = if (isVoice) {
+                if (dto.durationMs > 0) dto.durationMs else opened.durationMs
+            } else 0,
             voiceEncrypted = isVoice && dto.encrypted,
             attachmentUrl = if (isAttachment) dto.fileUrl else null,
-            attachmentName = if (isAttachment) dto.fileName ?: "" else "",
-            attachmentSize = dto.fileSize,
+            attachmentName = if (isAttachment) {
+                dto.fileName?.takeIf { it.isNotBlank() } ?: opened.fileName
+            } else "",
+            attachmentSize = if (dto.fileSize > 0) dto.fileSize else opened.fileSize,
             attachmentEncrypted = isAttachment && dto.encrypted,
             isImageAttachment = isAttachment && dto.fileType == ChatRepository.IMAGE_CONTENT_TYPE,
             videoUrl = if (isVideoNote) dto.fileUrl else null,
             videoThumbnailUrl = if (isVideoNote) dto.thumbnailUrl else null,
-            videoDurationMs = if (isVideoNote) dto.durationMs else 0,
+            videoDurationMs = if (isVideoNote) {
+                if (dto.durationMs > 0) dto.durationMs else opened.durationMs
+            } else 0,
             videoEncrypted = isVideoNote && dto.encrypted,
             keyVersion = dto.keyVersion,
+            encryptionVersion = if (dto.encryptionVersion == 0) 1 else dto.encryptionVersion,
+            senderDeviceId = dto.senderDeviceId,
             isForwarded = dto.isForwarded,
-            forwardedFromName = dto.forwardedFromName,
+            forwardedFromName = dto.forwardedFromName.ifBlank { opened.forwardedFrom },
             replyToId = dto.replyToId.orEmpty()
         )
     }
@@ -929,6 +1014,13 @@ class ChatViewModel @Inject constructor(
                 return@launch
             }
             val contentType = attachmentRepository.classify(picked.name)
+            val sealedMeta = chatRepository.sealMessage(
+                token, chatId, _chatState.value.chatType, "", fileName = picked.name, fileSize = picked.size
+            )
+            if (!sealedMeta.encrypted) {
+                _chatState.update { it.copy(isSending = false, error = "Cannot encrypt attachment") }
+                return@launch
+            }
 
             attachmentRepository.upload(token, chatId, picked)
                 .onSuccess { uploaded ->
@@ -944,7 +1036,9 @@ class ChatViewModel @Inject constructor(
                         contentType = contentType,
                         encrypted = uploaded.encrypted,
                         keyVersion = uploaded.keyVersion,
-                        replyToId = replyToId
+                        encryptionVersion = uploaded.encryptionVersion,
+                        replyToId = replyToId,
+                        sealedContent = sealedMeta.content
                     )
                         .onSuccess {
                             _chatState.update { it.copy(isSending = false) }
@@ -971,7 +1065,7 @@ class ChatViewModel @Inject constructor(
         val url = message.attachmentUrl ?: return null
         return attachmentRepository.fetchForView(
             chatId, message.id, url, message.attachmentName, message.attachmentEncrypted,
-            message.senderId, message.keyVersion
+            message.senderId, message.keyVersion, message.encryptionVersion
         ).getOrNull()
     }
 
@@ -1048,6 +1142,13 @@ class ChatViewModel @Inject constructor(
                 return@launch
             }
 
+            val sealedMeta = chatRepository.sealMessage(
+                token, chatId, _chatState.value.chatType, "", durationMs = result.durationMs
+            )
+            if (!sealedMeta.encrypted) {
+                _chatState.update { it.copy(isSending = false, error = "Cannot encrypt voice note") }
+                return@launch
+            }
             voiceRepository.upload(token, chatId, result.file)
                 .onSuccess { uploaded ->
                     val replyToId = _pendingReply.value?.id.orEmpty()
@@ -1055,14 +1156,14 @@ class ChatViewModel @Inject constructor(
                     chatRepository.sendVoiceMessage(
                         token = token,
                         chatId = chatId,
-                        // The server derives the real type from the chat row, but
-                        // don't claim "direct" for a group either.
                         chatType = _chatState.value.chatType,
                         fileUrl = uploaded.fileUrl,
                         durationMs = result.durationMs,
                         encrypted = uploaded.encrypted,
                         keyVersion = uploaded.keyVersion,
-                        replyToId = replyToId
+                        encryptionVersion = uploaded.encryptionVersion,
+                        replyToId = replyToId,
+                        sealedContent = sealedMeta.content
                     )
                         .onSuccess {
                             _chatState.update { it.copy(isSending = false) }
@@ -1208,7 +1309,9 @@ class ChatViewModel @Inject constructor(
                         durationMs = prepared.durationMs,
                         encrypted = prepared.encrypted,
                         keyVersion = prepared.keyVersion,
-                        replyToId = replyToId
+                        encryptionVersion = prepared.encryptionVersion,
+                        replyToId = replyToId,
+                        sealedContent = prepared.sealedContent
                     )
                         .onSuccess {
                             _capture.update { it.copy(sendStatus = null) }
@@ -1245,7 +1348,7 @@ class ChatViewModel @Inject constructor(
         viewModelScope.launch {
             roundVideoRepository.fetchThumbnail(
                 chatId, message.id, thumbUrl, message.videoEncrypted,
-                message.senderId, message.keyVersion
+                message.senderId, message.keyVersion, message.encryptionVersion
             )
                 .onSuccess { f -> updateVideo(message.id) { it.copy(thumbnailPath = f.absolutePath) } }
         }
@@ -1273,7 +1376,7 @@ class ChatViewModel @Inject constructor(
             }
             roundVideoRepository.fetchForPlayback(
                 chatId, message.id, url, message.videoEncrypted,
-                message.senderId, message.keyVersion
+                message.senderId, message.keyVersion, message.encryptionVersion
             ) { f -> updateVideo(message.id) { it.copy(downloadProgress = f) } }
                 .onSuccess { file ->
                     val player = playerPool.acquire()
@@ -1428,6 +1531,45 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    // ==================== Chat preview (long-press an avatar) ====================
+
+    /**
+     * Recent messages for the chat being peeked at, newest last.
+     *
+     * Served from the local cache only - a peek must not disturb the open
+     * chat's state or fire a network round trip, and the cache is already what
+     * the chat list itself was drawn from.
+     */
+    private val _previewMessages = MutableStateFlow<List<ChatMessageUi>>(emptyList())
+    val previewMessages: StateFlow<List<ChatMessageUi>> = _previewMessages.asStateFlow()
+
+    private val _previewLoading = MutableStateFlow(false)
+    val previewLoading: StateFlow<Boolean> = _previewLoading.asStateFlow()
+
+    private var previewJob: Job? = null
+
+    fun loadPreview(chatId: String) {
+        previewJob?.cancel()
+        _previewMessages.value = emptyList()
+        _previewLoading.value = true
+        previewJob = viewModelScope.launch {
+            val myId = resolveCurrentUserId()
+            val cached = runCatching { chatRepository.loadCachedMessages(chatId) }
+                .getOrDefault(emptyList())
+            _previewMessages.value = cached
+                .takeLast(PREVIEW_MESSAGE_COUNT)
+                .map { toChatMessageUi(chatId, it, myId) }
+            _previewLoading.value = false
+        }
+    }
+
+    fun clearPreview() {
+        previewJob?.cancel()
+        previewJob = null
+        _previewMessages.value = emptyList()
+        _previewLoading.value = false
+    }
+
     fun clearSelection() {
         _selectedMessageIds.value = emptySet()
     }
@@ -1545,7 +1687,7 @@ class ChatViewModel @Inject constructor(
         val url = message.voiceUrl ?: error("Voice note has no file")
         val cached = voiceRepository.fetchForPlayback(
             sourceChatId, message.id, url, message.voiceEncrypted,
-            message.senderId, message.keyVersion
+            message.senderId, message.keyVersion, message.encryptionVersion
         ).getOrThrow()
         // upload() deletes its input; copy so the playback cache survives.
         val uploadCopy = File(
@@ -1553,6 +1695,10 @@ class ChatViewModel @Inject constructor(
             "fwd_voice_${message.id}_${System.currentTimeMillis()}.m4a"
         )
         cached.copyTo(uploadCopy, overwrite = true)
+        val sealedMeta = chatRepository.sealMessage(
+            token, targetChatId, targetChatType, "",
+            forwardedFrom = forward.fromName, durationMs = message.voiceDurationMs
+        )
         val uploaded = voiceRepository.upload(token, targetChatId, uploadCopy).getOrThrow()
         chatRepository.sendVoiceMessage(
             token = token,
@@ -1562,7 +1708,9 @@ class ChatViewModel @Inject constructor(
             durationMs = message.voiceDurationMs,
             encrypted = uploaded.encrypted,
             keyVersion = uploaded.keyVersion,
-            forward = forward
+            encryptionVersion = uploaded.encryptionVersion,
+            forward = forward,
+            sealedContent = sealedMeta.content
         ).getOrThrow()
     }
 
@@ -1577,7 +1725,7 @@ class ChatViewModel @Inject constructor(
         val url = message.videoUrl ?: error("Video note has no file")
         val cached = roundVideoRepository.fetchForPlayback(
             sourceChatId, message.id, url, message.videoEncrypted,
-            message.senderId, message.keyVersion
+            message.senderId, message.keyVersion, message.encryptionVersion
         ).getOrThrow()
         // prepareAndUpload deletes its capture file; copy so the cache survives.
         val uploadCopy = File(
@@ -1585,7 +1733,9 @@ class ChatViewModel @Inject constructor(
             "fwd_video_${message.id}_${System.currentTimeMillis()}.mp4"
         )
         cached.copyTo(uploadCopy, overwrite = true)
-        val prepared = roundVideoRepository.prepareAndUpload(token, targetChatId, uploadCopy).getOrThrow()
+        val prepared = roundVideoRepository.prepareAndUpload(
+            token, targetChatId, uploadCopy, forwardedFrom = forward.fromName
+        ).getOrThrow()
         chatRepository.sendVideoNoteMessage(
             token = token,
             chatId = targetChatId,
@@ -1595,7 +1745,9 @@ class ChatViewModel @Inject constructor(
             durationMs = prepared.durationMs,
             encrypted = prepared.encrypted,
             keyVersion = prepared.keyVersion,
-            forward = forward
+            encryptionVersion = prepared.encryptionVersion,
+            forward = forward,
+            sealedContent = prepared.sealedContent
         ).getOrThrow()
     }
 
@@ -1610,12 +1762,16 @@ class ChatViewModel @Inject constructor(
         val url = message.attachmentUrl ?: error("Attachment has no file")
         val file = attachmentRepository.fetchForView(
             sourceChatId, message.id, url, message.attachmentName,
-            message.attachmentEncrypted, message.senderId, message.keyVersion
+            message.attachmentEncrypted, message.senderId, message.keyVersion, message.encryptionVersion
         ).getOrThrow()
         val name = message.attachmentName.ifBlank { file.name }
         val bytes = file.readBytes()
         val picked = AttachmentRepository.PickedFile(name, bytes.size.toLong(), bytes)
         val contentType = attachmentRepository.classify(name)
+        val sealedMeta = chatRepository.sealMessage(
+            token, targetChatId, targetChatType, "",
+            forwardedFrom = forward.fromName, fileName = name, fileSize = picked.size
+        )
         val uploaded = attachmentRepository.upload(token, targetChatId, picked).getOrThrow()
         chatRepository.sendAttachmentMessage(
             token = token,
@@ -1627,7 +1783,9 @@ class ChatViewModel @Inject constructor(
             contentType = contentType,
             encrypted = uploaded.encrypted,
             keyVersion = uploaded.keyVersion,
-            forward = forward
+            encryptionVersion = uploaded.encryptionVersion,
+            forward = forward,
+            sealedContent = sealedMeta.content
         ).getOrThrow()
     }
 
@@ -1658,7 +1816,7 @@ class ChatViewModel @Inject constructor(
         viewModelScope.launch {
             voiceRepository.fetchForPlayback(
                 chatId, message.id, url, message.voiceEncrypted,
-                message.senderId, message.keyVersion
+                message.senderId, message.keyVersion, message.encryptionVersion
             )
                 .onSuccess { file ->
                     voicePlayer.toggle(message.id, file)

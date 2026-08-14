@@ -570,7 +570,9 @@ ApplicationWindow {
                                        && chatViewLoader.item.currentChatId === chatId
                 if (viewingThisChat) return
 
-                var text = chatService.decryptMessage(chatId, message.content, message.encrypted === true)
+                var text = chatService.decryptMessage(chatId, message.content, message.encrypted === true,
+                                                      message.senderId || "", message.keyVersion || 0,
+                                                      message.encryptionVersion || 1, message.senderDeviceId || "")
                 trayNotifier.showMessage(chatList.chatNameFor(chatId), text)
             }
         }

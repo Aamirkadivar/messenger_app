@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(messenger_app VERSION 1.0.0 LANGUAGES CXX)
+project(messenger_app VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,6 +66,10 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 set(PROJECT_SOURCES
     src/main.cpp
     src/crypto/encryption.cpp
+    src/crypto/doubleratchet.cpp
+    src/crypto/doubleratchet.h
+    src/crypto/vaultcrypto.cpp
+    src/crypto/vaultcrypto.h
     src/models/user.cpp
     src/models/user.h
     src/models/message.h
@@ -99,6 +103,16 @@ set(PROJECT_SOURCES
     src/utils/win11frameless.cpp
     src/utils/win11frameless.h
     src/utils/traynotifier.cpp
+    src/utils/pairingqr.cpp
+    src/utils/pairingqr.h
+    src/utils/pairingqrscanner.cpp
+    src/utils/pairingqrscanner.h
+    third_party/quirc/quirc.c
+    third_party/quirc/decode.c
+    third_party/quirc/identify.c
+    third_party/quirc/version_db.c
+    third_party/qrcodegen/qrcodegen.cpp
+    third_party/qrcodegen/qrcodegen.hpp
     src/utils/traynotifier.h
     src/utils/messagecache.cpp
     src/utils/messagecache.h
@@ -142,6 +156,17 @@ qt_add_executable(${PROJECT_NAME}
 )
 
 # ---- Link Libraries ----
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/quirc
+)
+set_source_files_properties(
+    third_party/quirc/quirc.c
+    third_party/quirc/decode.c
+    third_party/quirc/identify.c
+    third_party/quirc/version_db.c
+    PROPERTIES LANGUAGE C COMPILE_FLAGS "-w"
+)
+
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::Core
     Qt6::Gui

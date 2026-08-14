@@ -80,10 +80,12 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		}
 	}
 
-	// Content is an opaque blob to the server: for E2EE direct messages it's
-	// client-produced ciphertext (hex of nonce||crypto_box); for plaintext
-	// fallback it's the raw text. Either way the server never decrypts it -
-	// end-to-end means only the two clients hold the keys.
+	if !req.Encrypted {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":   "encryption_required",
+			"message": "Messages must be end-to-end encrypted",
+		})
+	}
 	content := req.Content
 
 	// Reply is just an id pointer - clients resolve the quote from local
@@ -116,10 +118,16 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		EncryptedContent:       content,
 		IsEncrypted:            req.Encrypted,
 		KeyVersion:             req.KeyVersion,
+		EncryptionVersion:      req.EncryptionVersion,
 		ReplyToID:              req.ReplyToID,
 		IsForwarded:            req.IsForwarded,
 		ForwardedFromName:      req.ForwardedFromName,
 		ForwardedFromMessageID: req.ForwardedFromMessageID,
+		SenderDeviceID:         c.Get("X-Device-Id"),
+	}
+
+	if message.EncryptionVersion == 0 {
+		message.EncryptionVersion = 1
 	}
 
 	if req.FileURL != "" {
@@ -175,6 +183,8 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 			"duration_ms":               message.DurationMs,
 			"thumbnail_url":             message.ThumbnailURL,
 			"key_version":               message.KeyVersion,
+			"encryption_version":        message.EncryptionVersion,
+			"sender_device_id":          message.SenderDeviceID,
 			"reply_to_id":               replyToID,
 			"is_forwarded":              message.IsForwarded,
 			"forwarded_from_name":       message.ForwardedFromName,
@@ -206,6 +216,8 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 			"duration_ms":               message.DurationMs,
 			"thumbnail_url":             message.ThumbnailURL,
 			"key_version":               message.KeyVersion,
+			"encryption_version":        message.EncryptionVersion,
+			"sender_device_id":          message.SenderDeviceID,
 			"reply_to_id":               replyToID,
 			"is_forwarded":              message.IsForwarded,
 			"forwarded_from_name":       message.ForwardedFromName,
@@ -392,6 +404,8 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 		DurationMs             int64      `json:"duration_ms"`
 		ThumbnailURL           string     `json:"thumbnail_url"`
 		KeyVersion             int        `json:"key_version"`
+		EncryptionVersion      int        `json:"encryption_version"`
+		SenderDeviceID         string     `json:"sender_device_id"`
 		ReplyToID              *string    `json:"reply_to_id,omitempty"`
 		IsForwarded            bool       `json:"is_forwarded"`
 		ForwardedFromName      string     `json:"forwarded_from_name"`
@@ -462,6 +476,8 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 			DurationMs:             m.DurationMs,
 			ThumbnailURL:           m.ThumbnailURL,
 			KeyVersion:             m.KeyVersion,
+			EncryptionVersion:      m.EncryptionVersion,
+			SenderDeviceID:         m.SenderDeviceID,
 			ReplyToID:              replyToID,
 			IsForwarded:            m.IsForwarded,
 			ForwardedFromName:      m.ForwardedFromName,
@@ -726,6 +742,7 @@ type MessageResp struct {
 	FileName    string    `json:"file_name,omitempty"`
 	Encrypted   bool      `json:"encrypted"`
 	KeyVersion  int       `json:"key_version"`
+	EncryptionVersion int `json:"encryption_version"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -857,6 +874,7 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 				FileName:    msg.FileName,
 				Encrypted:   msg.IsEncrypted,
 				KeyVersion:  msg.KeyVersion,
+				EncryptionVersion: msg.EncryptionVersion,
 				CreatedAt:   msg.CreatedAt,
 			}
 		}

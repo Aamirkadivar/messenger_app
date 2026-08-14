@@ -48,6 +48,7 @@ data class MessageEntity(
     // Which of the sender's group Sender Key versions encrypted this message
     // (see ChatRepository's group E2EE). 0 outside a group chat.
     val keyVersion: Int = 0,
+    val encryptionVersion: Int = 1,
     val isForwarded: Boolean = false,
     val forwardedFromName: String = "",
     val forwardedFromMessageId: String = ""

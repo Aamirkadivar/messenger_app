@@ -47,6 +47,8 @@ data class MessageDto(
     @SerialName("thumbnail_url") val thumbnailUrl: String? = null,
     /** Which of the sender's group Sender Key versions encrypted this message. Meaningless outside a group. */
     @SerialName("key_version") val keyVersion: Int = 0,
+    @SerialName("encryption_version") val encryptionVersion: Int = 1,
+    @SerialName("sender_device_id") val senderDeviceId: String = "",
     @SerialName("reply_to_id") val replyToId: String? = null,
     @SerialName("is_forwarded") val isForwarded: Boolean = false,
     @SerialName("forwarded_from_name") val forwardedFromName: String = "",
@@ -86,6 +88,7 @@ data class SendMessageRequest(
     @SerialName("thumbnail_url") val thumbnailUrl: String = "",
     /** Only meaningful (and only ever non-zero) for a group message - see MessageDto.keyVersion. */
     @SerialName("key_version") val keyVersion: Int = 0,
+    @SerialName("encryption_version") val encryptionVersion: Int = 1,
     @SerialName("reply_to_id") val replyToId: String = "",
     @SerialName("is_forwarded") val isForwarded: Boolean = false,
     @SerialName("forwarded_from_name") val forwardedFromName: String = "",
@@ -135,6 +138,7 @@ data class LastMessageDto(
     @SerialName("file_name") val fileName: String = "",
     val encrypted: Boolean = false,
     @SerialName("key_version") val keyVersion: Int = 0,
+    @SerialName("encryption_version") val encryptionVersion: Int = 1,
     @SerialName("created_at") val createdAt: String
 )
 
@@ -220,4 +224,102 @@ data class CallLogDto(
 @Serializable
 data class CallHistoryResponse(
     val data: List<CallLogDto> = emptyList()
+)
+
+// ==================== E2EE vault (opaque to server) ====================
+
+@Serializable
+data class E2EEVaultDto(
+    @SerialName("user_id") val userId: String? = null,
+    @SerialName("vault_version") val vaultVersion: Int = 0,
+    @SerialName("protocol_version") val protocolVersion: Int = 1,
+    val suite: String = "",
+    @SerialName("vault_ciphertext_b64") val vaultCiphertextB64: String = "",
+    @SerialName("pw_kdf") val pwKdf: String = "",
+    @SerialName("pw_salt_b64") val pwSaltB64: String = "",
+    @SerialName("pw_params") val pwParams: String = "",
+    @SerialName("pw_wrapped_master_b64") val pwWrappedMasterB64: String = "",
+    @SerialName("rk_kdf") val rkKdf: String = "",
+    @SerialName("rk_salt_b64") val rkSaltB64: String = "",
+    @SerialName("rk_wrapped_master_b64") val rkWrappedMasterB64: String = ""
+)
+
+@Serializable
+data class E2EEVaultPutRequest(
+    @SerialName("vault_version") val vaultVersion: Int,
+    @SerialName("protocol_version") val protocolVersion: Int = 1,
+    val suite: String,
+    @SerialName("vault_ciphertext_b64") val vaultCiphertextB64: String,
+    @SerialName("pw_kdf") val pwKdf: String,
+    @SerialName("pw_salt_b64") val pwSaltB64: String,
+    @SerialName("pw_params") val pwParams: String,
+    @SerialName("pw_wrapped_master_b64") val pwWrappedMasterB64: String,
+    @SerialName("rk_kdf") val rkKdf: String = "",
+    @SerialName("rk_salt_b64") val rkSaltB64: String = "",
+    @SerialName("rk_wrapped_master_b64") val rkWrappedMasterB64: String = "",
+    @SerialName("expected_version") val expectedVersion: Int = 0
+)
+
+@Serializable
+data class E2EEDeviceRegisterRequest(
+    @SerialName("device_id") val deviceId: String,
+    val name: String,
+    val platform: String,
+    @SerialName("public_key") val publicKey: String
+)
+
+@Serializable
+data class E2EEDeviceDto(
+    val id: String = "",
+    @SerialName("device_id") val deviceId: String = "",
+    val name: String = "",
+    val platform: String = "",
+    @SerialName("public_key") val publicKey: String = "",
+    @SerialName("revoked_at") val revokedAt: String? = null,
+    @SerialName("last_seen_at") val lastSeenAt: String? = null,
+    @SerialName("created_at") val createdAt: String? = null
+)
+
+@Serializable
+data class E2EEDevicesResponse(
+    val devices: List<E2EEDeviceDto> = emptyList()
+)
+
+@Serializable
+data class ChatE2EEDeviceDto(
+    @SerialName("user_id") val userId: String = "",
+    @SerialName("device_id") val deviceId: String = "",
+    val platform: String = ""
+)
+
+@Serializable
+data class ChatE2EEDevicesResponse(
+    val devices: List<ChatE2EEDeviceDto> = emptyList()
+)
+
+@Serializable
+data class E2EEPairingCreateRequest(
+    @SerialName("ephemeral_pub_hex") val ephemeralPubHex: String,
+    @SerialName("device_id") val deviceId: String = ""
+)
+
+@Serializable
+data class E2EEPairingCreateResponse(
+    @SerialName("session_id") val sessionId: String = "",
+    @SerialName("pairing_string") val pairingString: String = "",
+    @SerialName("expires_at") val expiresAt: String? = null,
+    val status: String = ""
+)
+
+@Serializable
+data class E2EEPairingCompleteRequest(
+    @SerialName("payload_b64") val payloadB64: String,
+    @SerialName("sender_pub_hex") val senderPubHex: String
+)
+
+@Serializable
+data class E2EEPairingPayloadDto(
+    @SerialName("session_id") val sessionId: String = "",
+    @SerialName("payload_b64") val payloadB64: String = "",
+    @SerialName("sender_pub_hex") val senderPubHex: String = ""
 )

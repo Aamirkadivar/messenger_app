@@ -19,6 +19,7 @@ Item {
     property bool encrypted: false
     property string senderId: ""
     property int keyVersion: 0
+    property int encryptionVersion: 1
     property real durationMs: 0
     property color maskColor: "#12121A"
     property color accentColor: "#C9A961"
@@ -191,7 +192,8 @@ Item {
         bubbleRoot.downloading = true
         chatService.preparePlayableVideoNote(bubbleRoot.chatId, bubbleRoot.messageId,
                                               bubbleRoot.fileUrl, bubbleRoot.encrypted,
-                                              bubbleRoot.senderId, bubbleRoot.keyVersion)
+                                              bubbleRoot.senderId, bubbleRoot.keyVersion,
+                                              bubbleRoot.encryptionVersion)
     }
 
     Connections {
@@ -230,7 +232,7 @@ Item {
     Component.onCompleted: {
         if (thumbnailUrl !== "") {
             chatService.prepareVideoNoteThumbnail(chatId, messageId, thumbnailUrl, encrypted,
-                                                   senderId, keyVersion)
+                                                   senderId, keyVersion, encryptionVersion)
         }
     }
 }

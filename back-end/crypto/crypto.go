@@ -2,7 +2,6 @@ package crypto
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 
@@ -15,7 +14,8 @@ type KeyPair struct {
 	PrivateKey string
 }
 
-// GenerateKeyPair generates a new public/private key pair using NaCl box (Curve25519)
+// GenerateKeyPair is retained for offline tooling/tests. Live clients generate
+// keys on-device; the server must not persist private keys.
 func GenerateKeyPair() (*KeyPair, error) {
 	publicKey, privateKey, err := box.GenerateKey(rand.Reader)
 	if err != nil {

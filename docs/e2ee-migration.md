@@ -1,24 +1,23 @@
 # E2EE Migration Plan
 
+Status: **Done** for Android and Windows. New installs create a vault on first password login. Existing local identity keys are imported into the vault before relying on it.
+
 ## Principles
 - Never destroy old local keys before vault upload validates round-trip decrypt.
 - Never require re-encrypting historical messages.
-- Fail open to current E2EE if migration aborts mid-way.
+- `users.private_key` is dropped at migrate; clients never used it on the live path.
 
-## Steps (per user, on first upgraded client)
-
+## What a first upgraded client did
 1. Detect local identity sk/pk.
-2. Collect historical material: identity keys; own sender keys (all versions still available); cached peer sender keys if present; peer pubs needed for open threads.
-3. Generate MK + VEK; build vault CBOR; AEAD encrypt.
+2. Collect own sender keys (all versions), peer sender keys, peer pubs.
+3. Generate MK; AEAD-encrypt vault JSON (MK is the vault key).
 4. Wrap MK with Argon2id(password); show Recovery Key once; wrap MK with recovery KEK.
-5. Upload opaque wraps + vault ciphertext (`vault_version=1`).
-6. Local verify: download → unlock → compare identity sk.
-7. Mark `e2ee_migration_complete` locally; stop server `private_key` writes globally.
-8. Subsequent devices: login → unlock vault → restore (no new identity overwrite).
+5. `PUT /e2ee/vault` with `expected_version = 0`.
+6. Download → unlock → compare identity sk.
+7. Subsequent devices: login → unlock vault or pair → restore → register `device_id`.
 
 ## Rollback
-- If step 6 fails: keep using local keys; do not delete; surface error.
-- Server retains previous vault versions for conflict resolution.
+If unlock fails: keep using local keys; surface error; do not delete.
 
-## Conflict with FS requirement
-Sharing identity keys via vault preserves history but does not create forward secrecy for v1 direct chats. Documented; v2 is separate.
+## FS vs history
+Sharing identity keys via vault preserves history but does not give recipient-side forward secrecy. Direct v2 adds sender-side FS for **new** messages only. Full Double Ratchet is a separate track.

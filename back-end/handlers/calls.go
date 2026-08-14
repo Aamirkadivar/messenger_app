@@ -5,7 +5,9 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"messenger-app/config"
@@ -50,15 +52,18 @@ func (s *CallService) GetIceServers(c *fiber.Ctx) error {
 		mac.Write([]byte(username))
 		credential := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 
-		turnHostPort := fmt.Sprintf("%s:%s", s.cfg.TURNHost, s.cfg.TURNPort)
-		iceServers = append(iceServers, fiber.Map{
-			"urls": []string{
-				"turn:" + turnHostPort + "?transport=udp",
-				"turn:" + turnHostPort + "?transport=tcp",
-			},
-			"username":   username,
-			"credential": credential,
-		})
+		for _, host := range turnAdvertiseHosts(s.cfg.TURNHost, requestAdvertiseHost(c)) {
+			turnHostPort := net.JoinHostPort(host, s.cfg.TURNPort)
+			iceServers = append(iceServers, fiber.Map{
+				"urls": []string{
+					"stun:" + turnHostPort,
+					"turn:" + turnHostPort + "?transport=udp",
+					"turn:" + turnHostPort + "?transport=tcp",
+				},
+				"username":   username,
+				"credential": credential,
+			})
+		}
 	}
 
 	return c.JSON(fiber.Map{"ice_servers": iceServers})
@@ -128,3 +133,55 @@ func (s *CallService) GetCallHistory(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{"data": resp})
 }
+
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" || h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(h, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func requestAdvertiseHost(c *fiber.Ctx) string {
+	host := c.Get("X-Forwarded-Host")
+	if host == "" {
+		host = c.Hostname()
+	}
+	host = strings.TrimSpace(strings.Split(host, ",")[0])
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return host
+}
+
+// turnAdvertiseHosts picks TURN URIs that the calling device can actually
+// reach. A configured loopback host is skipped for remote clients (phones
+// cannot use TURN_HOST=localhost); the Host the client used to hit the API
+// is advertised instead.
+func turnAdvertiseHosts(configured, requestHost string) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	add := func(h string) {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			return
+		}
+		if _, ok := seen[h]; ok {
+			return
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	if configured != "" && !isLoopbackHost(configured) {
+		add(configured)
+	}
+	if requestHost != "" {
+		add(requestHost)
+	}
+	if len(out) == 0 && configured != "" {
+		add(configured)
+	}
+	return out
+}
+

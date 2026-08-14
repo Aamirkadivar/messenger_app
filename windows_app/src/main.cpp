@@ -26,6 +26,7 @@
 #include "services/roundvideoservice.h"
 #include "utils/circularvideoitem.h"
 #include "utils/videoframeitem.h"
+#include "utils/pairingqrscanner.h"
 #include "services/callservice.h"
 
 #ifdef Q_OS_WIN
@@ -92,11 +93,12 @@ int main(int argc, char* argv[]) {
 
     // Connect auth to websocket
     QObject::connect(&authService, &AuthService::loginSuccess,
-                     &websocketService, [&websocketService](const QString& userId, const QString& username) {
+                     &websocketService, [&websocketService, &authService](const QString& userId, const QString& username) {
         Q_UNUSED(userId);
         Q_UNUSED(username);
         QString token = CredentialManager::instance().getToken(QStringLiteral("access_token"));
         if (!token.isEmpty()) {
+            websocketService.setDeviceId(authService.getOrCreateDeviceId());
             websocketService.connectToServer(token);
         }
     });
@@ -125,8 +127,9 @@ int main(int argc, char* argv[]) {
     });
 
     QObject::connect(&authService, &AuthService::tokenReady,
-                     &websocketService, [&websocketService](const QString& token) {
+                     &websocketService, [&websocketService, &authService](const QString& token) {
         if (!websocketService.isConnected()) {
+            websocketService.setDeviceId(authService.getOrCreateDeviceId());
             websocketService.connectToServer(token);
         }
     });
@@ -135,6 +138,11 @@ int main(int argc, char* argv[]) {
     QObject::connect(&authService, &AuthService::tokenReady,
                      &chatService, [&chatService]() {
         chatService.fetchChats();
+    });
+
+    QObject::connect(&websocketService, &WebSocketService::connected,
+                     &authService, [&authService]() {
+        authService.pullAndMergeVault(true);
     });
 
     QObject::connect(&groupService, &GroupService::groupError,
@@ -168,6 +176,7 @@ int main(int argc, char* argv[]) {
     // Rectangular video surface for calls (remote feed + local self-view),
     // fed decoded QImage frames by CallService.
     qmlRegisterType<VideoFrameItem>("Messenger", 1, 0, "VideoFrame");
+    qmlRegisterType<PairingQrScanner>("Messenger", 1, 0, "PairingQrScanner");
 
     // Register types
     engine.rootContext()->setContextProperty(QStringLiteral("authService"), &authService);

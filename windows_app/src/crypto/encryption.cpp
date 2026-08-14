@@ -1,5 +1,7 @@
 #include "encryption.h"
 #include <QDebug>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QtGlobal>
 
 bool Encryption::m_initialized = false;
@@ -337,6 +339,91 @@ QByteArray Encryption::boxDecryptBytes(const QByteArray& payload,
     return plain;
 }
 
+
+QString Encryption::boxEncryptEphemeral(const QString& message,
+                                        const QString& recipientPublicHex) {
+    QByteArray sealed = boxEncryptBytesEphemeral(message.toUtf8(), recipientPublicHex);
+    if (sealed.isEmpty()) return QString();
+    return QString::fromUtf8(sealed.toHex());
+}
+
+QByteArray Encryption::boxEncryptBytesEphemeral(const QByteArray& plain,
+                                                const QString& recipientPublicHex) {
+    if (!init()) return QByteArray();
+
+    QByteArray pk = QByteArray::fromHex(recipientPublicHex.toUtf8());
+    if (pk.size() != crypto_box_PUBLICKEYBYTES) {
+        qWarning() << "boxEncryptBytesEphemeral: invalid recipient key size" << pk.size();
+        return QByteArray();
+    }
+
+    unsigned char ephPk[crypto_box_PUBLICKEYBYTES];
+    unsigned char ephSk[crypto_box_SECRETKEYBYTES];
+    if (crypto_box_keypair(ephPk, ephSk) != 0) {
+        qWarning() << "boxEncryptBytesEphemeral: keypair failed";
+        return QByteArray();
+    }
+
+    QByteArray nonce(crypto_box_NONCEBYTES, '\0');
+    randombytes_buf(nonce.data(), nonce.size());
+
+    QByteArray cipher(plain.size() + crypto_box_MACBYTES, '\0');
+    if (crypto_box_easy(
+            reinterpret_cast<unsigned char*>(cipher.data()),
+            reinterpret_cast<const unsigned char*>(plain.constData()),
+            static_cast<unsigned long long>(plain.size()),
+            reinterpret_cast<const unsigned char*>(nonce.constData()),
+            reinterpret_cast<const unsigned char*>(pk.constData()),
+            ephSk) != 0) {
+        sodium_memzero(ephSk, sizeof(ephSk));
+        qWarning() << "boxEncryptBytesEphemeral: crypto_box_easy failed";
+        return QByteArray();
+    }
+    sodium_memzero(ephSk, sizeof(ephSk));
+
+    QByteArray out;
+    out.reserve(crypto_box_PUBLICKEYBYTES + nonce.size() + cipher.size());
+    out.append(reinterpret_cast<const char*>(ephPk), crypto_box_PUBLICKEYBYTES);
+    out.append(nonce);
+    out.append(cipher);
+    return out;
+}
+
+QString Encryption::boxDecryptEphemeral(const QString& payloadHex,
+                                        const QString& myPrivateHex) {
+    QByteArray plain = boxDecryptBytesEphemeral(QByteArray::fromHex(payloadHex.toUtf8()), myPrivateHex);
+    if (plain.isEmpty()) return QString();
+    return QString::fromUtf8(plain);
+}
+
+QByteArray Encryption::boxDecryptBytesEphemeral(const QByteArray& payload,
+                                                const QString& myPrivateHex) {
+    if (!init()) return QByteArray();
+
+    QByteArray sk = QByteArray::fromHex(myPrivateHex.toUtf8());
+    if (sk.size() != crypto_box_SECRETKEYBYTES) return QByteArray();
+    // eph_pk(32) || nonce(24) || ct+mac
+    if (payload.size() < crypto_box_PUBLICKEYBYTES + crypto_box_NONCEBYTES + crypto_box_MACBYTES) {
+        return QByteArray();
+    }
+
+    QByteArray ephPk = payload.left(crypto_box_PUBLICKEYBYTES);
+    QByteArray nonce = payload.mid(crypto_box_PUBLICKEYBYTES, crypto_box_NONCEBYTES);
+    QByteArray cipher = payload.mid(crypto_box_PUBLICKEYBYTES + crypto_box_NONCEBYTES);
+    QByteArray plain(cipher.size() - crypto_box_MACBYTES, '\0');
+
+    if (crypto_box_open_easy(
+            reinterpret_cast<unsigned char*>(plain.data()),
+            reinterpret_cast<const unsigned char*>(cipher.constData()),
+            static_cast<unsigned long long>(cipher.size()),
+            reinterpret_cast<const unsigned char*>(nonce.constData()),
+            reinterpret_cast<const unsigned char*>(ephPk.constData()),
+            reinterpret_cast<const unsigned char*>(sk.constData())) != 0) {
+        return QByteArray();
+    }
+    return plain;
+}
+
 QString Encryption::secretBoxGenerateKey() {
     if (!init()) return QString();
     QByteArray key(crypto_secretbox_KEYBYTES, '\0');
@@ -403,6 +490,144 @@ QString Encryption::bytesToHex(const QByteArray& bytes) {
 
 QByteArray Encryption::hexToBytes(const QString& hex) {
     return QByteArray::fromHex(hex.toUtf8());
+}
+
+QString Encryption::safetyNumber(const QString& pubHexA, const QString& pubHexB) {
+    const QByteArray a = QByteArray::fromHex(pubHexA.trimmed().toLower().toLatin1());
+    const QByteArray b = QByteArray::fromHex(pubHexB.trimmed().toLower().toLatin1());
+    if (a.size() != 32 || b.size() != 32) return {};
+    const QString aHex = QString::fromLatin1(a.toHex());
+    const QString bHex = QString::fromLatin1(b.toHex());
+    const QByteArray concat = aHex <= bHex ? (a + b) : (b + a);
+    unsigned char out[crypto_hash_sha256_BYTES];
+    crypto_hash_sha256(out,
+                       reinterpret_cast<const unsigned char*>(concat.constData()),
+                       static_cast<unsigned long long>(concat.size()));
+    const QString hex = QString::fromLatin1(
+        QByteArray(reinterpret_cast<const char*>(out), crypto_hash_sha256_BYTES).toHex());
+    QString formatted;
+    formatted.reserve(64 + 15);
+    for (int i = 0; i < hex.size(); ++i) {
+        if (i > 0 && i % 16 == 0) formatted.append(QLatin1Char('\n'));
+        else if (i > 0 && i % 4 == 0) formatted.append(QLatin1Char(' '));
+        formatted.append(hex.at(i));
+    }
+    return formatted;
+}
+
+QString Encryption::safetyNumberCompact(const QString& formatted) {
+    QString out;
+    out.reserve(64);
+    for (QChar c : formatted.toLower()) {
+        if ((c >= QLatin1Char('0') && c <= QLatin1Char('9')) ||
+            (c >= QLatin1Char('a') && c <= QLatin1Char('f')))
+            out.append(c);
+    }
+    return out;
+}
+
+QString Encryption::safetyNumberQrPayload(const QString& formatted) {
+    const QString compact = safetyNumberCompact(formatted);
+    if (compact.size() != 64) return {};
+    return QStringLiteral("sn1.") + compact;
+}
+
+QString Encryption::parseSafetyNumberQr(const QString& raw) {
+    QString s = raw.trimmed();
+    if (s.startsWith(QStringLiteral("sn1."), Qt::CaseInsensitive))
+        s = s.mid(4);
+    const QString compact = safetyNumberCompact(s);
+    return compact.size() == 64 ? compact : QString();
+}
+
+QByteArray Encryption::wrapEnvelope(const QByteArray& payload,
+                                    const QString& fileName,
+                                    const QString& forwardedFrom,
+                                    qint64 durationMs,
+                                    qint64 fileSize) {
+    QJsonObject o;
+    if (!fileName.isEmpty()) o.insert(QStringLiteral("fn"), fileName);
+    if (!forwardedFrom.isEmpty()) o.insert(QStringLiteral("fwd"), forwardedFrom);
+    if (durationMs > 0) o.insert(QStringLiteral("dur"), durationMs);
+    if (fileSize > 0) o.insert(QStringLiteral("sz"), fileSize);
+    const QByteArray meta = QJsonDocument(o).toJson(QJsonDocument::Compact);
+    if (meta.size() > 0xffff) return payload;
+    QByteArray out;
+    out.reserve(6 + meta.size() + payload.size());
+    out.append("EM1\n", 4);
+    out.append(static_cast<char>((meta.size() >> 8) & 0xff));
+    out.append(static_cast<char>(meta.size() & 0xff));
+    out.append(meta);
+    out.append(payload);
+    return out;
+}
+
+Encryption::MessageEnvelope Encryption::unwrapEnvelope(const QByteArray& data) {
+    MessageEnvelope env;
+    env.payload = data;
+    if (data.size() < 6) return env;
+    if (!(data.size() >= 4 && data[0] == 'E' && data[1] == 'M' && data[2] == '1' && data[3] == '\n'))
+        return env;
+    const int n = (static_cast<unsigned char>(data[4]) << 8) | static_cast<unsigned char>(data[5]);
+    if (n < 0 || data.size() < 6 + n) return env;
+    const QJsonObject o = QJsonDocument::fromJson(data.mid(6, n)).object();
+    env.fileName = o.value(QStringLiteral("fn")).toString();
+    env.forwardedFrom = o.value(QStringLiteral("fwd")).toString();
+    env.durationMs = static_cast<qint64>(o.value(QStringLiteral("dur")).toDouble(0));
+    env.fileSize = static_cast<qint64>(o.value(QStringLiteral("sz")).toDouble(0));
+    env.payload = data.mid(6 + n);
+    return env;
+}
+
+QByteArray Encryption::wrapFanout(const QList<QPair<QString, QByteArray>>& parts) {
+    if (parts.isEmpty() || parts.size() > 0xffff) return {};
+    QByteArray out;
+    out.append("FN1\n", 4);
+    out.append(static_cast<char>((parts.size() >> 8) & 0xff));
+    out.append(static_cast<char>(parts.size() & 0xff));
+    for (const auto& p : parts) {
+        const QByteArray id = p.first.toUtf8();
+        if (id.size() > 255) return {};
+        out.append(static_cast<char>(id.size()));
+        out.append(id);
+        const quint32 n = static_cast<quint32>(p.second.size());
+        out.append(static_cast<char>((n >> 24) & 0xff));
+        out.append(static_cast<char>((n >> 16) & 0xff));
+        out.append(static_cast<char>((n >> 8) & 0xff));
+        out.append(static_cast<char>(n & 0xff));
+        out.append(p.second);
+    }
+    return out;
+}
+
+bool Encryption::isFanout(const QByteArray& data) {
+    return data.size() >= 4 && data[0] == 'F' && data[1] == 'N' && data[2] == '1' && data[3] == '\n';
+}
+
+QByteArray Encryption::pickFanout(const QByteArray& data, const QString& deviceId) {
+    if (!isFanout(data) || data.size() < 6) return data;
+    const int n = (static_cast<unsigned char>(data[4]) << 8) | static_cast<unsigned char>(data[5]);
+    int off = 6;
+    const QByteArray want = deviceId.toUtf8();
+    for (int i = 0; i < n; ++i) {
+        if (off >= data.size()) return {};
+        const int idLen = static_cast<unsigned char>(data[off]);
+        off++;
+        if (off + idLen + 4 > data.size()) return {};
+        const QByteArray id = data.mid(off, idLen);
+        off += idLen;
+        const quint32 blobLen =
+            (static_cast<quint32>(static_cast<unsigned char>(data[off])) << 24) |
+            (static_cast<quint32>(static_cast<unsigned char>(data[off + 1])) << 16) |
+            (static_cast<quint32>(static_cast<unsigned char>(data[off + 2])) << 8) |
+            static_cast<quint32>(static_cast<unsigned char>(data[off + 3]));
+        off += 4;
+        if (off + static_cast<int>(blobLen) > data.size()) return {};
+        const QByteArray blob = data.mid(off, static_cast<int>(blobLen));
+        off += static_cast<int>(blobLen);
+        if (id == want) return blob;
+    }
+    return {};
 }
 
 // Encrypt a message directly for a recipient's public key using a sealed box.

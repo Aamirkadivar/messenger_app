@@ -22,6 +22,42 @@ Item {
     property color accentColor: darkMode ? "#C9A961" : "#A6803A"
 
     property bool isLoading: false
+    property bool awaiting2FA: false
+    property bool awaitingRecoveryKey: false
+    property bool awaitingDevicePairing: false
+    property string pairingCode: ""
+    property string challengeId: ""
+    property string twoFactorHint: ""
+    property string recoveryKeyToShow: ""
+    property bool awaitingPasswordReset: false
+    property bool resetCodeSent: false
+    property bool resetTotpRequired: false
+    property string recoveryKeyInput: ""
+
+    Dialog {
+        id: recoveryKeyDialog
+        modal: true
+        anchors.centerIn: parent
+        title: "Save your recovery key"
+        standardButtons: Dialog.Ok
+        visible: loginPage.recoveryKeyToShow.length > 0
+        onAccepted: loginPage.recoveryKeyToShow = ""
+        contentItem: ColumnLayout {
+            spacing: 12
+            Label {
+                text: "Store this key somewhere safe. It unlocks your encrypted messages if you forget your password."
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
+            TextArea {
+                text: loginPage.recoveryKeyToShow
+                readOnly: true
+                selectByMouse: true
+                Layout.fillWidth: true
+                Layout.preferredHeight: 80
+            }
+        }
+    }
 
     // Ambient colour behind the glass card, same treatment as the main window.
     AmbientGlow {
@@ -111,7 +147,10 @@ Item {
             anchors.top: iconArea.bottom
             anchors.topMargin: 18
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "Welcome Back"
+            text: loginPage.awaitingRecoveryKey ? "Recovery key"
+                  : (loginPage.awaiting2FA ? "Two-factor code"
+                  : (loginPage.awaitingPasswordReset && loginPage.resetCodeSent ? "Reset password"
+                  : (loginPage.awaitingPasswordReset ? "Forgot password" : "Welcome Back")))
             font.pixelSize: 24
             font.bold: true
             color: darkMode ? "#F0EAD6" : "#2B2418"
@@ -122,7 +161,18 @@ Item {
             anchors.top: titleArea.bottom
             anchors.topMargin: 6
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "Sign in to continue to Messenger"
+            width: parent.width - 64
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
+            text: loginPage.awaitingRecoveryKey
+                  ? "Enter the recovery key you saved when encryption was set up."
+                  : (loginPage.awaiting2FA
+                     ? (loginPage.twoFactorHint || "Enter the 6-digit authenticator code or a backup code")
+                     : (loginPage.awaitingPasswordReset && loginPage.resetCodeSent
+                        ? (loginPage.twoFactorHint || "Enter the code and a new login password. Unlock history with your recovery key after sign-in.")
+                        : (loginPage.awaitingPasswordReset
+                           ? "Resetting login does not decrypt old messages without your recovery key."
+                           : "Sign in to continue to Messenger")))
             font.pixelSize: 13
             color: darkMode ? "#A39A8A" : "#7A6F5C"
         }
@@ -142,6 +192,8 @@ Item {
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 6
+                visible: !loginPage.awaiting2FA && !loginPage.awaitingRecoveryKey
+                         && !(loginPage.awaitingPasswordReset && loginPage.resetCodeSent)
 
                 Text {
                     text: "Email"
@@ -190,6 +242,7 @@ Item {
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 6
+                visible: !loginPage.awaiting2FA && !loginPage.awaitingRecoveryKey && !loginPage.awaitingPasswordReset
 
                 Text {
                     text: "Password"
@@ -224,7 +277,7 @@ Item {
                         color: darkMode ? "#F0EAD6" : "#2B2418"
                         passwordCharacter: "•"
                         selectByMouse: true
-                        onTextChanged: passwordError.text = ""
+                        onTextChanged: passwordErrorShared.text = ""
                         Keys.onReturnPressed: loginButton.clicked()
                     }
 
@@ -283,21 +336,226 @@ Item {
                         }
                     }
                 }
+            }
+
+            // DEV 2FA code
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                visible: loginPage.awaiting2FA || (loginPage.awaitingPasswordReset && loginPage.resetCodeSent)
 
                 Text {
-                    id: passwordError
-                    Layout.fillWidth: true
-                    text: ""
-                    color: "#FF6B6B"
-                    font.pixelSize: 12
-                    visible: text !== ""
+                    text: "Verification code"
+                    font.pixelSize: 13
+                    font.weight: Font.Medium
+                    color: darkMode ? "#A39A8A" : "#7A6F5C"
                 }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 46
+                    radius: 12
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
+                    border.color: otpField.activeFocus ? loginPage.accentColor : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0")
+                    border.width: otpField.activeFocus ? 2 : 1
+
+                    TextField {
+                        id: otpField
+                        anchors.fill: parent
+                        leftPadding: 14
+                        rightPadding: 14
+                        verticalAlignment: TextInput.AlignVCenter
+                        background: Item {}
+                        placeholderText: loginPage.awaiting2FA ? "Authenticator or backup code" : "6-digit code"
+                        placeholderTextColor: darkMode ? "#6B6355" : "#B0A58E"
+                        color: darkMode ? "#F0EAD6" : "#2B2418"
+                        font.pixelSize: 16
+                        font.letterSpacing: loginPage.awaiting2FA ? 1 : 4
+                        maximumLength: loginPage.awaiting2FA ? 9 : 6
+                        inputMethodHints: loginPage.awaiting2FA ? Qt.ImhLatinOnly : Qt.ImhDigitsOnly
+                        onTextChanged: passwordErrorShared.text = ""
+                        Keys.onReturnPressed: loginButton.clicked()
+                    }
+                }
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                visible: loginPage.awaitingPasswordReset && loginPage.resetCodeSent && loginPage.resetTotpRequired
+
+                Text {
+                    text: "Authenticator or backup code"
+                    font.pixelSize: 13
+                    font.weight: Font.Medium
+                    color: darkMode ? "#A39A8A" : "#7A6F5C"
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 46
+                    radius: 12
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
+                    border.color: totpResetField.activeFocus ? loginPage.accentColor : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0")
+                    border.width: totpResetField.activeFocus ? 2 : 1
+
+                    TextField {
+                        id: totpResetField
+                        anchors.fill: parent
+                        leftPadding: 14
+                        rightPadding: 14
+                        verticalAlignment: TextInput.AlignVCenter
+                        background: Item {}
+                        placeholderText: "6-digit or XXXX-XXXX"
+                        placeholderTextColor: darkMode ? "#6B6355" : "#B0A58E"
+                        color: darkMode ? "#F0EAD6" : "#2B2418"
+                        font.pixelSize: 16
+                        maximumLength: 9
+                        onTextChanged: passwordErrorShared.text = ""
+                        Keys.onReturnPressed: loginButton.clicked()
+                    }
+                }
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                visible: loginPage.awaitingPasswordReset && loginPage.resetCodeSent
+
+                Text {
+                    text: "New password"
+                    font.pixelSize: 13
+                    font.weight: Font.Medium
+                    color: darkMode ? "#A39A8A" : "#7A6F5C"
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 46
+                    radius: 12
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
+                    border.color: resetPasswordField.activeFocus ? loginPage.accentColor : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0")
+                    border.width: resetPasswordField.activeFocus ? 2 : 1
+
+                    TextField {
+                        id: resetPasswordField
+                        anchors.fill: parent
+                        leftPadding: 14
+                        rightPadding: 14
+                        verticalAlignment: TextInput.AlignVCenter
+                        background: Item {}
+                        placeholderText: "At least 8 characters"
+                        placeholderTextColor: darkMode ? "#6B6355" : "#B0A58E"
+                        echoMode: TextInput.Password
+                        color: darkMode ? "#F0EAD6" : "#2B2418"
+                        selectByMouse: true
+                        Keys.onReturnPressed: loginButton.clicked()
+                    }
+                }
+            }
+
+            // Recovery key (after password unlock fails)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                visible: loginPage.awaitingRecoveryKey && !loginPage.awaitingDevicePairing
+
+                Text {
+                    text: "Recovery key"
+                    font.pixelSize: 13
+                    font.weight: Font.Medium
+                    color: darkMode ? "#A39A8A" : "#7A6F5C"
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 72
+                    radius: 12
+                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(43/255, 36/255, 24/255, 0.06)
+                    border.color: recoveryInput.activeFocus ? loginPage.accentColor : (darkMode ? Qt.rgba(1, 1, 1, 0.08) : "#E6DFD0")
+                    border.width: recoveryInput.activeFocus ? 2 : 1
+
+                    TextArea {
+                        id: recoveryInput
+                        anchors.fill: parent
+                        anchors.margins: 10
+                        wrapMode: TextEdit.Wrap
+                        selectByMouse: true
+                        color: darkMode ? "#F0EAD6" : "#2B2418"
+                        font.pixelSize: 13
+                        text: loginPage.recoveryKeyInput
+                        onTextChanged: loginPage.recoveryKeyInput = text
+                    }
+                }
+
+                Text {
+                    text: "Link from another device instead"
+                    font.pixelSize: 13
+                    color: loginPage.accentColor
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -6
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            passwordErrorShared.text = ""
+                            isLoading = true
+                            authService.startDevicePairing()
+                        }
+                    }
+                }
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                visible: loginPage.awaitingDevicePairing
+                Text {
+                    text: "Pairing QR"
+                    font.pixelSize: 13
+                    font.weight: Font.Medium
+                    color: darkMode ? "#A39A8A" : "#7A6F5C"
+                }
+                Image {
+                    Layout.alignment: Qt.AlignHCenter
+                    width: 200
+                    height: 200
+                    fillMode: Image.PreserveAspectFit
+                    source: authService.pairingQrPath.length > 0
+                            ? ("file:///" + authService.pairingQrPath.replace(/\\/g, "/"))
+                            : ""
+                    visible: source !== ""
+                    cache: false
+                }
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WrapAnywhere
+                    text: loginPage.pairingCode
+                    font.pixelSize: 12
+                    color: darkMode ? "#F0EAD6" : "#2B2418"
+                }
+                Text {
+                    text: "On your unlocked device: Settings → Link a device (scan or paste)"
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                    font.pixelSize: 12
+                    color: darkMode ? "#A39A8A" : "#7A6F5C"
+                }
+            }
+
+            Text {
+                id: passwordErrorShared
+                Layout.fillWidth: true
+                text: ""
+                color: "#FF6B6B"
+                font.pixelSize: 12
+                visible: text !== ""
             }
 
             // Remember me & Forgot password
             RowLayout {
                 Layout.fillWidth: true
                 Layout.topMargin: 2
+                visible: !loginPage.awaiting2FA && !loginPage.awaitingRecoveryKey && !loginPage.awaitingPasswordReset
 
                 CheckBox {
                     id: rememberCheck
@@ -364,7 +622,10 @@ Item {
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
                         onClicked: {
-                            // Handle forgot password
+                            loginPage.awaitingPasswordReset = true
+                            loginPage.resetCodeSent = false
+                            loginPage.resetTotpRequired = false
+                            passwordErrorShared.text = ""
                         }
                     }
                 }
@@ -376,10 +637,26 @@ Item {
                 Layout.fillWidth: true
                 Layout.topMargin: 6
                 height: 48
-                text: isLoading ? "Signing in…" : "Sign In"
+                text: {
+                    if (isLoading) {
+                        if (loginPage.awaitingRecoveryKey) return "Unlocking…"
+                        if (loginPage.awaitingPasswordReset) return loginPage.resetCodeSent ? "Updating…" : "Sending…"
+                        return loginPage.awaiting2FA ? "Verifying…" : "Signing in…"
+                    }
+                    if (loginPage.awaitingRecoveryKey) return "Unlock vault"
+                    if (loginPage.awaitingPasswordReset) return loginPage.resetCodeSent ? "Set new password" : "Send reset code"
+                    return loginPage.awaiting2FA ? "Verify" : "Sign In"
+                }
                 font.pixelSize: 15
                 font.bold: true
-                enabled: !isLoading && emailField.text.length > 0 && passwordField.text.length > 0
+                enabled: !isLoading && !loginPage.awaitingDevicePairing && (
+                    loginPage.awaitingRecoveryKey ? loginPage.recoveryKeyInput.length > 0
+                    : loginPage.awaitingPasswordReset && loginPage.resetCodeSent
+                        ? (otpField.text.length === 6 && resetPasswordField.text.length >= 8
+                           && (!loginPage.resetTotpRequired || totpResetField.text.length >= 6))
+                    : loginPage.awaitingPasswordReset ? emailField.text.length > 0
+                    : loginPage.awaiting2FA ? otpField.text.length >= 6
+                    : (emailField.text.length > 0 && passwordField.text.length > 0))
                 contentItem: Text {
                     text: loginButton.text
                     font: loginButton.font
@@ -406,7 +683,45 @@ Item {
                 }
                 onClicked: {
                     isLoading = true
-                    authService.login(emailField.text, passwordField.text)
+                    passwordErrorShared.text = ""
+                    if (loginPage.awaitingRecoveryKey) {
+                        authService.unlockWithRecoveryKey(loginPage.recoveryKeyInput)
+                    } else if (loginPage.awaitingPasswordReset && loginPage.resetCodeSent) {
+                        authService.completePasswordReset(loginPage.challengeId, otpField.text, resetPasswordField.text, totpResetField.text)
+                    } else if (loginPage.awaitingPasswordReset) {
+                        authService.startPasswordReset(emailField.text)
+                    } else if (loginPage.awaiting2FA) {
+                        authService.verify2FA(loginPage.challengeId, otpField.text)
+                    } else {
+                        authService.login(emailField.text, passwordField.text)
+                    }
+                }
+            }
+
+            Text {
+                visible: loginPage.awaiting2FA || loginPage.awaitingRecoveryKey || loginPage.awaitingPasswordReset
+                Layout.alignment: Qt.AlignHCenter
+                text: "Back"
+                font.pixelSize: 13
+                color: darkMode ? "#A39A8A" : "#7A6F5C"
+                MouseArea {
+                    anchors.fill: parent
+                    anchors.margins: -8
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        loginPage.awaiting2FA = false
+                        loginPage.awaitingRecoveryKey = false
+                        loginPage.awaitingPasswordReset = false
+                        loginPage.resetCodeSent = false
+                        loginPage.resetTotpRequired = false
+                        loginPage.challengeId = ""
+                        loginPage.recoveryKeyInput = ""
+                        otpField.text = ""
+                        totpResetField.text = ""
+                        resetPasswordField.text = ""
+                        passwordErrorShared.text = ""
+                        isLoading = false
+                    }
                 }
             }
 
@@ -423,6 +738,7 @@ Item {
                 Layout.fillWidth: true
                 Layout.topMargin: 4
                 spacing: 12
+                visible: !loginPage.awaiting2FA && !loginPage.awaitingRecoveryKey && !loginPage.awaitingPasswordReset
 
                 Rectangle {
                     Layout.fillWidth: true
@@ -446,6 +762,7 @@ Item {
                 Layout.alignment: Qt.AlignHCenter
                 Layout.bottomMargin: 4
                 spacing: 4
+                visible: !loginPage.awaiting2FA && !loginPage.awaitingRecoveryKey && !loginPage.awaitingPasswordReset
 
                 Text {
                     text: "Don't have an account?"
@@ -499,10 +816,79 @@ Item {
     Component.onCompleted: {
         authService.loginFailed.connect(function(message) {
             isLoading = false
-            passwordError.text = message
+            passwordErrorShared.text = message
         })
         authService.loginSuccess.connect(function(userId, username) {
             isLoading = false
+            loginPage.awaiting2FA = false
+            loginPage.awaitingRecoveryKey = false
+            loginPage.challengeId = ""
+            loginPage.recoveryKeyInput = ""
+        })
+        authService.twoFactorRequired.connect(function(challengeId, hint) {
+            isLoading = false
+            loginPage.awaiting2FA = true
+            loginPage.challengeId = challengeId
+            loginPage.twoFactorHint = hint || ""
+            otpField.text = ""
+            passwordErrorShared.text = ""
+        })
+        authService.passwordResetStarted.connect(function(challengeId, hint, totpRequired) {
+            isLoading = false
+            loginPage.awaitingPasswordReset = true
+            loginPage.resetCodeSent = true
+            loginPage.resetTotpRequired = !!totpRequired
+            loginPage.challengeId = challengeId || ""
+            loginPage.twoFactorHint = hint || ""
+            otpField.text = ""
+            totpResetField.text = ""
+            resetPasswordField.text = ""
+            passwordErrorShared.text = challengeId ? "" : "If that account exists, check the DEV 2FA bot. Without a challenge id, complete cannot proceed."
+        })
+        authService.passwordResetCompleted.connect(function(message) {
+            isLoading = false
+            loginPage.awaitingPasswordReset = false
+            loginPage.resetCodeSent = false
+            loginPage.resetTotpRequired = false
+            loginPage.challengeId = ""
+            otpField.text = ""
+            totpResetField.text = ""
+            resetPasswordField.text = ""
+            passwordErrorShared.text = message || "Password updated. Sign in, then use your recovery key."
+        })
+        authService.passwordResetFailed.connect(function(message) {
+            isLoading = false
+            passwordErrorShared.text = message || "Reset failed"
+        })
+        authService.vaultNeedsRecovery.connect(function(message) {
+            isLoading = false
+            loginPage.awaitingRecoveryKey = true
+            loginPage.awaitingDevicePairing = false
+            passwordErrorShared.text = message || ""
+        })
+        authService.devicePairingStarted.connect(function(code) {
+            isLoading = true
+            loginPage.awaitingDevicePairing = true
+            loginPage.awaitingRecoveryKey = false
+            loginPage.pairingCode = code || ""
+            passwordErrorShared.text = ""
+        })
+        authService.devicePairingSucceeded.connect(function() {
+            isLoading = false
+            loginPage.awaitingDevicePairing = false
+            loginPage.awaitingRecoveryKey = false
+            loginPage.pairingCode = ""
+        })
+        authService.devicePairingFailed.connect(function(message) {
+            isLoading = false
+            loginPage.awaitingDevicePairing = false
+            loginPage.awaitingRecoveryKey = true
+            loginPage.pairingCode = ""
+            passwordErrorShared.text = message || "Device link failed"
+        })
+        authService.recoveryKeyReady.connect(function(recoveryKey) {
+            loginPage.recoveryKeyToShow = recoveryKey || ""
+            recoveryKeyDialog.open()
         })
     }
 }

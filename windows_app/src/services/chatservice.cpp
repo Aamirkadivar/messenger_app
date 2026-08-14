@@ -1,7 +1,9 @@
 #include "chatservice.h"
 #include "../utils/videothumbnailer.h"
 #include "../crypto/encryption.h"
+#include "../crypto/doubleratchet.h"
 #include "../utils/credentialmanager.h"
+#include "../utils/pairingqr.h"
 #include <QNetworkRequest>
 #include <QUrl>
 #include <QUrlQuery>
@@ -16,6 +18,7 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QStandardPaths>
+#include <QUrl>
 #include <QUuid>
 #include <QDateTime>
 
@@ -27,6 +30,11 @@ ChatService::ChatService(AuthService* authService, GroupService* groupService, Q
     setupNetworkManager();
     m_messageCache = new MessageCache(this);
     setupForwardSignalHooks();
+    if (m_authService) {
+        connect(m_authService, &AuthService::vaultRatchetsUpdated, this, [this]() {
+            m_dr.clear();
+        });
+    }
 }
 
 ChatService::~ChatService() {
@@ -51,12 +59,26 @@ QString ChatService::buildAuthHeader() const {
     return {};
 }
 
+void ChatService::applyAuthHeaders(QNetworkRequest& request) const {
+    const QString auth = buildAuthHeader();
+    if (!auth.isEmpty()) {
+        request.setRawHeader("Authorization", auth.toUtf8());
+    }
+    if (m_authService) {
+        const QString deviceId = m_authService->getOrCreateDeviceId();
+        if (!deviceId.isEmpty()) {
+            request.setRawHeader("X-Device-Id", deviceId.toUtf8());
+        }
+    }
+}
+
 void ChatService::appendForwardFields(QJsonObject& body, bool isForwarded,
                                        const QString& forwardedFromName,
                                        const QString& forwardedFromMessageId) const {
     if (!isForwarded) return;
     body[QStringLiteral("is_forwarded")] = true;
-    body[QStringLiteral("forwarded_from_name")] = forwardedFromName;
+    Q_UNUSED(forwardedFromName);
+    body[QStringLiteral("forwarded_from_name")] = QString();
     if (!forwardedFromMessageId.isEmpty())
         body[QStringLiteral("forwarded_from_message_id")] = forwardedFromMessageId;
 }
@@ -111,7 +133,7 @@ void ChatService::fetchChats() {
     QUrl url(baseUrl + "/chats");
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     qDebug() << "[ChatService] Fetching chats from:" << url.toString();
 
@@ -202,7 +224,7 @@ void ChatService::searchUsers(const QString& query) {
     url.setQuery(urlQuery);
 
     QNetworkRequest request(url);
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->get(request);
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
@@ -253,7 +275,7 @@ void ChatService::startDirectChat(const QString& userId, const QString& userName
     QUrl url(Config::apiBaseUrl() + "/chats/direct/" + userId);
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->post(request, QByteArray());
     connect(reply, &QNetworkReply::finished, this, [this, reply, userName]() {
@@ -317,7 +339,7 @@ void ChatService::fetchMessages(const QString& chatId) {
                 // A file/voice message has no text body - decrypting empty
                 // content would just yield the "encrypted" placeholder for no reason.
                 item["content"] = hasFile ? QString()
-                                           : decryptMessage(chatId, e.content, e.encrypted, e.senderId, e.keyVersion);
+                                           : decryptMessage(chatId, e.content, e.encrypted, e.senderId, e.keyVersion, e.encryptionVersion);
                 item["createdAt"] = e.createdAt;
                 item["readAt"] = e.readAt;
                 item["fileUrl"] = hasFile ? e.fileUrl : QString();
@@ -327,6 +349,7 @@ void ChatService::fetchMessages(const QString& chatId) {
                 item["durationMs"] = e.durationMs;
                 item["voiceEncrypted"] = hasFile && e.encrypted;
                 item["keyVersion"] = e.keyVersion;
+                item["encryptionVersion"] = e.encryptionVersion;
                 item["isForwarded"] = e.isForwarded;
                 item["forwardedFromName"] = e.forwardedFromName;
                 item["replyToId"] = e.replyToId;
@@ -343,7 +366,7 @@ void ChatService::fetchMessages(const QString& chatId) {
 
         QUrl url(Config::apiBaseUrl() + "/messages/" + chatId);
         QNetworkRequest request(url);
-        request.setRawHeader("Authorization", authToken.toUtf8());
+        applyAuthHeaders(request);
 
         QNetworkReply* reply = m_networkManager->get(request);
         connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
@@ -391,6 +414,8 @@ void ChatService::fetchMessages(const QString& chatId) {
                 QString thumbnailUrl = m["thumbnail_url"].toString();
                 QString senderId = m["sender_id"].toString();
                 int keyVersion = m["key_version"].toInt();
+                int encryptionVersion = m["encryption_version"].toInt(1);
+                if (encryptionVersion <= 0) encryptionVersion = 1;
                 bool hasFile = !fileUrl.isEmpty()
                                && (fileType == QStringLiteral("audio") || fileType == QStringLiteral("image")
                                    || fileType == QStringLiteral("file")
@@ -405,10 +430,12 @@ void ChatService::fetchMessages(const QString& chatId) {
                 // rendered before the keys arrived fixes itself; content is
                 // only a fallback for callers that do not.
                 item["content"] = hasFile ? QString()
-                                           : decryptMessage(chatId, rawContent, encrypted, senderId, keyVersion);
-                item["rawContent"] = hasFile ? QString() : rawContent;
+                                           : decryptMessage(chatId, rawContent, encrypted, senderId, keyVersion, encryptionVersion);
+                item["rawContent"] = hasFile ? rawContent : rawContent;
                 item["encrypted"] = encrypted;
                 item["keyVersion"] = keyVersion;
+                item["encryptionVersion"] = encryptionVersion;
+                item["senderDeviceId"] = m[QStringLiteral("sender_device_id")].toString();
                 item["createdAt"] = createdAt;
                 item["readAt"] = readAt;
                 item["fileUrl"] = hasFile ? fileUrl : QString();
@@ -422,6 +449,9 @@ void ChatService::fetchMessages(const QString& chatId) {
                 item["forwardedFromName"] = m[QStringLiteral("forwarded_from_name")].toString();
                 item["forwardedFromMessageId"] = m[QStringLiteral("forwarded_from_message_id")].toString();
                 item["replyToId"] = m[QStringLiteral("reply_to_id")].toString();
+                if (encrypted && !rawContent.isEmpty()) {
+                    applyEnvelopeMeta(item, openCipher(chatId, rawContent, encrypted, senderId, keyVersion, encryptionVersion));
+                }
                 result.append(item);
 
                 MessageCache::Entry cacheEntry;
@@ -438,6 +468,7 @@ void ChatService::fetchMessages(const QString& chatId) {
                 cacheEntry.fileSize = fileSize;
                 cacheEntry.durationMs = durationMs;
                 cacheEntry.keyVersion = keyVersion;
+                cacheEntry.encryptionVersion = encryptionVersion;
                 cacheEntry.isForwarded = item["isForwarded"].toBool();
                 cacheEntry.forwardedFromName = item["forwardedFromName"].toString();
                 cacheEntry.replyToId = item["replyToId"].toString();
@@ -474,29 +505,47 @@ void ChatService::sendMessage(const QString& chatId, const QString& text, const 
     QUrl url(Config::apiBaseUrl() + "/messages");
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     // Encrypt end-to-end when we know the recipient's public key. If we don't
     // (they've never published one - e.g. still on an old build - or this is
     // a group chat, where the pairwise scheme doesn't apply), fall back to
     // plaintext so messaging keeps working during rollout.
-    QString outContent = text;
-    bool encrypted = false;
     QString otherPub = m_chatOtherPub.value(chatId);
     QString myPriv = m_authService ? m_authService->e2eePrivateKey() : QString();
-    if (!otherPub.isEmpty() && !myPriv.isEmpty()) {
-        QString cipher = Encryption::boxEncrypt(text, otherPub, myPriv);
-        if (!cipher.isEmpty()) {
-            outContent = cipher;
-            encrypted = true;
-        }
+    if (otherPub.isEmpty() || myPriv.isEmpty()) {
+        emit messageError("Cannot send: peer encryption key is missing");
+        return;
     }
+    QString outContent;
+    bool encrypted = true;
+    int encryptionVersion = 3;
+    QByteArray v3 = encryptDirectV3(chatId, Encryption::wrapEnvelope(text.toUtf8(), QString(), forwardedFromName));
+    QString cipher;
+    if (!v3.isEmpty()) {
+        cipher = QString::fromLatin1(v3.toHex());
+    } else {
+        QByteArray inner = Encryption::wrapEnvelope(text.toUtf8(), QString(), forwardedFromName);
+        cipher = QString::fromLatin1(Encryption::boxEncryptBytesEphemeral(inner, otherPub).toHex());
+        encryptionVersion = 2;
+    }
+    if (cipher.isEmpty()) {
+        QByteArray inner = Encryption::wrapEnvelope(text.toUtf8(), QString(), forwardedFromName);
+        cipher = QString::fromLatin1(Encryption::boxEncryptBytes(inner, otherPub, myPriv).toHex());
+        encryptionVersion = 1;
+    }
+    if (cipher.isEmpty()) {
+        emit messageError("Cannot send: encryption failed");
+        return;
+    }
+    outContent = cipher;
 
     QJsonObject body;
     body["chat_id"] = chatId;
     body["chat_type"] = chatType;
     body["content"] = outContent;
     body["encrypted"] = encrypted;
+    body["encryption_version"] = encryptionVersion;
     appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
     appendReplyField(body, takePendingReplyToId());
 
@@ -526,44 +575,133 @@ void ChatService::sendMessage(const QString& chatId, const QString& text, const 
         QVariantMap item;
         item["id"] = data["id"].toString();
         item["senderId"] = data["sender_id"].toString();
-        item["content"] = decryptMessage(chatId, data["content"].toString(), data["encrypted"].toBool(false));
+        item["content"] = decryptMessage(chatId, data["content"].toString(), data["encrypted"].toBool(false),
+                                          QString(), 0, data["encryption_version"].toInt(1));
         item["createdAt"] = data["created_at"].toString();
         item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
         item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
         item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
+        applyEnvelopeMeta(item, openCipher(chatId, data["content"].toString(), data["encrypted"].toBool(false),
+                                           QString(), 0, data["encryption_version"].toInt(1)));
 
         emit messageSent(chatId, item);
     });
 }
 
-QString ChatService::decryptMessage(const QString& chatId, const QString& content, bool encrypted,
-                                     const QString& senderId, int keyVersion) const {
-    if (!encrypted) return content;
+bool ChatService::loadDr(const QString& chatId, DoubleRatchet::State& st, bool sending) const {
+    if (m_dr.contains(chatId)) {
+        st = m_dr.value(chatId);
+        return true;
+    }
+    const QString json = CredentialManager::instance().getToken(QStringLiteral("dr3_%1").arg(chatId));
+    if (!json.isEmpty() && DoubleRatchet::State::fromJson(json, st)) {
+        m_dr.insert(chatId, st);
+        return true;
+    }
+    const QString chatKey = chatId.section(QLatin1Char('|'), 0, 0);
+    const QByteArray other = QByteArray::fromHex(m_chatOtherPub.value(chatKey).toUtf8());
+    const QByteArray myPriv = QByteArray::fromHex(m_authService ? m_authService->e2eePrivateKey().toUtf8() : QByteArray());
+    const QByteArray myPub = QByteArray::fromHex(m_authService ? m_authService->e2eePublicKey().toUtf8() : QByteArray());
+    if (sending) {
+        if (!DoubleRatchet::initAlice(other, st)) return false;
+    } else {
+        if (!DoubleRatchet::initBob(myPub, myPriv, st)) return false;
+    }
+    m_dr.insert(chatId, st);
+    return true;
+}
 
+void ChatService::saveDr(const QString& chatId, DoubleRatchet::State& st) const {
+    st.seq++;
+    m_dr.insert(chatId, st);
+    CredentialManager::instance().saveToken(QStringLiteral("dr3_%1").arg(chatId), st.toJson());
+    if (m_authService) m_authService->refreshVaultContents();
+}
+
+QByteArray ChatService::encryptDirectV3(const QString& chatId, const QByteArray& plain) const {
+    DoubleRatchet::State st;
+    if (!loadDr(chatId, st, true)) return {};
+    if (st.cks.size() != 32) {
+        const QByteArray other = QByteArray::fromHex(m_chatOtherPub.value(chatId.section(QLatin1Char('|'), 0, 0)).toUtf8());
+        if (!DoubleRatchet::initAlice(other, st)) return {};
+    }
+    const QByteArray out = DoubleRatchet::encrypt(st, plain);
+    if (out.isEmpty()) return {};
+    saveDr(chatId, st);
+    return out;
+}
+
+QByteArray ChatService::decryptDirectV3(const QString& chatId, const QByteArray& payload) const {
+    DoubleRatchet::State st;
+    if (!loadDr(chatId, st, false)) return {};
+    const QByteArray plain = DoubleRatchet::decrypt(st, payload);
+    if (plain.isEmpty()) return {};
+    saveDr(chatId, st);
+    return plain;
+}
+
+QByteArray ChatService::decryptToBytes(const QString& chatId, const QByteArray& payload,
+                                        const QString& senderId, int keyVersion, int encryptionVersion,
+                                        const QString& senderDeviceId) const {
     if (m_chatType.value(chatId) == QStringLiteral("group")) {
         QString key = groupSenderKeyFor(chatId, senderId, keyVersion);
-        if (key.isEmpty()) {
-            return QString::fromUtf8("\xF0\x9F\x94\x92 Encrypted message"); // 🔒 - don't have this sender's key yet
-        }
-        QByteArray cipher = QByteArray::fromHex(content.toUtf8());
-        QByteArray plain = Encryption::secretBoxDecryptBytes(cipher, key);
-        if (plain.isEmpty()) {
-            return QString::fromUtf8("\xF0\x9F\x94\x92 Encrypted message");
-        }
-        return QString::fromUtf8(plain);
+        if (key.isEmpty()) return {};
+        return Encryption::secretBoxDecryptBytes(payload, key);
     }
-
-    QString otherPub = m_chatOtherPub.value(chatId);
     QString myPriv = m_authService ? m_authService->e2eePrivateKey() : QString();
-    if (otherPub.isEmpty() || myPriv.isEmpty()) {
-        return QString::fromUtf8("\xF0\x9F\x94\x92 Encrypted message"); // 🔒
+    if (myPriv.isEmpty()) return {};
+    if (encryptionVersion <= 0) encryptionVersion = 1;
+    if (encryptionVersion == 3) {
+        QString myDev = m_authService ? m_authService->getOrCreateDeviceId() : QString();
+        QByteArray blob = Encryption::pickFanout(payload, myDev);
+        if (blob.isEmpty() && Encryption::isFanout(payload)) return {};
+        if (blob.isEmpty()) blob = payload;
+        const QString sess = senderDeviceId.isEmpty() ? chatId : (chatId + QLatin1Char('|') + senderDeviceId);
+        QByteArray plain = decryptDirectV3(sess, blob);
+        if (plain.isEmpty() && sess != chatId) plain = decryptDirectV3(chatId, blob);
+        return plain;
     }
+    if (encryptionVersion >= 2) {
+        return Encryption::boxDecryptBytesEphemeral(payload, myPriv);
+    }
+    QString otherPub = m_chatOtherPub.value(chatId);
+    if (otherPub.isEmpty()) return {};
+    return Encryption::boxDecryptBytes(payload, otherPub, myPriv);
+}
 
-    QString plain = Encryption::boxDecrypt(content, otherPub, myPriv);
-    if (plain.isEmpty()) {
+Encryption::MessageEnvelope ChatService::openCipher(const QString& chatId, const QString& content, bool encrypted,
+                                                     const QString& senderId, int keyVersion, int encryptionVersion,
+                                                     const QString& senderDeviceId) const {
+    Encryption::MessageEnvelope env;
+    if (!encrypted) {
+        env.payload = content.toUtf8();
+        return env;
+    }
+    QByteArray inner = decryptToBytes(chatId, QByteArray::fromHex(content.toUtf8()), senderId, keyVersion, encryptionVersion, senderDeviceId);
+    if (inner.isEmpty()) return env;
+    return Encryption::unwrapEnvelope(inner);
+}
+
+void ChatService::applyEnvelopeMeta(QVariantMap& item, const Encryption::MessageEnvelope& env) const {
+    if (item.value(QStringLiteral("fileName")).toString().isEmpty() && !env.fileName.isEmpty())
+        item[QStringLiteral("fileName")] = env.fileName;
+    if (item.value(QStringLiteral("forwardedFromName")).toString().isEmpty() && !env.forwardedFrom.isEmpty())
+        item[QStringLiteral("forwardedFromName")] = env.forwardedFrom;
+    if (item.value(QStringLiteral("durationMs")).toLongLong() <= 0 && env.durationMs > 0)
+        item[QStringLiteral("durationMs")] = env.durationMs;
+    if (item.value(QStringLiteral("fileSize")).toLongLong() <= 0 && env.fileSize > 0)
+        item[QStringLiteral("fileSize")] = env.fileSize;
+}
+
+QString ChatService::decryptMessage(const QString& chatId, const QString& content, bool encrypted,
+                                     const QString& senderId, int keyVersion, int encryptionVersion,
+                                     const QString& senderDeviceId) const {
+    if (!encrypted) return content;
+    Encryption::MessageEnvelope env = openCipher(chatId, content, encrypted, senderId, keyVersion, encryptionVersion, senderDeviceId);
+    if (env.payload.isEmpty()) {
         return QString::fromUtf8("\xF0\x9F\x94\x92 Encrypted message");
     }
-    return plain;
+    return QString::fromUtf8(env.payload);
 }
 
 void ChatService::deleteMessage(const QString& chatId, const QString& messageId,
@@ -582,7 +720,7 @@ void ChatService::deleteMessage(const QString& chatId, const QString& messageId,
     }
 
     QNetworkRequest request(url);
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->sendCustomRequest(request, "DELETE");
     connect(reply, &QNetworkReply::finished, this, [this, reply, chatId, messageId]() {
@@ -626,11 +764,107 @@ QString ChatService::computeLastMessagePreview(const QString& chatId) const {
         return QString::fromUtf8("\xF0\x9F\x93\x8E ") + (e.fileName.isEmpty() ? QStringLiteral("File") : e.fileName); // 📎
     if (e.fileType == QStringLiteral("video_note"))
         return QString::fromUtf8("\xF0\x9F\x93\xB9 Video message"); // 📹
-    return decryptMessage(chatId, e.content, e.encrypted, e.senderId, e.keyVersion);
+    return decryptMessage(chatId, e.content, e.encrypted, e.senderId, e.keyVersion, e.encryptionVersion);
 }
 
 QString ChatService::takePendingSecurityNotice(const QString& chatId) {
     return m_pendingSecurityNotices.take(chatId);
+}
+
+QString ChatService::safetyNumberForChat(const QString& chatId) const {
+    if (!m_authService) return {};
+    const QString mine = m_authService->e2eePublicKey();
+    QString peer = m_chatOtherPub.value(chatId);
+    if (peer.isEmpty()) {
+        peer = CredentialManager::instance().getToken(
+            QStringLiteral("known_pubkey_%1").arg(chatId));
+    }
+    return Encryption::safetyNumber(mine, peer);
+}
+
+bool ChatService::hasPendingPeerKeyChange(const QString& chatId) const {
+    return m_pendingPeerPub.contains(chatId)
+        || !CredentialManager::instance().getToken(QStringLiteral("pending_pubkey_%1").arg(chatId)).isEmpty();
+}
+
+void ChatService::applyPeerIdentity(const QString& chatId, const QString& serverPub, const QString& contactName) {
+    const QString knownKey = QStringLiteral("known_pubkey_%1").arg(chatId);
+    const QString pendingKey = QStringLiteral("pending_pubkey_%1").arg(chatId);
+    QString knownPub = CredentialManager::instance().getToken(knownKey);
+    if (knownPub.isEmpty()) {
+        CredentialManager::instance().saveToken(knownKey, serverPub);
+        CredentialManager::instance().deleteToken(pendingKey);
+        m_pendingPeerPub.remove(chatId);
+        m_chatOtherPub.insert(chatId, serverPub);
+        if (m_authService) m_authService->refreshVaultContents();
+        return;
+    }
+    if (knownPub.compare(serverPub, Qt::CaseInsensitive) == 0) {
+        CredentialManager::instance().deleteToken(pendingKey);
+        m_pendingPeerPub.remove(chatId);
+        m_chatOtherPub.insert(chatId, knownPub);
+        return;
+    }
+    CredentialManager::instance().saveToken(pendingKey, serverPub);
+    m_pendingPeerPub.insert(chatId, serverPub);
+    m_chatOtherPub.insert(chatId, knownPub);
+    m_pendingSecurityNotices.insert(chatId, contactName);
+    emit securityCodeChanged(chatId, contactName);
+    emit peerKeyChangePendingChanged(chatId);
+    CredentialManager::instance().deleteToken(QStringLiteral("verified_pubkey_%1").arg(chatId));
+}
+
+void ChatService::acceptPeerKeyChange(const QString& chatId) {
+    QString pending = m_pendingPeerPub.value(chatId);
+    if (pending.isEmpty()) {
+        pending = CredentialManager::instance().getToken(QStringLiteral("pending_pubkey_%1").arg(chatId));
+    }
+    if (pending.isEmpty()) return;
+    CredentialManager::instance().saveToken(QStringLiteral("known_pubkey_%1").arg(chatId), pending);
+    CredentialManager::instance().deleteToken(QStringLiteral("pending_pubkey_%1").arg(chatId));
+    m_pendingPeerPub.remove(chatId);
+    m_pendingSecurityNotices.remove(chatId);
+    m_chatOtherPub.insert(chatId, pending);
+    quint64 oldSeq = 0;
+    if (m_dr.contains(chatId)) oldSeq = m_dr.value(chatId).seq;
+    m_dr.remove(chatId);
+    CredentialManager::instance().deleteToken(QStringLiteral("dr3_%1").arg(chatId));
+    DoubleRatchet::State st;
+    if (DoubleRatchet::initAlice(QByteArray::fromHex(pending.toUtf8()), st)) {
+        st.seq = oldSeq;
+        saveDr(chatId, st);
+    }
+    ++m_cryptoRevision;
+    emit cryptoRevisionChanged();
+    emit peerKeyChangePendingChanged(chatId);
+    CredentialManager::instance().deleteToken(QStringLiteral("verified_pubkey_%1").arg(chatId));
+}
+
+QString ChatService::safetyNumberQrUrl(const QString& chatId) const {
+    const QString payload = Encryption::safetyNumberQrPayload(safetyNumberForChat(chatId));
+    if (payload.isEmpty()) return {};
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    const QString path = QDir(dir).filePath(QStringLiteral("messenger-safety-qr.png"));
+    if (!PairingQr::savePng(payload, path, 6)) return {};
+    return QUrl::fromLocalFile(path).toString();
+}
+
+bool ChatService::hasVerifiedSafetyNumber(const QString& chatId) const {
+    const QString known = CredentialManager::instance().getToken(QStringLiteral("known_pubkey_%1").arg(chatId));
+    const QString verified = CredentialManager::instance().getToken(QStringLiteral("verified_pubkey_%1").arg(chatId));
+    return !known.isEmpty() && known.compare(verified, Qt::CaseInsensitive) == 0;
+}
+
+QString ChatService::compareSafetyNumberScan(const QString& chatId, const QString& scanned) {
+    const QString local = Encryption::parseSafetyNumberQr(
+        Encryption::safetyNumberQrPayload(safetyNumberForChat(chatId)));
+    const QString remote = Encryption::parseSafetyNumberQr(scanned);
+    if (local.isEmpty() || remote.isEmpty()) return QStringLiteral("invalid");
+    if (local.compare(remote, Qt::CaseInsensitive) != 0) return QStringLiteral("mismatch");
+    const QString known = CredentialManager::instance().getToken(QStringLiteral("known_pubkey_%1").arg(chatId));
+    if (!known.isEmpty())
+        CredentialManager::instance().saveToken(QStringLiteral("verified_pubkey_%1").arg(chatId), known);
+    return QStringLiteral("match");
 }
 
 bool ChatService::hasKeyForChat(const QString& chatId) const {
@@ -639,47 +873,86 @@ bool ChatService::hasKeyForChat(const QString& chatId) const {
 }
 
 bool ChatService::hasGroupSenderKey(const QString& chatId) const {
-    auto it = m_mySenderKeys.find(chatId);
-    if (it == m_mySenderKeys.end() || it->keyHex.isEmpty()) return false;
-    return it->version >= m_groupKeyEpoch.value(chatId, 0);
+    const QMap<int, QString> versions = m_mySenderKeys.value(chatId);
+    if (versions.isEmpty()) return false;
+    return versions.lastKey() >= m_groupKeyEpoch.value(chatId, 0);
 }
 
 QString ChatService::groupSenderKeyFor(const QString& chatId, const QString& senderId, int keyVersion) const {
     QString myId = m_authService ? m_authService->currentUserId() : QString();
     if (!myId.isEmpty() && senderId == myId) {
-        auto it = m_mySenderKeys.find(chatId);
-        if (it != m_mySenderKeys.end() && it->version == keyVersion) return it->keyHex;
-        return QString();
+        return m_mySenderKeys.value(chatId).value(keyVersion);
     }
-    return m_groupOtherKeys.value(QStringLiteral("%1|%2|%3").arg(chatId, senderId).arg(keyVersion));
+    const QString cacheKey = QStringLiteral("%1|%2|%3").arg(chatId, senderId).arg(keyVersion);
+    const QString cached = m_groupOtherKeys.value(cacheKey);
+    if (!cached.isEmpty()) return cached;
+    const QString stored = CredentialManager::instance().getToken(
+        QStringLiteral("peer_senderkey_%1").arg(cacheKey));
+    if (!stored.isEmpty()) {
+        m_groupOtherKeys.insert(cacheKey, stored);
+        return stored;
+    }
+    return QString();
+}
+
+void ChatService::loadPeerSenderKeysFromDisk(const QString& chatId) {
+    const QString prefix = QStringLiteral("peer_senderkey_%1|").arg(chatId);
+    const QMap<QString, QString> stored = CredentialManager::instance().tokensWithPrefix(prefix);
+    for (auto it = stored.constBegin(); it != stored.constEnd(); ++it) {
+        if (it.value().isEmpty()) continue;
+        const QString rest = it.key().mid(prefix.size());
+        m_groupOtherKeys.insert(QStringLiteral("%1|%2").arg(chatId, rest), it.value());
+    }
 }
 
 void ChatService::persistMySenderKey(const QString& chatId, int version, const QString& keyHex) {
+    QMap<int, QString> versions = m_mySenderKeys.value(chatId);
+    versions.insert(version, keyHex);
+    const QList<int> keys = versions.keys();
+    if (keys.size() > 64) {
+        for (int i = 0; i < keys.size() - 64; ++i) {
+            versions.remove(keys.at(i));
+            CredentialManager::instance().deleteToken(
+                QStringLiteral("group_senderkey_%1|%2").arg(chatId).arg(keys.at(i)));
+        }
+    }
+    m_mySenderKeys.insert(chatId, versions);
+    CredentialManager::instance().saveToken(
+        QStringLiteral("group_senderkey_%1|%2").arg(chatId).arg(version), keyHex);
     CredentialManager::instance().saveToken(QStringLiteral("group_senderkey_%1").arg(chatId),
                                              QString::number(version) + ":" + keyHex);
+    if (m_authService) m_authService->refreshVaultContents();
 }
 
 void ChatService::loadMySenderKeyFromDisk(const QString& chatId) {
-    if (m_mySenderKeys.contains(chatId)) return; // already loaded this run
-    QString stored = CredentialManager::instance().getToken(QStringLiteral("group_senderkey_%1").arg(chatId));
-    if (stored.isEmpty()) return;
-    int sep = stored.indexOf(':');
-    if (sep <= 0) return;
-    bool ok = false;
-    int version = stored.left(sep).toInt(&ok);
-    if (!ok) return;
-    SenderKeyState state;
-    state.version = version;
-    state.keyHex = stored.mid(sep + 1);
-    m_mySenderKeys.insert(chatId, state);
+    if (!m_mySenderKeys.value(chatId).isEmpty()) return;
+    QMap<int, QString> versions;
+    const QString prefix = QStringLiteral("group_senderkey_%1").arg(chatId);
+    const QMap<QString, QString> stored = CredentialManager::instance().tokensWithPrefix(prefix);
+    for (auto it = stored.constBegin(); it != stored.constEnd(); ++it) {
+        const QString rest = it.key().mid(prefix.size());
+        if (rest.startsWith(QLatin1Char('|'))) {
+            bool ok = false;
+            const int version = rest.mid(1).toInt(&ok);
+            if (ok && !it.value().isEmpty()) versions.insert(version, it.value());
+            continue;
+        }
+        if (!rest.isEmpty()) continue;
+        const int sep = it.value().indexOf(':');
+        if (sep <= 0) continue;
+        bool ok = false;
+        const int version = it.value().left(sep).toInt(&ok);
+        if (ok && !versions.contains(version)) versions.insert(version, it.value().mid(sep + 1));
+    }
+    if (!versions.isEmpty()) m_mySenderKeys.insert(chatId, versions);
 }
 
 void ChatService::ensureGroupSenderKeyReady(const QString& chatId, std::function<void()> onReady) {
     loadMySenderKeyFromDisk(chatId);
 
     int serverEpoch = m_groupKeyEpoch.value(chatId, 0);
-    auto existing = m_mySenderKeys.find(chatId);
-    if (existing != m_mySenderKeys.end() && !existing->keyHex.isEmpty() && existing->version >= serverEpoch) {
+    const QMap<int, QString> existing = m_mySenderKeys.value(chatId);
+    if (!existing.isEmpty() && existing.lastKey() >= serverEpoch) {
         onReady();
         return;
     }
@@ -729,7 +1002,9 @@ void ChatService::ensureGroupSenderKeyReady(const QString& chatId, std::function
                 recipients.append(r);
             }
 
-            m_mySenderKeys.insert(chatId, SenderKeyState{epoch, newKey});
+            QMap<int, QString> versions = m_mySenderKeys.value(chatId);
+            versions.insert(epoch, newKey);
+            m_mySenderKeys.insert(chatId, versions);
             m_groupKeyEpoch.insert(chatId, epoch);
             persistMySenderKey(chatId, epoch, newKey);
 
@@ -755,7 +1030,7 @@ void ChatService::ensureGroupSenderKeyReady(const QString& chatId, std::function
             QUrl url(Config::apiBaseUrl() + "/groups/" + chatId + "/sender-key");
             QNetworkRequest request(url);
             request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-            request.setRawHeader("Authorization", authToken.toUtf8());
+            applyAuthHeaders(request);
 
             QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
             connect(reply, &QNetworkReply::finished, this, [reply, onReady]() {
@@ -775,10 +1050,11 @@ void ChatService::fetchGroupSenderKeys(const QString& chatId, std::function<void
         onDone();
         return;
     }
+    loadPeerSenderKeysFromDisk(chatId);
 
     QUrl url(Config::apiBaseUrl() + "/groups/" + chatId + "/sender-keys");
     QNetworkRequest request(url);
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->get(request);
     connect(reply, &QNetworkReply::finished, this, [this, reply, chatId, onDone]() {
@@ -805,6 +1081,9 @@ void ChatService::fetchGroupSenderKeys(const QString& chatId, std::function<void
             if (keyBytes.isEmpty()) continue; // corrupt/foreign entry - skip, not fatal
 
             m_groupOtherKeys.insert(cacheKey, QString::fromUtf8(keyBytes.toHex()));
+            CredentialManager::instance().saveToken(
+                QStringLiteral("peer_senderkey_%1").arg(cacheKey),
+                QString::fromUtf8(keyBytes.toHex()));
         }
         onDone();
     });
@@ -820,23 +1099,25 @@ void ChatService::sendGroupTextMessage(const QString& chatId, const QString& tex
             return;
         }
 
-        QString outContent = text;
-        bool encrypted = false;
-        int keyVersion = 0;
-        auto it = m_mySenderKeys.find(chatId);
-        if (it != m_mySenderKeys.end() && !it->keyHex.isEmpty()) {
-            QByteArray cipher = Encryption::secretBoxEncryptBytes(text.toUtf8(), it->keyHex);
-            if (!cipher.isEmpty()) {
-                outContent = QString::fromUtf8(cipher.toHex());
-                encrypted = true;
-                keyVersion = it->version;
-            }
+        const QMap<int, QString> versions = m_mySenderKeys.value(chatId);
+        if (versions.isEmpty() || versions.last().isEmpty()) {
+            emit messageError("Cannot send: group encryption key is not ready");
+            return;
         }
+        QByteArray cipher = Encryption::secretBoxEncryptBytes(
+            Encryption::wrapEnvelope(text.toUtf8(), QString(), forwardedFromName), versions.last());
+        if (cipher.isEmpty()) {
+            emit messageError("Cannot send: group encryption failed");
+            return;
+        }
+        QString outContent = QString::fromUtf8(cipher.toHex());
+        bool encrypted = true;
+        int keyVersion = versions.lastKey();
 
         QUrl url(Config::apiBaseUrl() + "/messages");
         QNetworkRequest request(url);
         request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-        request.setRawHeader("Authorization", authToken.toUtf8());
+        applyAuthHeaders(request);
 
         QJsonObject body;
         body["chat_id"] = chatId;
@@ -868,42 +1149,54 @@ void ChatService::sendGroupTextMessage(const QString& chatId, const QString& tex
             item["createdAt"] = data["created_at"].toString();
             item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
             item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
+            applyEnvelopeMeta(item, openCipher(chatId, data["content"].toString(), data["encrypted"].toBool(false),
+                                               data["sender_id"].toString(), data["key_version"].toInt(), 1));
             emit messageSent(chatId, item);
         });
     });
 }
 
 QByteArray ChatService::encryptBytesForChat(const QString& chatId, const QByteArray& plain) const {
-    return encryptBytesForChat(chatId, plain, nullptr);
+    return encryptBytesForChat(chatId, plain, nullptr, nullptr);
 }
 
 QByteArray ChatService::encryptBytesForChat(const QString& chatId, const QByteArray& plain,
-                                             int* outKeyVersion) const {
+                                             int* outKeyVersion, int* outEncVersion,
+                                             const QString& fileName, const QString& forwardedFrom,
+                                             qint64 durationMs, qint64 fileSize) const {
     if (outKeyVersion) *outKeyVersion = 0;
+    if (outEncVersion) *outEncVersion = 1;
+    const QByteArray inner = Encryption::wrapEnvelope(plain, fileName, forwardedFrom, durationMs, fileSize);
     if (m_chatType.value(chatId).compare(QStringLiteral("group"), Qt::CaseInsensitive) == 0) {
-        auto it = m_mySenderKeys.constFind(chatId);
-        if (it == m_mySenderKeys.constEnd() || it->keyHex.isEmpty()) return QByteArray();
-        QByteArray cipher = Encryption::secretBoxEncryptBytes(plain, it->keyHex);
-        if (!cipher.isEmpty() && outKeyVersion) *outKeyVersion = it->version;
+        const QMap<int, QString> versions = m_mySenderKeys.value(chatId);
+        if (versions.isEmpty() || versions.last().isEmpty()) return QByteArray();
+        QByteArray cipher = Encryption::secretBoxEncryptBytes(inner, versions.last());
+        if (!cipher.isEmpty() && outKeyVersion) *outKeyVersion = versions.lastKey();
         return cipher;
     }
     QString otherPub = m_chatOtherPub.value(chatId);
+    if (otherPub.isEmpty()) return QByteArray();
+    QByteArray v3 = encryptDirectV3(chatId, inner);
+    if (!v3.isEmpty()) {
+        if (outEncVersion) *outEncVersion = 3;
+        return v3;
+    }
+    QByteArray eph = Encryption::boxEncryptBytesEphemeral(inner, otherPub);
+    if (!eph.isEmpty()) {
+        if (outEncVersion) *outEncVersion = 2;
+        return eph;
+    }
     QString myPriv = m_authService ? m_authService->e2eePrivateKey() : QString();
-    if (otherPub.isEmpty() || myPriv.isEmpty()) return QByteArray();
-    return Encryption::boxEncryptBytes(plain, otherPub, myPriv);
+    if (myPriv.isEmpty()) return QByteArray();
+    return Encryption::boxEncryptBytes(inner, otherPub, myPriv);
 }
 
 QByteArray ChatService::decryptBytesForChat(const QString& chatId, const QByteArray& payload,
-                                             const QString& senderId, int keyVersion) const {
-    if (m_chatType.value(chatId).compare(QStringLiteral("group"), Qt::CaseInsensitive) == 0) {
-        QString key = groupSenderKeyFor(chatId, senderId, keyVersion);
-        if (key.isEmpty()) return QByteArray();
-        return Encryption::secretBoxDecryptBytes(payload, key);
-    }
-    QString otherPub = m_chatOtherPub.value(chatId);
-    QString myPriv = m_authService ? m_authService->e2eePrivateKey() : QString();
-    if (otherPub.isEmpty() || myPriv.isEmpty()) return QByteArray();
-    return Encryption::boxDecryptBytes(payload, otherPub, myPriv);
+                                             const QString& senderId, int keyVersion,
+                                             int encryptionVersion) const {
+    QByteArray inner = decryptToBytes(chatId, payload, senderId, keyVersion, encryptionVersion);
+    if (inner.isEmpty()) return {};
+    return Encryption::unwrapEnvelope(inner).payload;
 }
 
 void ChatService::sendVoiceNote(const QString& chatId, const QString& chatType,
@@ -930,9 +1223,19 @@ void ChatService::sendVoiceNote(const QString& chatId, const QString& chatType,
 
     auto upload = [this, chatId, chatType, raw, durationMs, isForwarded, forwardedFromName, forwardedFromMessageId]() {
         int keyVersion = 0;
-        QByteArray sealed = encryptBytesForChat(chatId, raw, &keyVersion);
-        bool encrypted = !sealed.isEmpty();
-        QByteArray payload = encrypted ? sealed : raw;
+        int encryptionVersion = 1;
+        QByteArray meta = encryptBytesForChat(chatId, QByteArray(), nullptr, nullptr, QString(), forwardedFromName, durationMs);
+        if (meta.isEmpty()) {
+            emit voiceUploadError("Cannot encrypt voice note");
+            return;
+        }
+        QByteArray sealed = encryptBytesForChat(chatId, raw, &keyVersion, &encryptionVersion, QString(), forwardedFromName, durationMs);
+        if (sealed.isEmpty()) {
+            emit voiceUploadError("Cannot encrypt voice note");
+            return;
+        }
+        bool encrypted = true;
+        QByteArray payload = sealed;
 
         auto* multiPart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
         QHttpPart part;
@@ -944,13 +1247,13 @@ void ChatService::sendVoiceNote(const QString& chatId, const QString& chatType,
 
         QUrl url(Config::apiBaseUrl() + "/messages/voice");
         QNetworkRequest request(url);
-        request.setRawHeader("Authorization", buildAuthHeader().toUtf8());
+        applyAuthHeaders(request);
 
         QNetworkReply* reply = m_networkManager->post(request, multiPart);
         multiPart->setParent(reply);
         connect(reply, &QNetworkReply::finished, this,
-                [this, reply, chatId, chatType, durationMs, encrypted, keyVersion,
-                 isForwarded, forwardedFromName, forwardedFromMessageId]() {
+                [this, reply, chatId, chatType, durationMs, encrypted, keyVersion, encryptionVersion,
+                 isForwarded, forwardedFromName, forwardedFromMessageId, meta]() {
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
                 emit voiceUploadError(reply->errorString());
@@ -962,8 +1265,9 @@ void ChatService::sendVoiceNote(const QString& chatId, const QString& chatType,
                 emit voiceUploadError("Server did not return a file URL");
                 return;
             }
-            sendVoiceMessage(chatId, chatType, fileUrl, durationMs, encrypted, keyVersion,
-                             isForwarded, forwardedFromName, forwardedFromMessageId);
+            sendVoiceMessage(chatId, chatType, fileUrl, durationMs, encrypted, keyVersion, encryptionVersion,
+                             isForwarded, forwardedFromName, forwardedFromMessageId,
+                             QString::fromLatin1(meta.toHex()));
         });
     };
 
@@ -1036,9 +1340,19 @@ void ChatService::uploadVideoNote(const QString& chatId, const QString& chatType
         }
 
         int keyVersion = 0;
-        QByteArray sealed = encryptBytesForChat(chatId, raw, &keyVersion);
-        bool encrypted = !sealed.isEmpty();
-        QByteArray payload = encrypted ? sealed : raw;
+        int encryptionVersion = 1;
+        QByteArray meta = encryptBytesForChat(chatId, QByteArray(), nullptr, nullptr, QString(), forwardedFromName, durationMs);
+        if (meta.isEmpty()) {
+            emit videoNoteUploadError("Cannot encrypt video note");
+            return;
+        }
+        QByteArray sealed = encryptBytesForChat(chatId, raw, &keyVersion, &encryptionVersion, QString(), forwardedFromName, durationMs);
+        if (sealed.isEmpty()) {
+            emit videoNoteUploadError("Cannot encrypt video note");
+            return;
+        }
+        bool encrypted = true;
+        QByteArray payload = sealed;
 
         auto* multiPart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
         QHttpPart part;
@@ -1050,7 +1364,7 @@ void ChatService::uploadVideoNote(const QString& chatId, const QString& chatType
 
         QUrl url(Config::apiBaseUrl() + "/messages/video-note");
         QNetworkRequest request(url);
-        request.setRawHeader("Authorization", authToken.toUtf8());
+        applyAuthHeaders(request);
 
         QNetworkReply* reply = m_networkManager->post(request, multiPart);
         multiPart->setParent(reply);
@@ -1058,8 +1372,8 @@ void ChatService::uploadVideoNote(const QString& chatId, const QString& chatType
             emit videoNoteUploadProgress(sent, total);
         });
         connect(reply, &QNetworkReply::finished, this,
-                [this, reply, chatId, chatType, durationMs, encrypted, keyVersion, thumbnailPath,
-                 isForwarded, forwardedFromName, forwardedFromMessageId]() {
+                [this, reply, chatId, chatType, durationMs, encrypted, keyVersion, encryptionVersion, thumbnailPath,
+                 isForwarded, forwardedFromName, forwardedFromMessageId, meta]() {
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
                 emit videoNoteUploadError(reply->errorString());
@@ -1071,8 +1385,9 @@ void ChatService::uploadVideoNote(const QString& chatId, const QString& chatType
                 emit videoNoteUploadError("Server did not return a file URL");
                 return;
             }
-            uploadVideoNoteThumbnail(chatId, chatType, fileUrl, durationMs, encrypted, keyVersion, thumbnailPath,
-                                     isForwarded, forwardedFromName, forwardedFromMessageId);
+            uploadVideoNoteThumbnail(chatId, chatType, fileUrl, durationMs, encrypted, keyVersion, encryptionVersion, thumbnailPath,
+                                     isForwarded, forwardedFromName, forwardedFromMessageId,
+                                     QString::fromLatin1(meta.toHex()));
         });
     };
 
@@ -1085,13 +1400,15 @@ void ChatService::uploadVideoNote(const QString& chatId, const QString& chatType
 
 void ChatService::uploadVideoNoteThumbnail(const QString& chatId, const QString& chatType,
                                             const QString& fileUrl, qint64 durationMs,
-                                            bool encrypted, int keyVersion, const QString& thumbnailPath,
+                                            bool encrypted, int keyVersion, int encryptionVersion,
+                                            const QString& thumbnailPath,
                                             bool isForwarded, const QString& forwardedFromName,
-                                            const QString& forwardedFromMessageId) {
+                                            const QString& forwardedFromMessageId,
+                                            const QString& sealedContent) {
     QFile thumb(thumbnailPath);
     if (thumbnailPath.isEmpty() || !thumb.open(QIODevice::ReadOnly)) {
-        sendVideoNoteMessage(chatId, chatType, fileUrl, QString(), durationMs, encrypted, keyVersion,
-                             isForwarded, forwardedFromName, forwardedFromMessageId);
+        sendVideoNoteMessage(chatId, chatType, fileUrl, QString(), durationMs, encrypted, keyVersion, encryptionVersion,
+                             isForwarded, forwardedFromName, forwardedFromMessageId, sealedContent);
         return;
     }
     QByteArray thumbBytes = thumb.readAll();
@@ -1101,8 +1418,16 @@ void ChatService::uploadVideoNoteThumbnail(const QString& chatId, const QString&
     // The poster gets the same encryption as the video. It is a frame *of* the
     // video, so leaving it in the clear would leak exactly what the encryption
     // is protecting.
-    QByteArray payload = encrypted ? encryptBytesForChat(chatId, thumbBytes) : thumbBytes;
-    if (payload.isEmpty()) payload = thumbBytes;
+    QByteArray payload;
+    if (encrypted) {
+        payload = encryptBytesForChat(chatId, thumbBytes);
+        if (payload.isEmpty()) {
+            emit videoNoteUploadError("Cannot encrypt video thumbnail");
+            return;
+        }
+    } else {
+        payload = thumbBytes;
+    }
 
     auto* multiPart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
     QHttpPart part;
@@ -1114,13 +1439,13 @@ void ChatService::uploadVideoNoteThumbnail(const QString& chatId, const QString&
 
     QUrl url(Config::apiBaseUrl() + "/messages/video-thumb");
     QNetworkRequest request(url);
-    request.setRawHeader("Authorization", buildAuthHeader().toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->post(request, multiPart);
     multiPart->setParent(reply);
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, chatId, chatType, fileUrl, durationMs, encrypted, keyVersion,
-             isForwarded, forwardedFromName, forwardedFromMessageId]() {
+            [this, reply, chatId, chatType, fileUrl, durationMs, encrypted, keyVersion, encryptionVersion,
+             isForwarded, forwardedFromName, forwardedFromMessageId, sealedContent]() {
         reply->deleteLater();
         QString thumbUrl;
         if (reply->error() == QNetworkReply::NoError) {
@@ -1129,14 +1454,15 @@ void ChatService::uploadVideoNoteThumbnail(const QString& chatId, const QString&
             if (thumbUrl.isEmpty()) thumbUrl = root["file_url"].toString();
         }
         // A failed poster upload must not lose the video message itself.
-        sendVideoNoteMessage(chatId, chatType, fileUrl, thumbUrl, durationMs, encrypted, keyVersion,
-                             isForwarded, forwardedFromName, forwardedFromMessageId);
+        sendVideoNoteMessage(chatId, chatType, fileUrl, thumbUrl, durationMs, encrypted, keyVersion, encryptionVersion,
+                             isForwarded, forwardedFromName, forwardedFromMessageId, sealedContent);
     });
 }
 
 void ChatService::preparePlayableVideoNote(const QString& chatId, const QString& messageId,
                                             const QString& fileUrl, bool encrypted,
-                                            const QString& senderId, int keyVersion) {
+                                            const QString& senderId, int keyVersion,
+                                            int encryptionVersion) {
     QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/roundvideo";
     QDir().mkpath(cacheDir);
     QString localPath = cacheDir + "/" + messageId + ".mp4";
@@ -1150,7 +1476,7 @@ void ChatService::preparePlayableVideoNote(const QString& chatId, const QString&
     QNetworkRequest request(url);
     QNetworkReply* reply = m_networkManager->get(request);
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, chatId, messageId, localPath, encrypted, senderId, keyVersion]() {
+            [this, reply, chatId, messageId, localPath, encrypted, senderId, keyVersion, encryptionVersion]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             emit videoNotePlaybackError(messageId, reply->errorString());
@@ -1159,7 +1485,7 @@ void ChatService::preparePlayableVideoNote(const QString& chatId, const QString&
         QByteArray raw = reply->readAll();
         QByteArray playable = raw;
         if (encrypted) {
-            playable = decryptBytesForChat(chatId, raw, senderId, keyVersion);
+            playable = decryptBytesForChat(chatId, raw, senderId, keyVersion, encryptionVersion);
             if (playable.isEmpty()) {
                 emit videoNotePlaybackError(messageId, "Could not decrypt video message");
                 return;
@@ -1178,7 +1504,8 @@ void ChatService::preparePlayableVideoNote(const QString& chatId, const QString&
 
 void ChatService::prepareVideoNoteThumbnail(const QString& chatId, const QString& messageId,
                                              const QString& thumbnailUrl, bool encrypted,
-                                             const QString& senderId, int keyVersion) {
+                                             const QString& senderId, int keyVersion,
+                                             int encryptionVersion) {
     if (thumbnailUrl.isEmpty()) return;
 
     QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/roundvideo";
@@ -1193,12 +1520,12 @@ void ChatService::prepareVideoNoteThumbnail(const QString& chatId, const QString
     QUrl url(Config::resolveServerUrl(thumbnailUrl));
     QNetworkReply* reply = m_networkManager->get(QNetworkRequest(url));
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, chatId, messageId, localPath, encrypted, senderId, keyVersion]() {
+            [this, reply, chatId, messageId, localPath, encrypted, senderId, keyVersion, encryptionVersion]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) return;  // a missing poster is not worth surfacing
 
         QByteArray raw = reply->readAll();
-        QByteArray image = encrypted ? decryptBytesForChat(chatId, raw, senderId, keyVersion) : raw;
+        QByteArray image = encrypted ? decryptBytesForChat(chatId, raw, senderId, keyVersion, encryptionVersion) : raw;
         if (image.isEmpty()) return;
 
         QFile out(localPath);
@@ -1211,7 +1538,8 @@ void ChatService::prepareVideoNoteThumbnail(const QString& chatId, const QString
 
 void ChatService::preparePlayableVoice(const QString& chatId, const QString& messageId,
                                         const QString& fileUrl, bool encrypted,
-                                        const QString& senderId, int keyVersion) {
+                                        const QString& senderId, int keyVersion,
+                                        int encryptionVersion) {
     QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/voice";
     QDir().mkpath(cacheDir);
     QString localPath = cacheDir + "/" + messageId + ".m4a";
@@ -1228,7 +1556,7 @@ void ChatService::preparePlayableVoice(const QString& chatId, const QString& mes
     // images already load.
     QNetworkReply* reply = m_networkManager->get(request);
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, chatId, messageId, localPath, encrypted, senderId, keyVersion]() {
+            [this, reply, chatId, messageId, localPath, encrypted, senderId, keyVersion, encryptionVersion]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             emit voicePlaybackError(messageId, reply->errorString());
@@ -1237,7 +1565,7 @@ void ChatService::preparePlayableVoice(const QString& chatId, const QString& mes
         QByteArray raw = reply->readAll();
         QByteArray playable = raw;
         if (encrypted) {
-            playable = decryptBytesForChat(chatId, raw, senderId, keyVersion);
+            playable = decryptBytesForChat(chatId, raw, senderId, keyVersion, encryptionVersion);
             if (playable.isEmpty()) {
                 emit voicePlaybackError(messageId, "Could not decrypt voice note");
                 return;
@@ -1256,9 +1584,10 @@ void ChatService::preparePlayableVoice(const QString& chatId, const QString& mes
 
 void ChatService::sendVoiceMessage(const QString& chatId, const QString& chatType,
                                     const QString& fileUrl, qint64 durationMs, bool encrypted,
-                                    int keyVersion,
+                                    int keyVersion, int encryptionVersion,
                                     bool isForwarded, const QString& forwardedFromName,
-                                    const QString& forwardedFromMessageId) {
+                                    const QString& forwardedFromMessageId,
+                                    const QString& sealedContent) {
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit messageError("Not authenticated. Please login first.");
@@ -1268,25 +1597,26 @@ void ChatService::sendVoiceMessage(const QString& chatId, const QString& chatTyp
     QUrl url(Config::apiBaseUrl() + "/messages");
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QJsonObject body;
     body["chat_id"] = chatId;
     body["chat_type"] = chatType;
     // The bubble renders from file_url, so content stays empty rather than a
     // bogus placeholder string a future/other client might try to display.
-    body["content"] = "";
+    body["content"] = sealedContent;
     body["content_type"] = "audio";
     body["encrypted"] = encrypted;
     body["file_url"] = fileUrl;
     body["file_type"] = "audio";
-    body["duration_ms"] = durationMs;
+    body["duration_ms"] = 0;
     if (keyVersion > 0) body["key_version"] = keyVersion;
+    body["encryption_version"] = encryptionVersion <= 0 ? 1 : encryptionVersion;
     appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
     appendReplyField(body, takePendingReplyToId());
 
     QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId, durationMs]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             emit messageError(reply->errorString());
@@ -1303,13 +1633,17 @@ void ChatService::sendVoiceMessage(const QString& chatId, const QString& chatTyp
         item["senderId"] = data["sender_id"].toString();
         item["fileUrl"] = data["file_url"].toString();
         item["fileType"] = data["file_type"].toString();
-        item["durationMs"] = data["duration_ms"].toVariant();
+        item["durationMs"] = durationMs;
         item["encrypted"] = data["encrypted"].toBool(false);
         item["keyVersion"] = data["key_version"].toInt(0);
+        item["encryptionVersion"] = data["encryption_version"].toInt(1);
         item["createdAt"] = data["created_at"].toString();
         item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
         item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
         item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
+        applyEnvelopeMeta(item, openCipher(chatId, data["content"].toString(), data["encrypted"].toBool(false),
+                                           data["sender_id"].toString(), data["key_version"].toInt(),
+                                           data["encryption_version"].toInt(1)));
         emit voiceMessageSent(chatId, item);
     });
 }
@@ -1317,8 +1651,10 @@ void ChatService::sendVoiceMessage(const QString& chatId, const QString& chatTyp
 void ChatService::sendVideoNoteMessage(const QString& chatId, const QString& chatType,
                                         const QString& fileUrl, const QString& thumbnailUrl,
                                         qint64 durationMs, bool encrypted, int keyVersion,
+                                        int encryptionVersion,
                                         bool isForwarded, const QString& forwardedFromName,
-                                        const QString& forwardedFromMessageId) {
+                                        const QString& forwardedFromMessageId,
+                                        const QString& sealedContent) {
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit messageError("Not authenticated. Please login first.");
@@ -1328,7 +1664,7 @@ void ChatService::sendVideoNoteMessage(const QString& chatId, const QString& cha
     QUrl url(Config::apiBaseUrl() + "/messages");
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QJsonObject body;
     body["chat_id"] = chatId;
@@ -1336,19 +1672,20 @@ void ChatService::sendVideoNoteMessage(const QString& chatId, const QString& cha
     // Empty for the same reason as a voice note: the bubble renders from
     // file_url, and a placeholder string would be displayed by any client that
     // does not understand round videos.
-    body["content"] = "";
+    body["content"] = sealedContent;
     body["content_type"] = "video_note";
     body["encrypted"] = encrypted;
     body["file_url"] = fileUrl;
     body["file_type"] = "video_note";
-    body["duration_ms"] = durationMs;
+    body["duration_ms"] = 0;
     body["thumbnail_url"] = thumbnailUrl;
     if (keyVersion > 0) body["key_version"] = keyVersion;
+    body["encryption_version"] = encryptionVersion <= 0 ? 1 : encryptionVersion;
     appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
     appendReplyField(body, takePendingReplyToId());
 
     QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId, durationMs]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             emit videoNoteUploadError(reply->errorString());
@@ -1366,13 +1703,16 @@ void ChatService::sendVideoNoteMessage(const QString& chatId, const QString& cha
         item["fileUrl"] = data["file_url"].toString();
         item["fileType"] = data["file_type"].toString();
         item["thumbnailUrl"] = data["thumbnail_url"].toString();
-        item["durationMs"] = data["duration_ms"].toVariant();
+        item["durationMs"] = durationMs;
         item["encrypted"] = data["encrypted"].toBool(false);
         item["keyVersion"] = data["key_version"].toInt(0);
         item["createdAt"] = data["created_at"].toString();
         item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
         item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
         item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
+        applyEnvelopeMeta(item, openCipher(chatId, data["content"].toString(), data["encrypted"].toBool(false),
+                                           data["sender_id"].toString(), data["key_version"].toInt(),
+                                           data["encryption_version"].toInt(1)));
         emit videoNoteMessageSent(chatId, item);
     });
 }
@@ -1403,9 +1743,19 @@ void ChatService::sendAttachment(const QString& chatId, const QString& chatType,
     auto upload = [this, chatId, chatType, contentType, fileName, raw,
                    isForwarded, forwardedFromName, forwardedFromMessageId]() {
         int keyVersion = 0;
-        QByteArray sealed = encryptBytesForChat(chatId, raw, &keyVersion);
-        bool encrypted = !sealed.isEmpty();
-        QByteArray payload = encrypted ? sealed : raw;
+        int encryptionVersion = 1;
+        QByteArray meta = encryptBytesForChat(chatId, QByteArray(), nullptr, nullptr, fileName, forwardedFromName, 0, raw.size());
+        if (meta.isEmpty()) {
+            emit attachmentUploadError("Cannot encrypt attachment");
+            return;
+        }
+        QByteArray sealed = encryptBytesForChat(chatId, raw, &keyVersion, &encryptionVersion, fileName, forwardedFromName, 0, raw.size());
+        if (sealed.isEmpty()) {
+            emit attachmentUploadError("Cannot encrypt attachment");
+            return;
+        }
+        bool encrypted = true;
+        QByteArray payload = sealed;
 
         auto* multiPart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
         QHttpPart part;
@@ -1417,13 +1767,13 @@ void ChatService::sendAttachment(const QString& chatId, const QString& chatType,
 
         QUrl url(Config::apiBaseUrl() + "/messages/attachment");
         QNetworkRequest request(url);
-        request.setRawHeader("Authorization", buildAuthHeader().toUtf8());
+        applyAuthHeaders(request);
 
         QNetworkReply* reply = m_networkManager->post(request, multiPart);
         multiPart->setParent(reply);
         connect(reply, &QNetworkReply::finished, this,
-                [this, reply, chatId, chatType, fileName, contentType, encrypted, keyVersion,
-                 isForwarded, forwardedFromName, forwardedFromMessageId]() {
+                [this, reply, chatId, chatType, fileName, contentType, encrypted, keyVersion, encryptionVersion,
+                 isForwarded, forwardedFromName, forwardedFromMessageId, meta]() {
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
                 emit attachmentUploadError(reply->errorString());
@@ -1436,8 +1786,9 @@ void ChatService::sendAttachment(const QString& chatId, const QString& chatType,
                 return;
             }
             qint64 fileSize = static_cast<qint64>(root["file_size"].toDouble(0));
-            sendAttachmentMessage(chatId, chatType, fileUrl, fileName, contentType, fileSize, encrypted, keyVersion,
-                                  isForwarded, forwardedFromName, forwardedFromMessageId);
+            sendAttachmentMessage(chatId, chatType, fileUrl, fileName, contentType, fileSize, encrypted, keyVersion, encryptionVersion,
+                                  isForwarded, forwardedFromName, forwardedFromMessageId,
+                                  QString::fromLatin1(meta.toHex()));
         });
     };
 
@@ -1451,9 +1802,10 @@ void ChatService::sendAttachment(const QString& chatId, const QString& chatType,
 void ChatService::sendAttachmentMessage(const QString& chatId, const QString& chatType,
                                          const QString& fileUrl, const QString& fileName,
                                          const QString& contentType, qint64 fileSize, bool encrypted,
-                                         int keyVersion,
+                                         int keyVersion, int encryptionVersion,
                                          bool isForwarded, const QString& forwardedFromName,
-                                         const QString& forwardedFromMessageId) {
+                                         const QString& forwardedFromMessageId,
+                                         const QString& sealedContent) {
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
         emit messageError("Not authenticated. Please login first.");
@@ -1463,24 +1815,25 @@ void ChatService::sendAttachmentMessage(const QString& chatId, const QString& ch
     QUrl url(Config::apiBaseUrl() + "/messages");
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QJsonObject body;
     body["chat_id"] = chatId;
     body["chat_type"] = chatType;
-    body["content"] = "";
+    body["content"] = sealedContent;
     body["content_type"] = contentType;
     body["encrypted"] = encrypted;
     body["file_url"] = fileUrl;
     body["file_type"] = contentType;
-    body["file_name"] = fileName;
-    body["file_size"] = fileSize;
+    body["file_name"] = QString();
+    body["file_size"] = 0;
     if (keyVersion > 0) body["key_version"] = keyVersion;
+    body["encryption_version"] = encryptionVersion <= 0 ? 1 : encryptionVersion;
     appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
     appendReplyField(body, takePendingReplyToId());
 
     QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId, fileSize, fileName]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             emit messageError(reply->errorString());
@@ -1497,21 +1850,26 @@ void ChatService::sendAttachmentMessage(const QString& chatId, const QString& ch
         item["senderId"] = data["sender_id"].toString();
         item["fileUrl"] = data["file_url"].toString();
         item["fileType"] = data["file_type"].toString();
-        item["fileName"] = data["file_name"].toString();
-        item["fileSize"] = data["file_size"].toVariant();
+        item["fileName"] = fileName;
+        item["fileSize"] = fileSize;
         item["encrypted"] = data["encrypted"].toBool(false);
         item["keyVersion"] = data["key_version"].toInt(0);
         item["createdAt"] = data["created_at"].toString();
         item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
         item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
         item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
+        applyEnvelopeMeta(item, openCipher(chatId, data["content"].toString(), data["encrypted"].toBool(false),
+                                           data["sender_id"].toString(), data["key_version"].toInt(),
+                                           data["encryption_version"].toInt(1)));
         emit attachmentMessageSent(chatId, item);
     });
 }
 
 void ChatService::prepareAttachment(const QString& chatId, const QString& messageId,
-                                     const QString& fileUrl, bool encrypted, const QString& fileName,
-                                     const QString& senderId, int keyVersion) {
+                                      const QString& fileUrl, bool encrypted,
+                                      const QString& fileName,
+                                      const QString& senderId, int keyVersion,
+                                      int encryptionVersion) {
     QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/attachments";
     QDir().mkpath(cacheDir);
     // Keep the original extension (from the sender's filename) so the OS
@@ -1529,7 +1887,7 @@ void ChatService::prepareAttachment(const QString& chatId, const QString& messag
     QNetworkRequest request(url);
     QNetworkReply* reply = m_networkManager->get(request);
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, chatId, messageId, localPath, encrypted, senderId, keyVersion]() {
+            [this, reply, chatId, messageId, cacheDir, fileName, encrypted, senderId, keyVersion, encryptionVersion]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             emit attachmentError(messageId, reply->errorString());
@@ -1537,21 +1895,31 @@ void ChatService::prepareAttachment(const QString& chatId, const QString& messag
         }
         QByteArray raw = reply->readAll();
         QByteArray plain = raw;
+        QString resolvedName = fileName;
         if (encrypted) {
-            plain = decryptBytesForChat(chatId, raw, senderId, keyVersion);
-            if (plain.isEmpty()) {
+            QByteArray inner = decryptToBytes(chatId, raw, senderId, keyVersion, encryptionVersion);
+            if (inner.isEmpty()) {
                 emit attachmentError(messageId, "Could not decrypt attachment");
                 return;
             }
+            Encryption::MessageEnvelope env = Encryption::unwrapEnvelope(inner);
+            plain = env.payload;
+            if (resolvedName.isEmpty()) resolvedName = env.fileName;
         }
-        QFile out(localPath);
+        QString suffix = QFileInfo(resolvedName).suffix();
+        QString outPath = cacheDir + "/" + messageId + (suffix.isEmpty() ? QString() : "." + suffix);
+        if (QFile::exists(outPath)) {
+            emit attachmentReady(messageId, outPath);
+            return;
+        }
+        QFile out(outPath);
         if (!out.open(QIODevice::WriteOnly)) {
             emit attachmentError(messageId, "Could not save attachment locally");
             return;
         }
         out.write(plain);
         out.close();
-        emit attachmentReady(messageId, localPath);
+        emit attachmentReady(messageId, outPath);
     });
 }
 
@@ -1658,6 +2026,8 @@ void ChatService::forwardMessages(const QString& sourceChatId,
         item.encrypted = m.value(QStringLiteral("encrypted")).toBool();
         item.senderId = m.value(QStringLiteral("senderId")).toString();
         item.keyVersion = m.value(QStringLiteral("keyVersion")).toInt();
+        item.encryptionVersion = m.value(QStringLiteral("encryptionVersion")).toInt();
+        if (item.encryptionVersion <= 0) item.encryptionVersion = 1;
         item.fileName = m.value(QStringLiteral("fileName")).toString();
         item.fileSize = m.value(QStringLiteral("fileSize")).toLongLong();
         item.durationMs = m.value(QStringLiteral("durationMs")).toLongLong();
@@ -1717,13 +2087,13 @@ void ChatService::processNextForward() {
 
     if (item.contentType == QStringLiteral("audio")) {
         preparePlayableVoice(m_forwardSourceChatId, item.messageId, item.fileUrl, item.encrypted,
-                             item.senderId, item.keyVersion);
+                             item.senderId, item.keyVersion, item.encryptionVersion);
     } else if (item.contentType == QStringLiteral("video_note")) {
         preparePlayableVideoNote(m_forwardSourceChatId, item.messageId, item.fileUrl, item.encrypted,
-                                 item.senderId, item.keyVersion);
+                                 item.senderId, item.keyVersion, item.encryptionVersion);
     } else {
         prepareAttachment(m_forwardSourceChatId, item.messageId, item.fileUrl, item.encrypted,
-                          item.fileName, item.senderId, item.keyVersion);
+                          item.fileName, item.senderId, item.keyVersion, item.encryptionVersion);
     }
 }
 
@@ -1746,7 +2116,7 @@ void ChatService::markAsRead(const QString& chatId) {
     QUrl url(Config::apiBaseUrl() + "/chats/" + chatId + "/read");
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->post(request, QByteArray());
     connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
@@ -1763,7 +2133,7 @@ void ChatService::deleteChat(const QString& chatId) {
     QUrl url(Config::apiBaseUrl() + "/chats/" + chatId);
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->deleteResource(request);
     connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
@@ -1799,7 +2169,7 @@ void ChatService::blockUser(const QString& userId, const QString& chatId) {
     QUrl url(Config::apiBaseUrl() + "/users/" + userId + "/block");
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->post(request, QByteArray());
     connect(reply, &QNetworkReply::finished, this, [this, reply, userId, chatId]() {
@@ -1821,7 +2191,7 @@ void ChatService::unblockUser(const QString& userId) {
     QUrl url(Config::apiBaseUrl() + "/users/" + userId + "/block");
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->deleteResource(request);
     connect(reply, &QNetworkReply::finished, this, [this, reply, userId]() {
@@ -1844,7 +2214,7 @@ void ChatService::fetchBlockedUsers() {
     QUrl url(Config::apiBaseUrl() + "/users/me/blocks");
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    request.setRawHeader("Authorization", authToken.toUtf8());
+    applyAuthHeaders(request);
 
     QNetworkReply* reply = m_networkManager->get(request);
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
@@ -1907,32 +2277,13 @@ QVariantMap ChatService::parseChatItem(const QJsonObject& obj) {
         // decrypt from this chat.
         QString pub = userObj["public_key"].toString();
         if (!pub.isEmpty()) {
+            QString name = userObj["display_name"].toString();
+            if (name.isEmpty()) name = userObj["username"].toString();
             const QString previous = m_chatOtherPub.value(chatId);
-            m_chatOtherPub.insert(chatId, pub);
-            if (previous != pub) {
-                // Tells QML that anything which failed to decrypt is worth
-                // another try - see ChatService::cryptoRevision.
+            applyPeerIdentity(chatId, pub, name);
+            if (previous != m_chatOtherPub.value(chatId)) {
                 ++m_cryptoRevision;
                 emit cryptoRevisionChanged();
-            }
-
-            // WhatsApp-style security notice: a contact's public key only
-            // ever changes if they reinstalled/reset the app (new keypair
-            // generated) or someone is intercepting the connection - either
-            // way the user should see it happened, the same reason WhatsApp
-            // surfaces "security code changed" instead of silently
-            // re-encrypting to the new key. Nothing is flagged the first
-            // time a key is ever seen for this chat - only on a genuine change.
-            QString knownKeyToken = QStringLiteral("known_pubkey_%1").arg(chatId);
-            QString knownPub = CredentialManager::instance().getToken(knownKeyToken);
-            if (!knownPub.isEmpty() && knownPub != pub) {
-                QString name = userObj["display_name"].toString();
-                if (name.isEmpty()) name = userObj["username"].toString();
-                m_pendingSecurityNotices.insert(chatId, name);
-                emit securityCodeChanged(chatId, name);
-            }
-            if (knownPub != pub) {
-                CredentialManager::instance().saveToken(knownKeyToken, pub);
             }
         }
     }
@@ -1952,7 +2303,8 @@ QVariantMap ChatService::parseChatItem(const QJsonObject& obj) {
             : contentType == QStringLiteral("file")
             ? QString::fromUtf8("\xF0\x9F\x93\x8E ") + (msgObj["file_name"].toString().isEmpty() ? QStringLiteral("File") : msgObj["file_name"].toString()) // 📎
             : decryptMessage(chatId, msgObj["content"].toString(), msgObj["encrypted"].toBool(false),
-                              msgObj["sender_id"].toString(), msgObj["key_version"].toInt());
+                              msgObj["sender_id"].toString(), msgObj["key_version"].toInt(),
+                              msgObj["encryption_version"].toInt(1));
         lastMessage["sender_id"] = msgObj["sender_id"].toString();
         lastMessage["content_type"] = contentType;
         lastMessage["created_at"] = msgObj["created_at"].toString();

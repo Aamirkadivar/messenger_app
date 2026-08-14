@@ -2,6 +2,7 @@ package com.messenger.app.data.repository
 
 import android.util.Log
 import com.messenger.app.data.encryption.E2ECrypto
+import com.messenger.app.data.encryption.DoubleRatchet
 import com.messenger.app.data.local.dao.CachedChatDao
 import com.messenger.app.data.local.dao.ConversationDao
 import com.messenger.app.data.local.dao.MessageDao
@@ -47,7 +48,11 @@ class ChatRepository(
     private val webSocketManager: WebSocketManager,
     private val tokenManager: TokenManager,
     private val groupRepository: GroupRepository,
-    private val json: Json
+    private val json: Json,
+    /** Fired after local vault-relevant material changes (sender keys / peer pubs). */
+    private val onVaultMaterialChanged: (suspend (token: String) -> Unit)? = null,
+    /** Pull+merge vault from server (sibling device ratchets). */
+    private val onVaultPullNeeded: (suspend (token: String, force: Boolean) -> Unit)? = null
 ) {
     companion object {
         private const val TAG = "ChatRepository"
@@ -89,6 +94,8 @@ class ChatRepository(
     // Serializes key generation so concurrent callers (multiple ViewModels)
     // don't each generate a different keypair and clobber each other.
     private val keyMutex = Mutex()
+    private val drMutex = Mutex()
+    private val drSessions = mutableMapOf<String, DoubleRatchet.State>()
 
     // ==================== Group "Sender Keys" state ====================
 
@@ -96,10 +103,12 @@ class ChatRepository(
 
     // chatId -> the server's current key_epoch (the rotation signal).
     private val groupKeyEpoch = mutableMapOf<String, Int>()
-    // chatId -> this device's own current Sender Key for that group.
-    private val mySenderKeys = mutableMapOf<String, SenderKeyState>()
+    // chatId -> version -> this device's own Sender Key hex (historical + current).
+    private val mySenderKeys = mutableMapOf<String, MutableMap<Int, String>>()
     // "chatId|senderId|version" -> decrypted Sender Key (hex) for other members.
     private val groupOtherKeys = mutableMapOf<String, String>()
+    private val peerKeysLoaded = mutableSetOf<String>()
+    private val pendingPeerPubs = mutableMapOf<String, String>()
     // Serializes (re)generation/distribution per chat so concurrent sends
     // don't each publish a different key for the same epoch.
     private val groupKeyMutex = Mutex()
@@ -135,6 +144,13 @@ class ChatRepository(
          * sent before now is undecryptable everywhere.
          */
         data object ReplacedAnotherDevicesKey : KeyStatus
+
+        /**
+         * Local keys are missing but a password-wrapped vault exists. Callers
+         * must unlock the vault with the account password instead of generating
+         * a replacement identity.
+         */
+        data object NeedsVaultUnlock : KeyStatus
     }
 
     /**
@@ -147,12 +163,15 @@ class ChatRepository(
      * every earlier message undecryptable on every device. This used to happen
      * with no indication whatsoever the moment you signed in somewhere new.
      *
-     * The takeover still goes ahead when it happens - refusing would leave the
-     * new device unable to send or read anything at all - but it is reported
-     * back as [KeyStatus.ReplacedAnotherDevicesKey] so the UI can say so
-     * plainly instead of showing a wall of "Encrypted message".
+     * When a vault exists and [allowTakeover] is false, returns
+     * [KeyStatus.NeedsVaultUnlock] instead of minting a new identity.
+     * Password login should call [E2EEVaultRepository.syncAfterPasswordLogin]
+     * first so keys are restored from the vault.
      */
-    suspend fun ensureKeysPublished(token: String): Result<KeyStatus> = withContext(Dispatchers.IO) {
+    suspend fun ensureKeysPublished(
+        token: String,
+        allowTakeover: Boolean = true
+    ): Result<KeyStatus> = withContext(Dispatchers.IO) {
         keyMutex.withLock {
             try {
                 val userId = tokenManager.getCurrentUserId().getOrNull()
@@ -165,7 +184,10 @@ class ChatRepository(
                 // Happy path: we already own this account's key on this device.
                 if (!priv.isNullOrEmpty() && !pub.isNullOrEmpty()) {
                     myPrivateHex = priv
-                    chatApiService.savePublicKey(bearer(token), mapOf("public_key" to pub))
+                    val saved = chatApiService.savePublicKey(bearer(token), mapOf("public_key" to pub))
+                    if (saved.code() == 409) {
+                        return@withLock Result.success(KeyStatus.NeedsVaultUnlock)
+                    }
                     return@withLock Result.success(KeyStatus.Existing)
                 }
 
@@ -179,11 +201,35 @@ class ChatRepository(
                     }
                 }.getOrNull()
 
+                if (registered != null) {
+                    val vaultResp = runCatching {
+                        chatApiService.getE2EEVault(bearer(token))
+                    }.getOrNull()
+                    if (vaultResp != null && vaultResp.isSuccessful) {
+                        Log.w(TAG, "Vault exists but local identity keys are missing")
+                        return@withLock Result.success(KeyStatus.NeedsVaultUnlock)
+                    }
+                    if (!allowTakeover) {
+                        Log.w(TAG, "Refusing key takeover (allowTakeover=false)")
+                        return@withLock Result.success(KeyStatus.NeedsVaultUnlock)
+                    }
+                }
+
                 val kp = E2ECrypto.generateKeyPair()
                     ?: return@withLock Result.failure(Exception("Keygen failed"))
+                val saved = chatApiService.savePublicKey(
+                    bearer(token),
+                    mapOf("public_key" to kp.publicHex)
+                )
+                if (saved.code() == 409) {
+                    Log.w(TAG, "Server refused identity takeover (identity_locked)")
+                    return@withLock Result.success(KeyStatus.NeedsVaultUnlock)
+                }
+                if (!saved.isSuccessful) {
+                    return@withLock Result.failure(Exception("Failed to publish public key"))
+                }
                 tokenManager.saveE2EEKeys(userId, kp.publicHex, kp.privateHex)
                 myPrivateHex = kp.privateHex
-                chatApiService.savePublicKey(bearer(token), mapOf("public_key" to kp.publicHex))
 
                 if (registered != null && registered != kp.publicHex) {
                     Log.w(
@@ -213,12 +259,143 @@ class ChatRepository(
         return p
     }
 
-    /** Encrypt for a chat. Returns (content, encrypted). Falls back to plaintext when we lack the key. */
-    suspend fun encryptFor(chatId: String, plaintext: String): Pair<String, Boolean> {
-        val otherPub = chatOtherPub[chatId] ?: return plaintext to false
-        val priv = myPriv() ?: return plaintext to false
-        val cipher = E2ECrypto.encrypt(plaintext, otherPub, priv) ?: return plaintext to false
-        return cipher to true
+    private suspend fun myPubHex(): String? {
+        val userId = myUserId ?: tokenManager.getCurrentUserId().getOrNull() ?: return null
+        return tokenManager.getE2EEPublicKey(userId).getOrNull()
+    }
+
+    private suspend fun loadRatchet(sessionKey: String, otherPub: String, priv: String, sending: Boolean): DoubleRatchet.State? {
+        drSessions[sessionKey]?.let { return it }
+        tokenManager.loadDirectRatchet(sessionKey).getOrNull()?.let { json ->
+            DoubleRatchet.State.fromJson(json)?.let {
+                drSessions[sessionKey] = it
+                return it
+            }
+        }
+        val their = E2ECrypto.fromHex(otherPub) ?: return null
+        if (sending) {
+            return DoubleRatchet.initAlice(their)?.also { drSessions[sessionKey] = it }
+        }
+        val pk = E2ECrypto.fromHex(myPubHex() ?: return null) ?: return null
+        val sk = E2ECrypto.fromHex(priv) ?: return null
+        return DoubleRatchet.initBob(pk, sk).also { drSessions[sessionKey] = it }
+    }
+
+    private suspend fun persistRatchet(sessionKey: String, st: DoubleRatchet.State) {
+        st.seq += 1
+        drSessions[sessionKey] = st
+        tokenManager.saveDirectRatchet(sessionKey, st.toJson())
+        tokenManager.getAccessToken().getOrNull()?.let { notifyVaultMaterialChanged(it) }
+    }
+
+    suspend fun adoptDirectRatchetsFromVault(sessions: Map<String, String>) {
+        drMutex.withLock {
+            for ((key, json) in sessions) {
+                if (key.isBlank() || json.isBlank()) continue
+                DoubleRatchet.State.fromJson(json)?.let { drSessions[key] = it }
+            }
+        }
+    }
+
+    private suspend fun encryptDirectV3(sessionKey: String, otherPub: String, priv: String, plain: ByteArray): ByteArray? {
+        var st = loadRatchet(sessionKey, otherPub, priv, sending = true) ?: return null
+        if (st.cks.size != 32) {
+            st = DoubleRatchet.initAlice(E2ECrypto.fromHex(otherPub) ?: return null) ?: return null
+            drSessions[sessionKey] = st
+        }
+        val out = DoubleRatchet.encrypt(st, plain) ?: return null
+        persistRatchet(sessionKey, st)
+        return out
+    }
+
+    private suspend fun decryptDirectV3(sessionKey: String, otherPub: String, priv: String, payload: ByteArray): ByteArray? {
+        val st = loadRatchet(sessionKey, otherPub, priv, sending = false) ?: return null
+        val plain = DoubleRatchet.decrypt(st, payload) ?: return null
+        persistRatchet(sessionKey, st)
+        return plain
+    }
+
+    private val chatDevices = mutableMapOf<String, List<Pair<String, String>>>() // chatId -> (userId, deviceId)
+
+    suspend fun refreshChatDevices(token: String, chatId: String) {
+        try {
+            val r = chatApiService.listChatE2EEDevices(bearer(token), chatId)
+            if (r.isSuccessful) {
+                chatDevices[chatId] = r.body()?.devices.orEmpty().map { it.userId to it.deviceId }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "refreshChatDevices", e)
+        }
+    }
+
+    private suspend fun sealDirectV3(chatId: String, otherPub: String, priv: String, inner: ByteArray): ByteArray? {
+        val me = myUserId ?: tokenManager.getCurrentUserId().getOrNull().orEmpty()
+        val myDev = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
+        val myPub = myPubHex() ?: otherPub
+        val devices = chatDevices[chatId].orEmpty()
+        val targets = LinkedHashMap<String, String>()
+        for ((uid, did) in devices) {
+            if (did.isBlank() || did == myDev) continue
+            val pub = if (uid == me) myPub else otherPub
+            if (pub.isNotBlank()) targets[did] = pub
+        }
+        if (targets.size <= 1) {
+            return encryptDirectV3(chatId, otherPub, priv, inner)
+        }
+        val parts = ArrayList<E2ECrypto.FanoutPart>(targets.size)
+        for ((did, pub) in targets) {
+            val blob = encryptDirectV3("$chatId|$did", pub, priv, inner) ?: return null
+            parts.add(E2ECrypto.FanoutPart(did, blob))
+        }
+        return E2ECrypto.wrapFanout(parts)
+    }
+
+    private suspend fun openDirectV3(
+        chatId: String,
+        otherPub: String,
+        priv: String,
+        payload: ByteArray,
+        senderDeviceId: String
+    ): ByteArray? {
+        val myDev = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
+        val blob = E2ECrypto.pickFanout(payload, myDev) ?: return null
+        val keyed = if (senderDeviceId.isNotBlank()) "$chatId|$senderDeviceId" else chatId
+        decryptDirectV3(keyed, otherPub, priv, blob)?.let { return it }
+        if (keyed != chatId) decryptDirectV3(chatId, otherPub, priv, blob)?.let { return it }
+        return null
+    }
+
+    /** Encrypt for a direct chat with protocol v3 Double Ratchet when possible. */
+    data class SealedText(
+        val content: String,
+        val encrypted: Boolean,
+        val encryptionVersion: Int,
+        val keyVersion: Int = 0
+    )
+
+    suspend fun encryptFor(
+        chatId: String,
+        plaintext: String,
+        forwardedFrom: String = "",
+        fileName: String = "",
+        durationMs: Long = 0,
+        fileSize: Long = 0
+    ): SealedText {
+        val otherPub = chatOtherPub[chatId] ?: return SealedText(plaintext, false, 1)
+        val priv = myPriv() ?: return SealedText(plaintext, false, 1)
+        val inner = E2ECrypto.wrapEnvelope(
+            plaintext.toByteArray(Charsets.UTF_8), fileName, forwardedFrom, durationMs, fileSize
+        )
+        syncVaultDown()
+        tokenManager.getAccessToken().getOrNull()?.let { refreshChatDevices(it, chatId) }
+        drMutex.withLock {
+            val v3 = sealDirectV3(chatId, otherPub, priv, inner)
+            if (v3 != null) return SealedText(E2ECrypto.toHex(v3), true, 3)
+        }
+        val v2 = E2ECrypto.encryptBytesEphemeral(inner, otherPub)
+        if (v2 != null) return SealedText(E2ECrypto.toHex(v2), true, 2)
+        val cipher = E2ECrypto.encryptBytes(inner, otherPub, priv) ?: return SealedText(plaintext, false, 1)
+        return SealedText(E2ECrypto.toHex(cipher), true, 1)
     }
 
     /**
@@ -226,7 +403,11 @@ class ChatRepository(
      * used for a group (0 for direct crypto_box). Callers must treat null as
      * "this will be sent in the clear".
      */
-    data class SealedBytes(val bytes: ByteArray, val keyVersion: Int = 0)
+    data class SealedBytes(
+        val bytes: ByteArray,
+        val keyVersion: Int = 0,
+        val encryptionVersion: Int = 1
+    )
 
     /**
      * Encrypts binary content (voice / attachment / round video) for a chat.
@@ -234,16 +415,33 @@ class ChatRepository(
      * Sender Key (same secretbox as group text, but raw bytes for the upload).
      * [token] is needed so a stale/missing group key can be (re)distributed.
      */
-    suspend fun encryptBytesFor(token: String, chatId: String, plain: ByteArray): SealedBytes? {
+    suspend fun encryptBytesFor(
+        token: String,
+        chatId: String,
+        plain: ByteArray,
+        fileName: String = "",
+        forwardedFrom: String = "",
+        durationMs: Long = 0,
+        fileSize: Long = 0
+    ): SealedBytes? {
+        val inner = E2ECrypto.wrapEnvelope(plain, fileName, forwardedFrom, durationMs, fileSize)
         if (chatTypeMap[chatId].equals("group", ignoreCase = true)) {
             val state = ensureGroupSenderKeyReady(token, chatId) ?: return null
-            val cipher = E2ECrypto.secretBoxEncryptBytes(plain, state.keyHex) ?: return null
+            val cipher = E2ECrypto.secretBoxEncryptBytes(inner, state.keyHex) ?: return null
             return SealedBytes(cipher, state.version)
         }
         val otherPub = chatOtherPub[chatId] ?: return null
         val priv = myPriv() ?: return null
-        val cipher = E2ECrypto.encryptBytes(plain, otherPub, priv) ?: return null
-        return SealedBytes(cipher, 0)
+        syncVaultDown()
+        refreshChatDevices(token, chatId)
+        drMutex.withLock {
+            val v3 = sealDirectV3(chatId, otherPub, priv, inner)
+            if (v3 != null) return SealedBytes(v3, 0, 3)
+        }
+        val eph = E2ECrypto.encryptBytesEphemeral(inner, otherPub)
+        if (eph != null) return SealedBytes(eph, 0, 2)
+        val cipher = E2ECrypto.encryptBytes(inner, otherPub, priv) ?: return null
+        return SealedBytes(cipher, 0, 1)
     }
 
     /**
@@ -255,54 +453,107 @@ class ChatRepository(
         chatId: String,
         payload: ByteArray,
         senderId: String = "",
-        keyVersion: Int = 0
+        keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
+        senderDeviceId: String = ""
+    ): ByteArray? = openBytesFor(chatId, payload, senderId, keyVersion, encryptionVersion, senderDeviceId)?.payload
+
+    suspend fun openBytesFor(
+        chatId: String,
+        payload: ByteArray,
+        senderId: String = "",
+        keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
+        senderDeviceId: String = ""
+    ): E2ECrypto.Envelope? {
+        val plain = decryptToBytes(chatId, payload, senderId, keyVersion, encryptionVersion, senderDeviceId) ?: return null
+        return E2ECrypto.unwrapEnvelope(plain)
+    }
+
+    data class OpenedMessage(
+        val text: String,
+        val fileName: String = "",
+        val forwardedFrom: String = "",
+        val durationMs: Long = 0,
+        val fileSize: Long = 0
+    )
+
+    private suspend fun decryptToBytes(
+        chatId: String,
+        payload: ByteArray,
+        senderId: String,
+        keyVersion: Int,
+        encryptionVersion: Int,
+        senderDeviceId: String = ""
     ): ByteArray? {
         if (chatTypeMap[chatId].equals("group", ignoreCase = true)) {
+            ensurePeerSenderKeysLoaded(chatId)
             val keyHex = groupSenderKeyFor(chatId, senderId, keyVersion) ?: return null
             return E2ECrypto.secretBoxDecryptBytes(payload, keyHex)
         }
-        val otherPub = chatOtherPub[chatId] ?: return null
         val priv = myPriv() ?: return null
+        val otherPub = chatOtherPub[chatId] ?: ""
+        if (encryptionVersion == 3) {
+            syncVaultDown()
+            drMutex.withLock { openDirectV3(chatId, otherPub, priv, payload, senderDeviceId) }?.let { return it }
+            syncVaultDown(force = true)
+            return drMutex.withLock { openDirectV3(chatId, otherPub, priv, payload, senderDeviceId) }
+        }
+        if (encryptionVersion >= 2) {
+            return E2ECrypto.decryptBytesEphemeral(payload, priv)
+        }
+        if (otherPub.isEmpty()) return null
         return E2ECrypto.decryptBytes(payload, otherPub, priv)
     }
 
-    /**
-     * Decrypt a message for a chat. Returns plaintext, or a placeholder if we
-     * can't. [senderId]/[keyVersion] are only meaningful (and only needed) for
-     * a group chat, where decryption depends on whose Sender Key encrypted it.
-     */
+    suspend fun openFor(
+        chatId: String,
+        content: String,
+        encrypted: Boolean,
+        senderId: String = "",
+        keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
+        senderDeviceId: String = ""
+    ): OpenedMessage {
+        if (!encrypted) return OpenedMessage(content)
+        if (content.isBlank()) return OpenedMessage("")
+        val payload = E2ECrypto.fromHex(content) ?: return OpenedMessage(ENCRYPTED_PLACEHOLDER)
+        val plain = decryptToBytes(chatId, payload, senderId, keyVersion, encryptionVersion, senderDeviceId)
+            ?: return OpenedMessage(ENCRYPTED_PLACEHOLDER)
+        val env = E2ECrypto.unwrapEnvelope(plain)
+        val text = runCatching { String(env.payload, Charsets.UTF_8) }.getOrDefault(ENCRYPTED_PLACEHOLDER)
+        return OpenedMessage(text, env.fileName, env.forwardedFrom, env.durationMs, env.fileSize)
+    }
+
     suspend fun decryptFor(
         chatId: String,
         content: String,
         encrypted: Boolean,
         senderId: String = "",
-        keyVersion: Int = 0
-    ): String {
-        if (!encrypted) return content
-        if (chatTypeMap[chatId].equals("group", ignoreCase = true)) {
-            val keyHex = groupSenderKeyFor(chatId, senderId, keyVersion) ?: return ENCRYPTED_PLACEHOLDER
-            val payload = E2ECrypto.fromHex(content) ?: return ENCRYPTED_PLACEHOLDER
-            val plain = E2ECrypto.secretBoxDecryptBytes(payload, keyHex) ?: return ENCRYPTED_PLACEHOLDER
-            return runCatching { String(plain, Charsets.UTF_8) }.getOrDefault(ENCRYPTED_PLACEHOLDER)
-        }
-        val otherPub = chatOtherPub[chatId] ?: return ENCRYPTED_PLACEHOLDER
-        val priv = myPriv() ?: return ENCRYPTED_PLACEHOLDER
-        return E2ECrypto.decrypt(content, otherPub, priv) ?: ENCRYPTED_PLACEHOLDER
-    }
+        keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
+        senderDeviceId: String = ""
+    ): String = openFor(chatId, content, encrypted, senderId, keyVersion, encryptionVersion, senderDeviceId).text
 
     // ==================== Group "Sender Keys" ====================
 
     /**
-     * The key that encrypted a given group message: our own current key when
-     * [senderId] is us, otherwise a copy we've previously fetched/decrypted
-     * from the server (see [fetchGroupSenderKeys]).
+     * The key that encrypted a given group message: our own key for
+     * [keyVersion] when [senderId] is us (historical versions retained after
+     * rotation), otherwise a copy fetched from the server.
      */
     private fun groupSenderKeyFor(chatId: String, senderId: String, keyVersion: Int): String? {
         if (senderId.isNotEmpty() && senderId == myUserId) {
-            val mine = mySenderKeys[chatId] ?: return null
-            return mine.keyHex.takeIf { mine.version == keyVersion }
+            return mySenderKeys[chatId]?.get(keyVersion)
         }
         return groupOtherKeys["$chatId|$senderId|$keyVersion"]
+    }
+
+    private suspend fun ensurePeerSenderKeysLoaded(chatId: String) {
+        if (!peerKeysLoaded.add(chatId)) return
+        tokenManager.loadPeerSenderKeys(chatId).getOrNull()?.forEach { (senderAndVer, hex) ->
+            groupOtherKeys["$chatId|$senderAndVer"] = hex
+        }
     }
 
     /**
@@ -314,31 +565,29 @@ class ChatRepository(
      */
     private suspend fun ensureGroupSenderKeyReady(token: String, chatId: String): SenderKeyState? =
         groupKeyMutex.withLock {
-            if (mySenderKeys[chatId] == null) {
-                tokenManager.getGroupSenderKey(chatId).getOrNull()?.let { stored ->
-                    val parts = stored.split(":", limit = 2)
-                    val version = parts.getOrNull(0)?.toIntOrNull()
-                    val keyHex = parts.getOrNull(1)
-                    if (version != null && !keyHex.isNullOrEmpty()) {
-                        mySenderKeys[chatId] = SenderKeyState(version, keyHex)
+            if (mySenderKeys[chatId].isNullOrEmpty()) {
+                tokenManager.loadGroupSenderKeys(chatId).getOrNull()?.let { stored ->
+                    if (stored.isNotEmpty()) {
+                        mySenderKeys[chatId] = stored.toMutableMap()
                     }
                 }
             }
 
             val currentEpoch = groupKeyEpoch[chatId] ?: 0
-            val existing = mySenderKeys[chatId]
-            if (existing != null && existing.version >= currentEpoch) {
-                return@withLock existing
+            val versions = mySenderKeys.getOrPut(chatId) { mutableMapOf() }
+            val current = versions.maxByOrNull { it.key }?.let { SenderKeyState(it.key, it.value) }
+            if (current != null && current.version >= currentEpoch) {
+                return@withLock current
             }
 
             // Stale (or missing) - fetch the authoritative member list + epoch,
             // generate a fresh key, and redistribute it to everyone.
-            val group = groupRepository.getGroupInfo(token, chatId).getOrNull() ?: return@withLock existing
+            val group = groupRepository.getGroupInfo(token, chatId).getOrNull() ?: return@withLock current
             groupKeyEpoch[chatId] = group.keyEpoch
 
-            val newKeyHex = E2ECrypto.secretBoxGenerateKey() ?: return@withLock existing
-            val newKeyBytes = E2ECrypto.fromHex(newKeyHex) ?: return@withLock existing
-            val priv = myPriv() ?: return@withLock existing
+            val newKeyHex = E2ECrypto.secretBoxGenerateKey() ?: return@withLock current
+            val newKeyBytes = E2ECrypto.fromHex(newKeyHex) ?: return@withLock current
+            val priv = myPriv() ?: return@withLock current
             val myId = myUserId
 
             val recipients = group.members.mapNotNull { member ->
@@ -353,11 +602,9 @@ class ChatRepository(
                 groupRepository.publishSenderKey(token, chatId, group.keyEpoch, recipients)
                     .onFailure { Log.w(TAG, "publishSenderKey failed for $chatId - keeping key locally anyway", it) }
             }
-            // Adopt the key locally regardless of publish success: refusing to
-            // send at all would be worse than a message some members can't yet
-            // decrypt (they'll catch up once the publish succeeds/retries).
-            mySenderKeys[chatId] = state
+            versions[state.version] = state.keyHex
             tokenManager.saveGroupSenderKey(chatId, "${state.version}:${state.keyHex}")
+            notifyVaultMaterialChanged(token)
             state
         }
 
@@ -368,12 +615,15 @@ class ChatRepository(
      */
     suspend fun fetchGroupSenderKeys(token: String, chatId: String) {
         val priv = myPriv() ?: return
+        ensurePeerSenderKeysLoaded(chatId)
         groupRepository.getSenderKeys(token, chatId).onSuccess { entries ->
             for (entry in entries) {
                 if (entry.senderPublicKey.isBlank() || entry.encryptedKey.isBlank()) continue
                 val payload = E2ECrypto.fromHex(entry.encryptedKey) ?: continue
                 val keyBytes = E2ECrypto.decryptBytes(payload, entry.senderPublicKey, priv) ?: continue
-                groupOtherKeys["$chatId|${entry.senderId}|${entry.keyVersion}"] = E2ECrypto.toHex(keyBytes)
+                val hex = E2ECrypto.toHex(keyBytes)
+                groupOtherKeys["$chatId|${entry.senderId}|${entry.keyVersion}"] = hex
+                tokenManager.savePeerSenderKey(chatId, entry.senderId, entry.keyVersion, hex)
             }
         }.onFailure { Log.w(TAG, "fetchGroupSenderKeys failed for $chatId", it) }
     }
@@ -384,11 +634,40 @@ class ChatRepository(
      * (hexCiphertext, encrypted, keyVersion) - encrypted=false means we
      * couldn't get a key at all and [plaintext] is being returned as-is.
      */
-    private suspend fun encryptGroupText(token: String, chatId: String, plaintext: String): Triple<String, Boolean, Int> {
+    private suspend fun encryptGroupText(
+        token: String,
+        chatId: String,
+        plaintext: String,
+        forwardedFrom: String = "",
+        fileName: String = "",
+        durationMs: Long = 0,
+        fileSize: Long = 0
+    ): Triple<String, Boolean, Int> {
         val state = ensureGroupSenderKeyReady(token, chatId) ?: return Triple(plaintext, false, 0)
-        val cipher = E2ECrypto.secretBoxEncryptBytes(plaintext.toByteArray(Charsets.UTF_8), state.keyHex)
+        val inner = E2ECrypto.wrapEnvelope(
+            plaintext.toByteArray(Charsets.UTF_8), fileName, forwardedFrom, durationMs, fileSize
+        )
+        val cipher = E2ECrypto.secretBoxEncryptBytes(inner, state.keyHex)
             ?: return Triple(plaintext, false, 0)
         return Triple(E2ECrypto.toHex(cipher), true, state.version)
+    }
+
+    suspend fun sealMessage(
+        token: String,
+        chatId: String,
+        chatType: String,
+        plaintext: String,
+        forwardedFrom: String = "",
+        fileName: String = "",
+        durationMs: Long = 0,
+        fileSize: Long = 0
+    ): SealedText {
+        return if (chatType.equals("group", ignoreCase = true)) {
+            val t = encryptGroupText(token, chatId, plaintext, forwardedFrom, fileName, durationMs, fileSize)
+            SealedText(t.first, t.second, 1, t.third)
+        } else {
+            encryptFor(chatId, plaintext, forwardedFrom, fileName, durationMs, fileSize)
+        }
     }
 
     /**
@@ -401,20 +680,74 @@ class ChatRepository(
         chatTypeMap[dto.id] = dto.type
         groupKeyEpoch[dto.id] = dto.keyEpoch
         val pub = dto.otherUser?.publicKey?.takeIf { it.isNotEmpty() } ?: return
-        chatOtherPub[dto.id] = pub
         if (!dto.type.equals("group", ignoreCase = true)) {
-            checkSecurityCodeChange(dto.id, pub)
+            applyPeerIdentity(dto.id, pub)
+        } else {
+            chatOtherPub[dto.id] = pub
         }
     }
 
-    private suspend fun checkSecurityCodeChange(chatId: String, newPublicKeyHex: String) {
+    /**
+     * First-seen identity is pinned (TOFU). A later server value is held as
+     * pending until [acceptPeerKeyChange] — encrypt keeps using the pinned key.
+     */
+    private suspend fun applyPeerIdentity(chatId: String, serverPub: String) {
         val known = tokenManager.getKnownPublicKey(chatId).getOrNull()
-        if (known != null && known != newPublicKeyHex) {
-            pendingSecurityNotices.add(chatId)
+        when {
+            known.isNullOrBlank() -> {
+                tokenManager.saveKnownPublicKey(chatId, serverPub)
+                tokenManager.clearPendingPublicKey(chatId)
+                pendingPeerPubs.remove(chatId)
+                chatOtherPub[chatId] = serverPub
+                tokenManager.getAccessToken().getOrNull()?.let { notifyVaultMaterialChanged(it) }
+            }
+            known.equals(serverPub, ignoreCase = true) -> {
+                tokenManager.clearPendingPublicKey(chatId)
+                pendingPeerPubs.remove(chatId)
+                chatOtherPub[chatId] = known
+            }
+            else -> {
+                tokenManager.savePendingPublicKey(chatId, serverPub)
+                pendingPeerPubs[chatId] = serverPub
+                pendingSecurityNotices.add(chatId)
+                chatOtherPub[chatId] = known
+                tokenManager.clearSafetyVerified(chatId)
+            }
         }
-        if (known != newPublicKeyHex) {
-            tokenManager.saveKnownPublicKey(chatId, newPublicKeyHex)
+    }
+
+    fun hasPendingPeerKeyChange(chatId: String): Boolean = pendingPeerPubs.containsKey(chatId)
+
+    suspend fun acceptPeerKeyChange(chatId: String) {
+        val pending = tokenManager.getPendingPublicKey(chatId).getOrNull()
+            ?: pendingPeerPubs[chatId]
+            ?: return
+        tokenManager.saveKnownPublicKey(chatId, pending)
+        tokenManager.clearPendingPublicKey(chatId)
+        tokenManager.clearSafetyVerified(chatId)
+        pendingPeerPubs.remove(chatId)
+        pendingSecurityNotices.remove(chatId)
+        chatOtherPub[chatId] = pending
+        drMutex.withLock {
+            val oldSeq = drSessions[chatId]?.seq ?: 0L
+            drSessions.remove(chatId)
+            tokenManager.deleteDirectRatchet(chatId)
+            val their = E2ECrypto.fromHex(pending) ?: return@withLock
+            val st = DoubleRatchet.initAlice(their) ?: return@withLock
+            st.seq = oldSeq
+            persistRatchet(chatId, st)
         }
+    }
+
+    private suspend fun notifyVaultMaterialChanged(token: String) {
+        runCatching { onVaultMaterialChanged?.invoke(token) }
+            .onFailure { Log.w(TAG, "Vault material refresh failed", it) }
+    }
+
+    private suspend fun syncVaultDown(force: Boolean = false) {
+        val token = tokenManager.getAccessToken().getOrNull() ?: return
+        runCatching { onVaultPullNeeded?.invoke(token, force) }
+            .onFailure { Log.w(TAG, "Vault pull failed", it) }
     }
 
     suspend fun getChats(token: String): Result<List<ChatListItemDto>> = withContext(Dispatchers.IO) {
@@ -506,11 +839,32 @@ class ChatRepository(
             chatTypeMap[chatId] = chatType
             // Group: Sender Key (crypto_secretbox). Direct: pairwise crypto_box.
             // Plaintext fallback when we have no key for either.
-            val (outContent, encrypted, keyVersion) = if (chatType.equals("group", ignoreCase = true)) {
-                encryptGroupText(token, chatId, plaintext)
+            val outContent: String
+            val encrypted: Boolean
+            val keyVersion: Int
+            val encVer: Int
+            if (chatType.equals("group", ignoreCase = true)) {
+                val t = encryptGroupText(token, chatId, plaintext, forwardedFrom = forward.fromName)
+                if (!t.second) {
+                    return@withContext Result.failure(
+                        Exception("Cannot send: group encryption key is not ready")
+                    )
+                }
+                outContent = t.first
+                encrypted = true
+                keyVersion = t.third
+                encVer = 1
             } else {
-                val (c, enc) = encryptFor(chatId, plaintext)
-                Triple(c, enc, 0)
+                val s = encryptFor(chatId, plaintext, forwardedFrom = forward.fromName)
+                if (!s.encrypted) {
+                    return@withContext Result.failure(
+                        Exception("Cannot send: peer encryption key is missing")
+                    )
+                }
+                outContent = s.content
+                encrypted = true
+                keyVersion = 0
+                encVer = s.encryptionVersion
             }
             val response = chatApiService.sendMessage(
                 bearer(token),
@@ -520,9 +874,10 @@ class ChatRepository(
                     content = outContent,
                     encrypted = encrypted,
                     keyVersion = keyVersion,
+                    encryptionVersion = encVer,
                     replyToId = replyToId,
                     isForwarded = forward.isForwarded,
-                    forwardedFromName = forward.fromName,
+                    forwardedFromName = "",
                     forwardedFromMessageId = forward.fromMessageId
                 )
             )
@@ -546,6 +901,7 @@ class ChatRepository(
                         isEncrypted = sent.encrypted,
                         readAt = null,
                         keyVersion = keyVersion,
+                        encryptionVersion = encVer,
                         replyTo = replyToId.ifBlank { null },
                         isForwarded = forward.isForwarded,
                         forwardedFromName = forward.fromName,
@@ -575,8 +931,10 @@ class ChatRepository(
         durationMs: Long,
         encrypted: Boolean,
         keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
         forward: ForwardMeta = ForwardMeta(),
-        replyToId: String = ""
+        replyToId: String = "",
+        sealedContent: String = ""
     ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.sendMessage(
@@ -584,19 +942,17 @@ class ChatRepository(
                 SendMessageRequest(
                     chatId = chatId,
                     chatType = chatType,
-                    // The bubble renders from file_url; content stays empty so a
-                    // client that doesn't understand voice shows nothing rather
-                    // than a bogus blob of text.
-                    content = "",
+                    content = sealedContent,
                     contentType = VOICE_CONTENT_TYPE,
                     encrypted = encrypted,
                     fileUrl = fileUrl,
                     fileType = VOICE_CONTENT_TYPE,
-                    durationMs = durationMs,
+                    durationMs = 0,
                     keyVersion = keyVersion,
+                    encryptionVersion = encryptionVersion,
                     replyToId = replyToId,
                     isForwarded = forward.isForwarded,
-                    forwardedFromName = forward.fromName,
+                    forwardedFromName = "",
                     forwardedFromMessageId = forward.fromMessageId
                 )
             )
@@ -626,8 +982,10 @@ class ChatRepository(
         durationMs: Long,
         encrypted: Boolean,
         keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
         forward: ForwardMeta = ForwardMeta(),
-        replyToId: String = ""
+        replyToId: String = "",
+        sealedContent: String = ""
     ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.sendMessage(
@@ -635,20 +993,18 @@ class ChatRepository(
                 SendMessageRequest(
                     chatId = chatId,
                     chatType = chatType,
-                    // Same as a voice note: the bubble renders from file_url, and
-                    // a client that does not understand round videos shows
-                    // nothing rather than a bogus blob of text.
-                    content = "",
+                    content = sealedContent,
                     contentType = VIDEO_NOTE_CONTENT_TYPE,
                     encrypted = encrypted,
                     fileUrl = fileUrl,
                     fileType = VIDEO_NOTE_CONTENT_TYPE,
-                    durationMs = durationMs,
+                    durationMs = 0,
                     thumbnailUrl = thumbnailUrl,
                     keyVersion = keyVersion,
+                    encryptionVersion = encryptionVersion,
                     replyToId = replyToId,
                     isForwarded = forward.isForwarded,
-                    forwardedFromName = forward.fromName,
+                    forwardedFromName = "",
                     forwardedFromMessageId = forward.fromMessageId
                 )
             )
@@ -680,8 +1036,10 @@ class ChatRepository(
         contentType: String,
         encrypted: Boolean,
         keyVersion: Int = 0,
+        encryptionVersion: Int = 1,
         forward: ForwardMeta = ForwardMeta(),
-        replyToId: String = ""
+        replyToId: String = "",
+        sealedContent: String = ""
     ): Result<SendMessageResponseData> = withContext(Dispatchers.IO) {
         try {
             val response = chatApiService.sendMessage(
@@ -689,17 +1047,18 @@ class ChatRepository(
                 SendMessageRequest(
                     chatId = chatId,
                     chatType = chatType,
-                    content = "",
+                    content = sealedContent,
                     contentType = contentType,
                     encrypted = encrypted,
                     fileUrl = fileUrl,
                     fileType = contentType,
-                    fileName = fileName,
-                    fileSize = fileSize,
+                    fileName = "",
+                    fileSize = 0,
                     keyVersion = keyVersion,
+                    encryptionVersion = encryptionVersion,
                     replyToId = replyToId,
                     isForwarded = forward.isForwarded,
-                    forwardedFromName = forward.fromName,
+                    forwardedFromName = "",
                     forwardedFromMessageId = forward.fromMessageId
                 )
             )
@@ -758,6 +1117,7 @@ class ChatRepository(
                 fileSize = e.fileSize,
                 durationMs = e.durationMs,
                 keyVersion = e.keyVersion,
+                encryptionVersion = e.encryptionVersion,
                 replyToId = e.replyTo,
                 isForwarded = e.isForwarded,
                 forwardedFromName = e.forwardedFromName,
@@ -793,6 +1153,7 @@ class ChatRepository(
                 fileSize = dto.fileSize,
                 durationMs = dto.durationMs,
                 keyVersion = dto.keyVersion,
+                encryptionVersion = if (dto.encryptionVersion == 0) 1 else dto.encryptionVersion,
                 replyTo = dto.replyToId,
                 isForwarded = dto.isForwarded,
                 forwardedFromName = dto.forwardedFromName,
@@ -821,10 +1182,33 @@ class ChatRepository(
         webSocketManager.sendTypingIndicator(chatId, userId, isTyping)
     }
 
+    suspend fun safetyNumberForChat(chatId: String): String? {
+        val userId = tokenManager.getCurrentUserId().getOrNull() ?: return null
+        val mine = tokenManager.getE2EEPublicKey(userId).getOrNull() ?: return null
+        val peer = tokenManager.getKnownPublicKey(chatId).getOrNull() ?: return null
+        return E2ECrypto.safetyNumber(mine, peer)
+    }
+
+    suspend fun isSafetyVerified(chatId: String): Boolean =
+        tokenManager.isSafetyVerified(chatId).getOrDefault(false)
+
+    suspend fun verifySafetyNumberScan(chatId: String, scanned: String): Boolean {
+        val local = safetyNumberForChat(chatId) ?: return false
+        val a = E2ECrypto.parseSafetyNumberQr(scanned) ?: return false
+        val b = E2ECrypto.parseSafetyNumberQr(E2ECrypto.safetyNumberQrPayload(local) ?: return false)
+            ?: return false
+        if (!a.equals(b, ignoreCase = true)) return false
+        val peer = tokenManager.getKnownPublicKey(chatId).getOrNull() ?: return false
+        tokenManager.markSafetyVerified(chatId, peer)
+        return true
+    }
+
     // ==================== Real-time (WebSocket) ====================
 
     fun connectRealtime() = webSocketManager.connect()
     fun disconnectRealtime() = webSocketManager.disconnect()
+    fun nudgeRealtime() = webSocketManager.nudgeReconnect()
+    fun ensureRealtime() = webSocketManager.ensureConnected()
     fun joinChatRoom(chatId: String) = webSocketManager.joinChat(chatId)
     fun leaveChatRoom(chatId: String) = webSocketManager.leaveChat(chatId)
     val connectionState get() = webSocketManager.connectionState
@@ -917,7 +1301,8 @@ class ChatRepository(
                 latest.encryptedContent ?: latest.content,
                 latest.isEncrypted,
                 latest.senderId,
-                latest.keyVersion
+                latest.keyVersion,
+                latest.encryptionVersion
             )
         }
     }

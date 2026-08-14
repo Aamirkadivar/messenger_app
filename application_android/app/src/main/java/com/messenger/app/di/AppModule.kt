@@ -2,7 +2,6 @@ package com.messenger.app.di
 
 import android.content.Context
 import com.messenger.app.BuildConfig
-import com.messenger.app.data.encryption.MessageEncryption
 import com.messenger.app.data.local.AuthDatabase
 import com.messenger.app.data.local.dao.CachedChatDao
 import com.messenger.app.data.local.dao.ConversationDao
@@ -15,6 +14,7 @@ import com.messenger.app.data.remote.websocket.WebSocketManager
 import com.messenger.app.data.repository.AttachmentRepository
 import com.messenger.app.data.repository.AuthRepository
 import com.messenger.app.data.repository.ChatRepository
+import com.messenger.app.data.repository.E2EEVaultRepository
 import com.messenger.app.data.repository.AvatarRepository
 import com.messenger.app.data.repository.GroupRepository
 import com.messenger.app.data.repository.VoiceRepository
@@ -55,7 +55,10 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideOkHttpClient(authenticator: TokenRefreshAuthenticator): OkHttpClient {
+    fun provideOkHttpClient(
+        authenticator: TokenRefreshAuthenticator,
+        tokenManager: TokenManager
+    ): OkHttpClient {
         val logging = HttpLoggingInterceptor().apply {
             level = if (BuildConfig.DEBUG) {
                 HttpLoggingInterceptor.Level.BODY
@@ -63,7 +66,17 @@ object AppModule {
                 HttpLoggingInterceptor.Level.NONE
             }
         }
+        val deviceIdInterceptor = okhttp3.Interceptor { chain ->
+            val deviceId = kotlinx.coroutines.runBlocking {
+                tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
+            }
+            val req = if (deviceId.isNotBlank()) {
+                chain.request().newBuilder().header("X-Device-Id", deviceId).build()
+            } else chain.request()
+            chain.proceed(req)
+        }
         return OkHttpClient.Builder()
+            .addInterceptor(deviceIdInterceptor)
             .addInterceptor(logging)
             // Renews an expired access token and replays the request, instead
             // of letting every call fail until the user signs in again.
@@ -106,10 +119,6 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideMessageEncryption(): MessageEncryption = MessageEncryption()
-
-    @Provides
-    @Singleton
     fun provideAuthDatabase(@ApplicationContext context: Context): AuthDatabase =
         AuthDatabase.getDatabase(context)
 
@@ -132,6 +141,9 @@ object AppModule {
             serverUrl = BuildConfig.API_BASE_URL,
             tokenProvider = {
                 kotlinx.coroutines.runBlocking { tokenManager.getAccessToken().getOrNull() }
+            },
+            deviceIdProvider = {
+                kotlinx.coroutines.runBlocking { tokenManager.getOrCreateDeviceId().getOrNull() }
             }
         )
 
@@ -208,10 +220,13 @@ object AppModule {
         webSocketManager: WebSocketManager,
         tokenManager: TokenManager,
         groupRepository: GroupRepository,
-        json: Json
+        json: Json,
+        vaultRepository: dagger.Lazy<E2EEVaultRepository>
     ): ChatRepository = ChatRepository(
         chatApiService, messageDao, conversationDao, cachedChatDao, webSocketManager, tokenManager,
-        groupRepository, json
+        groupRepository, json,
+        onVaultMaterialChanged = { token -> vaultRepository.get().scheduleRefreshVaultContents(token) },
+        onVaultPullNeeded = { token, force -> vaultRepository.get().pullAndMergeVault(token, force) }
     )
 
     @Provides

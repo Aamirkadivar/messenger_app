@@ -24,6 +24,15 @@ interface AuthApiService {
     @POST("auth/login")
     suspend fun login(@Body request: LoginRequest): Response<AuthResponse>
 
+    @POST("auth/2fa/verify")
+    suspend fun verify2FA(@Body request: Verify2FARequest): Response<AuthResponse>
+
+    @POST("auth/password-reset/start")
+    suspend fun startPasswordReset(@Body request: PasswordResetStartRequest): Response<PasswordResetStartResponse>
+
+    @POST("auth/password-reset/complete")
+    suspend fun completePasswordReset(@Body request: PasswordResetCompleteRequest): Response<PasswordResetCompleteResponse>
+
     @POST("auth/refresh")
     suspend fun refreshToken(@Body request: RefreshTokenRequest): Response<AuthResponse>
 }
@@ -36,6 +45,12 @@ interface ChatApiService {
     // The backend wraps this one: {"user": {...}}. Declaring it as a bare
     // UserDto made every response fail to deserialize.
     suspend fun getCurrentUser(@Header("Authorization") token: String): Response<MeResponse>
+
+    @POST("users/me/password")
+    suspend fun changePassword(
+        @Header("Authorization") token: String,
+        @Body body: ChangePasswordRequest
+    ): Response<Map<String, String>>
 
     @GET("users/search")
     suspend fun searchUsers(
@@ -263,6 +278,85 @@ interface ChatApiService {
     suspend fun getMyPublicKey(
         @Header("Authorization") token: String
     ): Response<Map<String, String>>
+
+    // ==================== E2EE vault ====================
+
+    @GET("e2ee/vault")
+    suspend fun getE2EEVault(
+        @Header("Authorization") token: String
+    ): Response<E2EEVaultDto>
+
+    @PUT("e2ee/vault")
+    suspend fun putE2EEVault(
+        @Header("Authorization") token: String,
+        @Body body: E2EEVaultPutRequest
+    ): Response<E2EEVaultDto>
+
+    @POST("e2ee/devices")
+    suspend fun registerE2EEDevice(
+        @Header("Authorization") token: String,
+        @Body body: E2EEDeviceRegisterRequest
+    ): Response<Unit>
+
+    @GET("e2ee/devices")
+    suspend fun listE2EEDevices(
+        @Header("Authorization") token: String
+    ): Response<E2EEDevicesResponse>
+
+    @GET("e2ee/chats/{chatId}/devices")
+    suspend fun listChatE2EEDevices(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String
+    ): Response<ChatE2EEDevicesResponse>
+
+    @POST("e2ee/devices/{deviceId}/revoke")
+    suspend fun revokeE2EEDevice(
+        @Header("Authorization") token: String,
+        @Path("deviceId") deviceId: String
+    ): Response<Unit>
+
+    @POST("e2ee/pairing")
+    suspend fun createE2EEPairing(
+        @Header("Authorization") token: String,
+        @Body body: E2EEPairingCreateRequest
+    ): Response<E2EEPairingCreateResponse>
+
+    @GET("e2ee/pairing/{sessionId}/payload")
+    suspend fun takeE2EEPairingPayload(
+        @Header("Authorization") token: String,
+        @Path("sessionId") sessionId: String
+    ): Response<E2EEPairingPayloadDto>
+
+    @POST("e2ee/pairing/{sessionId}/complete")
+    suspend fun completeE2EEPairing(
+        @Header("Authorization") token: String,
+        @Path("sessionId") sessionId: String,
+        @Body body: E2EEPairingCompleteRequest
+    ): Response<Map<String, String>>
+
+    @GET("auth/2fa/status")
+    suspend fun totpStatus(@Header("Authorization") token: String): Response<TotpStatusDto>
+
+    @POST("auth/2fa/totp/setup")
+    suspend fun totpSetup(@Header("Authorization") token: String): Response<TotpSetupDto>
+
+    @POST("auth/2fa/totp/confirm")
+    suspend fun totpConfirm(
+        @Header("Authorization") token: String,
+        @Body body: TotpConfirmRequest
+    ): Response<TotpStatusDto>
+
+    @POST("auth/2fa/totp/disable")
+    suspend fun totpDisable(
+        @Header("Authorization") token: String,
+        @Body body: TotpDisableRequest
+    ): Response<TotpStatusDto>
+
+    @POST("auth/2fa/totp/backup-codes")
+    suspend fun totpRegenerateBackupCodes(
+        @Header("Authorization") token: String,
+        @Body body: TotpDisableRequest
+    ): Response<TotpStatusDto>
 
     // ==================== Calls ====================
     // Signaling itself (invite/answer/ICE/end) is WS-only (see

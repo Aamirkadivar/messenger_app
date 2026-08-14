@@ -3,6 +3,9 @@
 
 #include <QString>
 #include <QByteArray>
+#include <QList>
+#include <QPair>
+#include <QtGlobal>
 #include <sodium.h>
 
 class Encryption {
@@ -96,6 +99,18 @@ public:
                                       const QString& otherPublicHex,
                                       const QString& myPrivateHex);
 
+    // Protocol v2 direct messages: ephemeral crypto_box (sender forward secrecy).
+    // Wire: eph_pk(32) || nonce(24) || ciphertext+mac. Text hex for JSON bodies,
+    // raw bytes for media uploads. Recipient only needs their private key.
+    static QString boxEncryptEphemeral(const QString& message,
+                                       const QString& recipientPublicHex);
+    static QString boxDecryptEphemeral(const QString& payloadHex,
+                                       const QString& myPrivateHex);
+    static QByteArray boxEncryptBytesEphemeral(const QByteArray& plain,
+                                               const QString& recipientPublicHex);
+    static QByteArray boxDecryptBytesEphemeral(const QByteArray& payload,
+                                               const QString& myPrivateHex);
+
     // ---- Symmetric secretbox (XSalsa20-Poly1305) for group "Sender Keys" ----
     // Direct chats use crypto_box (X25519 ECDH) because there are exactly two
     // parties to derive a shared secret between. A group has no single
@@ -120,6 +135,32 @@ public:
 
     // Convert hex string to bytes (inline for convenience)
     static QByteArray hexToBytes(const QString& hex);
+
+    // Direct-chat security code. SHA-256 of the two 32-byte identity pubs
+    // (sorted by lowercase hex), formatted as 4 lines of 4×4 hex groups.
+    // Must match Android E2ECrypto.safetyNumber.
+    static QString safetyNumber(const QString& pubHexA, const QString& pubHexB);
+    static QString safetyNumberCompact(const QString& formatted);
+    static QString safetyNumberQrPayload(const QString& formatted);
+    static QString parseSafetyNumberQr(const QString& raw);
+
+    struct MessageEnvelope {
+        QByteArray payload;
+        QString fileName;
+        QString forwardedFrom;
+        qint64 durationMs = 0;
+        qint64 fileSize = 0;
+    };
+    static QByteArray wrapEnvelope(const QByteArray& payload,
+                                   const QString& fileName = QString(),
+                                   const QString& forwardedFrom = QString(),
+                                   qint64 durationMs = 0,
+                                   qint64 fileSize = 0);
+    static MessageEnvelope unwrapEnvelope(const QByteArray& data);
+
+    static QByteArray wrapFanout(const QList<QPair<QString, QByteArray>>& parts);
+    static QByteArray pickFanout(const QByteArray& data, const QString& deviceId);
+    static bool isFanout(const QByteArray& data);
 
 private:
     static bool m_initialized;

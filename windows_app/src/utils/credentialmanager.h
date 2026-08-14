@@ -15,12 +15,13 @@ public:
 
     bool saveToken(const QString& key, const QString& value);
     QString getToken(const QString& key) const;
+    QMap<QString, QString> tokensWithPrefix(const QString& prefix) const;
     void removeToken(const QString& key);
     bool deleteToken(const QString& key);
     QString getPersistentData(const QString& key) const;
     void savePersistentData(const QString& key, const QString& value);
     void clearAllTokens();
-    bool saveUser(const QString& userId, const QString& username, const QString& pubKey, const QString& privKey);
+    bool saveUser(const QString& userId, const QString& username, const QString& pubKey);
     void loadLocalStore();
     void saveLocalStore();
     void persistToOS(const QString& key, const QString& value, bool isSecret = true);

@@ -55,6 +55,7 @@ func main() {
 	groupService := handlers.NewGroupService(hub)
 	userHandler := handlers.NewUserHandler()
 	cryptoHandler := handlers.NewCryptoHandler()
+	e2eeHandler := handlers.NewE2EEHandler(hub)
 	uploadHandler := handlers.NewUploadHandler()
 	callService := handlers.NewCallService(cfg)
 
@@ -101,16 +102,28 @@ func main() {
 	auth := api.Group("/auth")
 	auth.Post("/register", authService.Register)
 	auth.Post("/login", authService.Login)
+	auth.Post("/2fa/verify", authService.Verify2FA)
 	auth.Post("/refresh", authService.RefreshToken)
+	auth.Post("/password-reset/start", authService.StartPasswordReset)
+	auth.Post("/password-reset/complete", authService.CompletePasswordReset)
 
 	// Protected routes
 	protected := api.Group("")
 	protected.Use(middleware.AuthMiddleware(cfg))
+	protected.Use(middleware.DeviceRevocationGuard())
+
+	authProtected := protected.Group("/auth")
+	authProtected.Get("/2fa/status", authService.TotpStatus)
+	authProtected.Post("/2fa/totp/setup", authService.TotpSetup)
+	authProtected.Post("/2fa/totp/confirm", authService.TotpConfirm)
+	authProtected.Post("/2fa/totp/disable", authService.TotpDisable)
+	authProtected.Post("/2fa/totp/backup-codes", authService.TotpRegenerateBackupCodes)
 
 	// User routes
 	userRoutes := protected.Group("/users")
 	userRoutes.Get("/me", userHandler.GetMe)
 	userRoutes.Put("/me", userHandler.UpdateMe)
+	userRoutes.Post("/me/password", authService.ChangePassword)
 	userRoutes.Get("/me/blocks", userHandler.ListBlockedUsers)
 	userRoutes.Get("/search", userHandler.SearchUsers)
 	userRoutes.Get("/:user_id/presence", userHandler.GetUserPresence)
@@ -181,8 +194,23 @@ func main() {
 	cryptoRoutes.Get("/public-key", cryptoHandler.GetPublicKey)
 	cryptoRoutes.Get("/public-key/:user_id", cryptoHandler.GetPublicKeyByUserId)
 
+	// Opaque E2EE vault + device registry (server never decrypts vault bytes).
+	e2eeRoutes := protected.Group("/e2ee")
+	e2eeRoutes.Get("/vault", e2eeHandler.GetVault)
+	e2eeRoutes.Put("/vault", e2eeHandler.PutVault)
+	e2eeRoutes.Get("/vault/versions", e2eeHandler.GetVaultVersions)
+	e2eeRoutes.Get("/devices", e2eeHandler.ListDevices)
+	e2eeRoutes.Get("/chats/:chat_id/devices", e2eeHandler.ListChatDevices)
+	e2eeRoutes.Post("/devices", e2eeHandler.RegisterDevice)
+	e2eeRoutes.Delete("/devices/:device_id", e2eeHandler.DeleteDevice)
+	e2eeRoutes.Post("/devices/:device_id/revoke", e2eeHandler.RevokeDevice)
+	e2eeRoutes.Post("/pairing", e2eeHandler.CreatePairing)
+	e2eeRoutes.Get("/pairing/:session_id", e2eeHandler.GetPairing)
+	e2eeRoutes.Post("/pairing/:session_id/complete", e2eeHandler.CompletePairing)
+	e2eeRoutes.Get("/pairing/:session_id/payload", e2eeHandler.TakePairingPayload)
+
 	// WebSocket route
-	app.Get("/ws", middleware.WebSocketAuth(cfg), websocket.WSHandler(hub))
+	app.Get("/ws", middleware.WebSocketAuth(cfg), middleware.WebSocketDeviceGuard(), websocket.WSHandler(hub))
 
 	// Start server
 	addr := ":" + cfg.AppPort

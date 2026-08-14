@@ -3,8 +3,8 @@
 ## Assets
 - Message plaintext (text, voice, attachments)
 - E2EE identity private key
-- Group sender keys (all historical versions needed for history)
-- Future: E2EE Master Key, Vault Encryption Key, Recovery Key, password-derived KEK
+- Group sender keys (own and peer, all versions needed for history)
+- E2EE Master Key, password-derived KEK, Recovery Key
 - Account credentials / JWT sessions
 
 ## Adversaries
@@ -14,30 +14,32 @@
 | Network attacker | Passive/active on wire | Read/modify traffic |
 | Database thief | Read DB dump | Decrypt messages / steal keys |
 | Malicious backend operator | Full app + DB control | Decrypt user messages |
-| Stolen / lost device | Physical access to unlocked or locked device | Extract keys / read chats |
-| Malicious authenticated device | Own vault unlock | Exfiltrate keys; revoke hard |
+| Stolen / lost device | Physical access | Extract keys / read chats |
+| Malicious authenticated device | Own vault unlock | Exfiltrate keys |
 | Password compromise | Knows account password | Login; if also vault KEK, unlock E2EE |
-| 2FA compromise | OTP/session second factor | Complete login |
 | Recovery-key compromise | Has recovery secret | Unlock E2EE without password |
 | MITM on QR pairing | Intercept pairing | Steal vault transfer |
 
-## What current system protects / fails
+## What the system protects / fails
 
-| Scenario | Today | Target |
-|----------|-------|--------|
-| DB dump of ciphertext | Protected if clients encrypted | Same + no `users.private_key` |
-| DB dump of `users.private_key` (register leftover) | **Broken** for any account with that field populated | Remove; never store |
-| Malicious backend | Cannot decrypt properly encrypted msgs; **can** push malicious pubkeys / drop msgs | Same confidentiality; authenticity still needs identity trust UX |
-| New device without old | **History lost** | Vault + password/recovery unlock |
-| Password reset without recovery | N/A (no vault) | Account may reset; **E2EE history stays locked** |
-| Revoked device | No revocation | Session kill + epoch bump; cannot erase already-copied keys |
+| Scenario | Today |
+|----------|--------|
+| DB dump of ciphertext | Protected (clients encrypt; no server private keys) |
+| DB dump of `users.private_key` | Column dropped; leftover rows cleared then dropped |
+| Malicious backend | Cannot decrypt properly encrypted msgs; **can** substitute peer public keys / drop msgs |
+| New device without old | Vault + password, recovery key, or pairing |
+| Password reset without recovery | Account may reset (TOTP still required if enabled); **E2EE history stays locked** |
+| Revoked device | API/WS blocked; cannot erase keys already copied |
 
 ## Explicit non-goals
-- Perfect memory zeroization on Go/JVM/Qt/JS
-- Cryptographic erasure of keys already exfiltrated by a malicious device before revoke
-- Server-assisted "forgot everything" recovery of E2EE without Recovery Key / old password / QR from old device
+- Perfect memory zeroization on Go/JVM/Qt
+- Cryptographic erasure of keys already exfiltrated before revoke
+- Server-assisted recovery of E2EE without Recovery Key / old password / pairing from an old device
 
-## Residual risks after target design
-- Password + recovery key both weak/stolen → full E2EE compromise
-- Malicious server can still substitute peer public keys (users must verify security codes)
-- Protocol v1 direct chat lacks forward secrecy
+## Residual risks
+- Password + recovery key both stolen → full E2EE compromise
+- Malicious server can still substitute peer public keys. Direct chats **pin** the first identity (TOFU) and keep encrypting to it if the server later reports a different key; the user must tap **Accept new code**. Safety numbers can be compared as text or via QR (`sn1.` + SHA-256 hex). A successful scan is stored as verified until the pinned key changes.
+- Attachment filenames, duration, file size, and forward attribution live in the inner `EM1` ciphertext, not in server `file_name` / `forwarded_from_name` / `duration_ms` / `file_size` columns (those are empty or zero on new sends). Coarse `content_type` remains visible to the server.
+- Direct v2 is sender-side FS only (historical); new directs use v3 Double Ratchet
+- Multiple devices can stay signed in; revoke still kicks a chosen device
+- Optional TOTP 2FA (password still unlocks the vault if stolen)

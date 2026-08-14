@@ -77,9 +77,11 @@ on invite; no mid-call renegotiation); camera on/off mid-call is signaled via
 the relayed `call:media` type. Only SDP/ICE crosses the server; media is
 DTLS-SRTP peer-to-peer.
 
-**Realtime.** One WebSocket hub (`back-end/websocket/`). Clients must `join` a
-chat room to receive its messages. `call:*` types are relayed 1:1 rather than
-broadcast.
+**Realtime.** One WebSocket hub (`back-end/websocket/`). Multiple devices per
+account stay connected (keyed by connection id; same `device_id` replaces the
+previous socket). Clients must `join` a chat room to receive its messages.
+`call:*` types are relayed 1:1 (and to the sender's other devices on
+answer/reject/end).
 
 ## Gotchas
 
@@ -129,17 +131,11 @@ These each cost hours. Most are not discoverable by reading the code.
   Verify with `nm -C --defined-only libdatachannel.a | grep srtp_`.
 
 ### Backend / WebSocket
-- **`Hub.Clients` is keyed by user id alone - one live connection per account.**
-  A second login for the same user overwrites the first, and when that second
-  connection drops it used to `delete` the entry unconditionally, evicting the
-  connection that was still live. The survivor stays connected but unregistered:
-  no error, no reconnect, silently receiving nothing until restarted.
-  Unregister now only evicts when the stored client *is* the departing one.
-- **Never point a test harness at an account a real client is signed into.**
-  Because of the above, doing so knocks that client off the hub and makes it
-  look like the feature under test is broken. This burned a whole debugging
-  round - the Windows app appeared to ignore `call:reject` when in fact it was
-  receiving nothing at all.
+- **Same `device_id` replaces the previous socket** for that install (reconnect).
+  Other devices for the same account stay connected. Answer/reject/end on one
+  device is echoed to the account's other sockets so they stop ringing.
+- A test harness that reuses a real client's `device_id` will kick that
+  install's socket. Use a distinct device id for harnesses.
 
 ### Android
 - **A Hilt `@AndroidEntryPoint` BroadcastReceiver injects nothing on its own.**
@@ -198,12 +194,15 @@ theories.
 
 ## Known gaps
 
-- **coturn is configured but has never been started** (`docker-compose.yml`,
-  `turnserver.conf`). Calls work on a LAN; users behind different NATs need
-  TURN. `TURN_HOST` still defaults to `localhost`, which is unreachable from a
-  phone.
+- **TURN:** `GET /calls/ice-servers` advertises the API Host (not `localhost`)
+  when `TURN_HOST` is loopback, so a phone talking to a LAN IP gets
+  `turn:<that-ip>:3478`. Start coturn with `docker compose up -d coturn` in
+  `back-end/` (`TURN_SECRET` must match `.env`). Cross-NAT still needs
+  `TURN_EXTERNAL_IP` / a public `TURN_HOST` and those UDP/TCP ports forwarded.
+  Windows must parse `turn:host:port?transport=` itself (`QUrl` does not) and
+  set `enableIceTcp` so TCP TURN is actually gathered.
 - Group calls are full mesh (max 4); audio and video. Video uses lower
   capture settings on Android (480×360@15); Windows encodes VP8 once and
   fans RTP to each peer. Cross-NAT still needs TURN (same as 1:1).
-- Video calls have no RTCP feedback loop on Windows (no NACK/PLI); recovery
- from packet loss relies on the ~2s periodic keyframe.
+- Windows video advertises NACK/PLI and forces a keyframe on PLI (and
+  requests one after decode loss). Periodic keyframes remain a fallback.

@@ -1336,7 +1336,9 @@ Item {
     function onMessageReceived(chatId, message) {
         if (authService !== undefined && message.senderId === authService.currentUserId) return
 
-        var preview = chatService.decryptMessage(chatId, message.content, message.encrypted === true)
+        var preview = chatService.decryptMessage(chatId, message.content, message.encrypted === true,
+                                                 message.senderId || "", message.keyVersion || 0,
+                                                 message.encryptionVersion || 1, message.senderDeviceId || "")
         // Always refresh the snippet - even for the open chat. Skipping that
         // used to leave the sidebar stuck on whatever was last when the chat
         // was opened. Only the unread badge is suppressed for the active chat

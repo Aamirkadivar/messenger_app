@@ -24,7 +24,11 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import com.messenger.app.ui.theme.Tokens
+import com.messenger.app.ui.pairing.PairingQr
+import com.messenger.app.ui.pairing.PairingQrScanDialog
+import com.messenger.app.data.encryption.E2ECrypto
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -46,6 +50,7 @@ import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Videocam
@@ -69,6 +74,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -139,6 +145,11 @@ fun ChatScreen(
     val recording by viewModel.recording.collectAsStateWithLifecycle()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
     val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
+    val safetyNumber by viewModel.safetyNumber.collectAsStateWithLifecycle()
+    val pendingPeerKeyChange by viewModel.pendingPeerKeyChange.collectAsStateWithLifecycle()
+    val safetyVerified by viewModel.safetyVerified.collectAsStateWithLifecycle()
+    var showSafetyNumber by remember { mutableStateOf(false) }
+    var showSafetyScan by remember { mutableStateOf(false) }
     var messageText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
@@ -380,6 +391,19 @@ fun ChatScreen(
                             Icon(Icons.Filled.Call, contentDescription = "Call $chatName")
                         }
                     }
+                    if (!isGroup) {
+                        IconButton(onClick = {
+                            viewModel.reloadSafetyNumber()
+                            showSafetyNumber = true
+                        }) {
+                            Icon(
+                                Icons.Filled.Lock,
+                                contentDescription = if (safetyVerified) "Encryption verified" else "Encryption",
+                                tint = if (safetyVerified) MaterialTheme.colorScheme.primary
+                                else LocalContentColor.current
+                            )
+                        }
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
             )
@@ -503,6 +527,31 @@ fun ChatScreen(
                 baseOpacity = 0f
             )
             Column(modifier = Modifier.fillMaxSize()) {
+                if (pendingPeerKeyChange && !isGroup) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = MaterialTheme.colorScheme.errorContainer
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(
+                                "Security code changed. Messages still encrypt to the previous key until you accept.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                TextButton(onClick = { showSafetyNumber = true }) {
+                                    Text("Verify")
+                                }
+                                TextButton(onClick = { viewModel.acceptPeerKeyChange() }) {
+                                    Text("Accept new code")
+                                }
+                            }
+                        }
+                    }
+                }
                 LazyColumn(
                     state = listState,
                     modifier = Modifier
@@ -660,8 +709,73 @@ fun ChatScreen(
         }
     }
 
-    // Drawn last, so it sits above the app bar, the message list and the
-    // composer rather than behind them.
+    if (showSafetyNumber && !isGroup) {
+        AlertDialog(
+            onDismissRequest = { showSafetyNumber = false },
+            title = { Text("Encryption") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        "Compare this code with $chatName on their device, or scan their QR. If it matches, no one in the middle has swapped keys."
+                    )
+                    if (safetyVerified) {
+                        Text("Verified on this device.", fontWeight = FontWeight.Medium)
+                    }
+                    val qr = remember(safetyNumber) {
+                        safetyNumber?.let { E2ECrypto.safetyNumberQrPayload(it) }?.let { PairingQr.toImageBitmap(it, 320) }
+                    }
+                    if (qr != null) {
+                        Image(
+                            bitmap = qr,
+                            contentDescription = "Security code QR",
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(220.dp)
+                        )
+                    }
+                    Text(
+                        text = safetyNumber ?: "Keys aren’t ready yet. Open this chat once while online.",
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val code = safetyNumber
+                    if (!code.isNullOrBlank()) {
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("security code", code))
+                        Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                    }
+                    showSafetyNumber = false
+                }) { Text("Copy") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { showSafetyScan = true }) { Text("Scan") }
+                    TextButton(onClick = { showSafetyNumber = false }) { Text("Close") }
+                }
+            }
+        )
+    }
+
+    if (showSafetyScan) {
+        PairingQrScanDialog(
+            title = "Scan security code",
+            onDismiss = { showSafetyScan = false },
+            onCode = { raw ->
+                viewModel.onSafetyNumberScanned(raw) { ok ->
+                    showSafetyScan = false
+                    Toast.makeText(
+                        context,
+                        if (ok) "Security codes match" else "Codes do not match",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        )
+    }
     if (showForwardPicker) {
         ForwardChatPickerSheet(
             chats = chatList.chats.filter { it.id != chatId },

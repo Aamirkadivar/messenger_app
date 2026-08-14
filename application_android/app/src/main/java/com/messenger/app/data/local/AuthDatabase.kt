@@ -23,7 +23,7 @@ import com.messenger.app.data.local.entity.UserEntity
         UserEntity::class,
         CachedChatEntity::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = true
 )
 abstract class AuthDatabase : RoomDatabase() {

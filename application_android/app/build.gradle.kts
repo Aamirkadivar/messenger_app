@@ -184,6 +184,10 @@ dependencies {
     implementation(libs.androidx.camera.video)
     implementation(libs.androidx.camera.view)
 
+    // Device-pairing QR encode + camera scan
+    implementation(libs.zxing.core)
+    implementation(libs.mlkit.barcode.scanning)
+
     // Media3 - ExoPlayer for round-video playback. Note: media3-transformer is
     // NOT available offline here, so compression uses MediaCodec/MediaMuxer
     // from the platform SDK instead (see VideoCompressor).

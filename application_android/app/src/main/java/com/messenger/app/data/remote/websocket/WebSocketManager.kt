@@ -34,6 +34,9 @@ data class IncomingChatMessage(
     val durationMs: Long = 0,
     /** Which of the sender's group Sender Key versions encrypted this message. */
     val keyVersion: Int = 0,
+    /** Direct-chat protocol: 1 = static box, 2 = ephemeral box. */
+    val encryptionVersion: Int = 1,
+    val senderDeviceId: String = "",
     val replyToId: String = "",
     val isForwarded: Boolean = false,
     val forwardedFromName: String = "",
@@ -99,19 +102,28 @@ data class IncomingPresence(
 
 class WebSocketManager private constructor(
     private val serverUrl: String,
-    private val tokenProvider: () -> String?
+    private val tokenProvider: () -> String?,
+    private val deviceIdProvider: () -> String? = { null }
 ) {
     companion object {
         private const val TAG = "WebSocketManager"
-        private const val RECONNECT_DELAY = 3000L
+        /** First retry is fast; later attempts back off (Telegram-style). */
+        private const val RECONNECT_DELAY = 1000L
         private const val MAX_RECONNECT_DELAY = 30000L
+        private const val CONNECT_WATCHDOG_MS = 20_000L
+        /** Detect half-open sockets; Java-WebSocket pings at this interval. */
+        private const val CONNECTION_LOST_TIMEOUT_SEC = 20
 
         @Volatile
         private var instance: WebSocketManager? = null
 
-        fun getInstance(serverUrl: String, tokenProvider: () -> String?): WebSocketManager {
+        fun getInstance(
+            serverUrl: String,
+            tokenProvider: () -> String?,
+            deviceIdProvider: () -> String? = { null }
+        ): WebSocketManager {
             return instance ?: synchronized(this) {
-                instance ?: WebSocketManager(serverUrl, tokenProvider).also { instance = it }
+                instance ?: WebSocketManager(serverUrl, tokenProvider, deviceIdProvider).also { instance = it }
             }
         }
 
@@ -123,12 +135,16 @@ class WebSocketManager private constructor(
 
     enum class ConnectionState { CONNECTED, CONNECTING, DISCONNECTED, RECONNECTING }
 
+    private val lock = Any()
     private var webSocketClient: WebSocketClient? = null
     private var isConnected: Boolean = false
     private var isConnecting: Boolean = false
     private var reconnectAttempts: Int = 0
     private var shuttingDown: Boolean = false
     private val joinedChats = mutableSetOf<String>()
+    private val reconnectScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var reconnectJob: Job? = null
+    private var connectWatchdog: Job? = null
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
@@ -153,74 +169,129 @@ class WebSocketManager private constructor(
     val callSignals: SharedFlow<IncomingCallSignal> = _callSignals.asSharedFlow()
 
     fun connect() {
-        if (isConnected || isConnecting) {
-            Log.w(TAG, "Already connected or connecting")
-            return
-        }
-
         val token = tokenProvider()
+        synchronized(lock) {
+            if (shuttingDown) {
+                shuttingDown = false
+            }
+            if (isConnected || isConnecting) {
+                Log.d(TAG, "Already connected or connecting")
+                return
+            }
+            if (token.isNullOrEmpty()) {
+                Log.w(TAG, "No authentication token; will retry")
+                _connectionState.value = ConnectionState.RECONNECTING
+            } else {
+                isConnecting = true
+                _connectionState.value = ConnectionState.CONNECTING
+            }
+        }
         if (token.isNullOrEmpty()) {
-            Log.e(TAG, "No authentication token available")
-            _connectionState.value = ConnectionState.DISCONNECTED
+            scheduleReconnect()
             return
         }
-
-        shuttingDown = false
-        isConnecting = true
-        _connectionState.value = ConnectionState.CONNECTING
 
         val uri = buildWsUri(token)
         val draft: Draft = Draft_6455(listOf(DefaultExtension()))
 
-        webSocketClient = object : WebSocketClient(uri, draft) {
+        val client = object : WebSocketClient(uri, draft) {
             override fun onOpen(handshake: ServerHandshake?) {
-                Log.d(TAG, "WebSocket connected")
-                isConnected = true
-                isConnecting = false
-                reconnectAttempts = 0
+                synchronized(lock) {
+                    if (webSocketClient !== this) return
+                    Log.d(TAG, "WebSocket connected")
+                    isConnected = true
+                    isConnecting = false
+                    reconnectAttempts = 0
+                }
+                reconnectJob?.cancel()
+                connectWatchdog?.cancel()
                 _connectionState.value = ConnectionState.CONNECTED
                 rejoinChats()
             }
 
             override fun onMessage(text: String?) {
+                if (webSocketClient !== this) return
                 text?.let { handleMessage(it) }
             }
 
             override fun onMessage(bytes: java.nio.ByteBuffer?) {
+                if (webSocketClient !== this) return
                 bytes?.let { handleMessage(String(it.array())) }
             }
 
             override fun onClose(code: Int, reason: String?, remote: Boolean) {
-                Log.w(TAG, "WebSocket closed: code=$code, reason=$reason")
-                isConnected = false
-                _connectionState.value = ConnectionState.DISCONNECTED
-                if (remote && !shuttingDown) scheduleReconnect()
+                synchronized(lock) {
+                    if (webSocketClient !== this) return
+                }
+                Log.w(TAG, "WebSocket closed: code=$code reason=$reason remote=$remote")
+                handleSocketFailure()
             }
 
             override fun onError(ex: Exception?) {
+                synchronized(lock) {
+                    if (webSocketClient !== this) return
+                }
                 Log.e(TAG, "WebSocket error: ${ex?.message}")
-                isConnected = false
-                isConnecting = false
-                _connectionState.value = ConnectionState.DISCONNECTED
-                if (!shuttingDown) scheduleReconnect()
+                handleSocketFailure()
+            }
+        }
+        client.connectionLostTimeout = CONNECTION_LOST_TIMEOUT_SEC
+
+        synchronized(lock) {
+            val previous = webSocketClient
+            webSocketClient = client
+            if (previous != null && previous !== client) {
+                try {
+                    previous.close()
+                } catch (_: Exception) {
+                }
             }
         }
 
         try {
-            webSocketClient?.connect()
+            client.connect()
+            startConnectWatchdog()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to connect: ${e.message}")
-            isConnecting = false
-            _connectionState.value = ConnectionState.DISCONNECTED
-            scheduleReconnect()
+            handleSocketFailure()
         }
     }
 
+    /**
+     * Immediate retry when the network returns or the app is foregrounded.
+     * Does nothing if already connected or a handshake is in progress — tearing
+     * those down is what left the emulator stuck on "Connecting…".
+     */
+    fun nudgeReconnect() {
+        synchronized(lock) {
+            if (shuttingDown || isConnected || isConnecting) return
+            reconnectAttempts = 0
+        }
+        reconnectJob?.cancel()
+        connect()
+    }
+
+    /** Start a connect only if we are fully idle (not connected, not handshaking). */
+    fun ensureConnected() {
+        synchronized(lock) {
+            if (shuttingDown || isConnected || isConnecting) return
+        }
+        connect()
+    }
+
     fun disconnect() {
-        shuttingDown = true
-        webSocketClient?.close()
+        synchronized(lock) {
+            shuttingDown = true
+            isConnected = false
+            isConnecting = false
+        }
+        reconnectJob?.cancel()
+        connectWatchdog?.cancel()
+        try {
+            webSocketClient?.close()
+        } catch (_: Exception) {
+        }
         webSocketClient = null
-        isConnected = false
         joinedChats.clear()
         _connectionState.value = ConnectionState.DISCONNECTED
         Log.d(TAG, "WebSocket disconnected")
@@ -248,14 +319,27 @@ class WebSocketManager private constructor(
     fun isHealthy(): Boolean = isConnected
 
     /**
-     * Build the WS URL from the origin only - API_BASE_URL includes the /api/v1
-     * REST path, but the backend's WebSocket route is just /ws (see main.go).
+     * Build the WS URL from the origin only. [serverUrl] is the REST base
+     * (`http://host:3000/api/v1/`); the hub is `GET /ws`, not `/api/v1/ws`.
+     * Hitting the REST prefix never upgrades, so the UI stays on Connecting.
      */
     private fun buildWsUri(token: String): URI {
-        val httpUri = URI(serverUrl)
-        val scheme = if (httpUri.scheme == "https") "wss" else "ws"
-        val port = if (httpUri.port != -1) ":${httpUri.port}" else ""
-        return URI("$scheme://${httpUri.host}$port/ws?token=$token")
+        var origin = serverUrl.trim()
+        val apiIdx = origin.indexOf("/api/")
+        if (apiIdx >= 0) origin = origin.substring(0, apiIdx)
+        origin = origin.trimEnd('/')
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+        val deviceId = deviceIdProvider()?.takeIf { it.isNotBlank() }
+        val qs = buildString {
+            append("token=").append(java.net.URLEncoder.encode(token, "UTF-8"))
+            if (deviceId != null) {
+                append("&device_id=").append(java.net.URLEncoder.encode(deviceId, "UTF-8"))
+            }
+        }
+        val uri = URI("$origin/ws?$qs")
+        Log.d(TAG, "WS connect $origin/ws")
+        return uri
     }
 
     private fun rejoinChats() {
@@ -310,6 +394,8 @@ class WebSocketManager private constructor(
                         fileSize = data.optLong("file_size", 0),
                         durationMs = data.optLong("duration_ms", 0),
                         keyVersion = data.optInt("key_version", 0),
+                        encryptionVersion = data.optInt("encryption_version", 1).let { if (it == 0) 1 else it },
+                        senderDeviceId = data.optString("sender_device_id"),
                         replyToId = data.optString("reply_to_id"),
                         isForwarded = data.optBoolean("is_forwarded", false),
                         forwardedFromName = data.optString("forwarded_from_name"),
@@ -393,26 +479,62 @@ class WebSocketManager private constructor(
         }
     }
 
+    private fun handleSocketFailure() {
+        val shouldRetry: Boolean
+        synchronized(lock) {
+            isConnected = false
+            isConnecting = false
+            shouldRetry = !shuttingDown
+        }
+        connectWatchdog?.cancel()
+        if (shouldRetry) {
+            scheduleReconnect()
+        } else {
+            _connectionState.value = ConnectionState.DISCONNECTED
+        }
+    }
+
+    private fun startConnectWatchdog() {
+        connectWatchdog?.cancel()
+        connectWatchdog = reconnectScope.launch {
+            delay(CONNECT_WATCHDOG_MS)
+            val stillTrying: Boolean
+            synchronized(lock) {
+                stillTrying = isConnecting && !isConnected && !shuttingDown
+                if (stillTrying) isConnecting = false
+            }
+            if (stillTrying) {
+                Log.w(TAG, "Connect timed out; retrying")
+                try {
+                    webSocketClient?.close()
+                } catch (_: Exception) {
+                }
+                scheduleReconnect()
+            }
+        }
+    }
+
     private fun scheduleReconnect() {
-        reconnectAttempts++
+        if (synchronized(lock) { shuttingDown }) return
+        if (reconnectJob?.isActive == true) return
+
+        val attempt: Int
+        synchronized(lock) {
+            reconnectAttempts++
+            attempt = reconnectAttempts
+        }
         _connectionState.value = ConnectionState.RECONNECTING
 
-        // Back off exponentially up to MAX_RECONNECT_DELAY, then keep retrying
-        // at that interval forever. This deliberately never gives up: it used
-        // to stop after 10 attempts (~2.5 min), and since reconnectAttempts
-        // only resets on a successful connect, any outage longer than that
-        // left the app silently offline until it was manually restarted -
-        // messages stopped arriving and incoming calls rang against nobody,
-        // with nothing in the UI saying so.
-        // The shift is clamped separately from the minOf: at ~63 attempts
-        // 1L shl n overflows to a negative delay, which would busy-loop.
-        val exponent = (reconnectAttempts - 1).coerceIn(0, 20)
-        val delay = minOf(MAX_RECONNECT_DELAY, RECONNECT_DELAY * (1L shl exponent))
-        val jitter = (Math.random() * 0.25 * delay).toLong()
+        val exponent = (attempt - 1).coerceIn(0, 20)
+        val delayMs = minOf(MAX_RECONNECT_DELAY, RECONNECT_DELAY * (1L shl exponent))
+        val jitter = (Math.random() * 0.25 * delayMs).toLong()
+        Log.d(TAG, "Reconnect in ${delayMs + jitter}ms (attempt $attempt)")
 
-        CoroutineScope(Dispatchers.IO).launch {
-            delay(delay + jitter)
-            if (!isConnected) connect()
+        reconnectJob = reconnectScope.launch {
+            delay(delayMs + jitter)
+            if (synchronized(lock) { shuttingDown || isConnected }) return@launch
+            synchronized(lock) { isConnecting = false }
+            connect()
         }
     }
 }

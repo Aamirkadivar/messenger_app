@@ -3,6 +3,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import QtQuick.Dialogs
+import Messenger 1.0
 
 Item {
     id: chatViewRoot
@@ -49,6 +50,8 @@ Item {
     property string otherUserId: ""
     property bool isOnline: false
     readonly property bool isGroupChat: currentChatType === "group"
+    property bool peerKeyPending: false
+    property bool safetyVerified: false
     property bool typingIndicator: false
     property string typingUser: ""
     // Telegram-style bar above the first unread incoming message for this open.
@@ -83,7 +86,21 @@ Item {
             isLoadingMore = true
             chatService.fetchMessages(currentChatId)
             websocketService.joinChat(currentChatId)
+            peerKeyPending = !isGroupChat && chatService.hasPendingPeerKeyChange(currentChatId)
+            safetyVerified = !isGroupChat && chatService.hasVerifiedSafetyNumber(currentChatId)
+        } else {
+            peerKeyPending = false
+            safetyVerified = false
         }
+    }
+
+    function openSafetyDialog() {
+        safetyNumberText.text = chatService.safetyNumberForChat(chatViewRoot.currentChatId)
+        safetyQrImage.source = ""
+        safetyQrImage.source = chatService.safetyNumberQrUrl(chatViewRoot.currentChatId)
+        chatViewRoot.safetyVerified = chatService.hasVerifiedSafetyNumber(chatViewRoot.currentChatId)
+        safetyScanStatus.text = ""
+        safetyDialog.open()
     }
 
     Connections {
@@ -139,7 +156,9 @@ Item {
                                          isMine, isRead, m.fileUrl, m.durationMs, m.voiceEncrypted, m.id,
                                          m.fileType, m.fileName, m.fileSize, m.thumbnailUrl,
                                          m.rawContent, m.encrypted, m.keyVersion,
-                                         m.isForwarded === true, m.forwardedFromName || "", m.replyToId || "")
+                                         m.encryptionVersion || 1,
+                                         m.isForwarded === true, m.forwardedFromName || "", m.replyToId || "",
+                                         m.senderDeviceId || "")
                 if (!isMine && (!m.readAt || m.readAt.length === 0)) {
                     unreadCount++
                     if (firstUnreadIndex === -1) {
@@ -187,6 +206,7 @@ Item {
                                      true, false, message.fileUrl, message.durationMs,
                                      message.encrypted === true, message.id, "audio", "", 0, "",
                                      "", message.encrypted === true, message.keyVersion || 0,
+                                     message.encryptionVersion || 1,
                                      message.isForwarded === true, message.forwardedFromName || "", message.replyToId || "")
         }
 
@@ -203,6 +223,7 @@ Item {
                                      message.encrypted === true, message.id, "video_note", "", 0,
                                      message.thumbnailUrl || "",
                                      "", message.encrypted === true, message.keyVersion || 0,
+                                     message.encryptionVersion || 1,
                                      message.isForwarded === true, message.forwardedFromName || "", message.replyToId || "")
             scrollAfterSend.restart()
         }
@@ -217,6 +238,7 @@ Item {
                                      message.encrypted === true, message.id,
                                      message.fileType, message.fileName, message.fileSize, "",
                                      "", message.encrypted === true, message.keyVersion || 0,
+                                     message.encryptionVersion || 1,
                                      message.isForwarded === true, message.forwardedFromName || "", message.replyToId || "")
         }
 
@@ -239,11 +261,13 @@ Item {
 
         function onSecurityCodeChanged(chatId, contactName) {
             if (chatId !== chatViewRoot.currentChatId) return
-            // Consume the same pending entry onMessagesFetched would
-            // otherwise replay later (e.g. navigating away and back) -
-            // it's being shown right now instead.
             chatService.takePendingSecurityNotice(chatId)
             chatViewRoot.addSystemMessage("🔒 Your security code with " + contactName + " changed.")
+            chatViewRoot.peerKeyPending = true
+        }
+        function onPeerKeyChangePendingChanged(chatId) {
+            if (chatId === chatViewRoot.currentChatId)
+                chatViewRoot.peerKeyPending = chatService.hasPendingPeerKeyChange(chatId)
         }
     }
 
@@ -590,7 +614,8 @@ Item {
                            || message.fileType === "file" || message.fileType === "video_note")
                           && message.fileUrl && message.fileUrl.length > 0
             var text = hasFile ? "" : chatService.decryptMessage(chatId, message.content, message.encrypted === true,
-                                                                  message.senderId, message.keyVersion || 0)
+                                                                  message.senderId, message.keyVersion || 0,
+                                                                  message.encryptionVersion || 1, message.senderDeviceId || "")
             chatViewRoot.addMessage(message.senderId, chatViewRoot.currentChatName, text,
                                      chatViewRoot.formatTime(message.createdAt), false, false,
                                      hasFile ? message.fileUrl : "", message.durationMs,
@@ -599,7 +624,9 @@ Item {
                                      message.thumbnailUrl || "",
                                      hasFile ? "" : message.content,
                                      message.encrypted === true, message.keyVersion || 0,
-                                     message.isForwarded === true, message.forwardedFromName || "", message.replyToId || "")
+                                     message.encryptionVersion || 1,
+                                     message.isForwarded === true, message.forwardedFromName || "", message.replyToId || "",
+                                     message.senderDeviceId || "")
             // This chat is already open and visible, so the message that just
             // arrived counts as read immediately - onCurrentChatIdChanged only
             // fires when switching chats, not for new messages in one already open.
@@ -924,6 +951,51 @@ Item {
                     }
                 }
 
+                // Encryption / security code (direct chats).
+                Rectangle {
+                    Layout.preferredWidth: 36
+                    Layout.preferredHeight: 36
+                    radius: 9
+                    visible: !chatViewRoot.isGroupChat && chatViewRoot.currentChatId.length > 0
+                    color: lockMouse.containsPress ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.2) : (lockMouse.containsMouse ? Qt.rgba(chatViewRoot.accentColor.r, chatViewRoot.accentColor.g, chatViewRoot.accentColor.b, 0.1) : "transparent")
+                    Behavior on color {
+                        enabled: !chatViewRoot.instantThemeActive
+                        ColorAnimation { duration: 100 }
+                    }
+
+                    Canvas {
+                        id: lockIcon
+                        anchors.centerIn: parent
+                        width: 14
+                        height: 16
+                        Connections {
+                            target: chatViewRoot
+                            function onTextSecondaryChanged() { lockIcon.requestPaint() }
+                        }
+                        Component.onCompleted: requestPaint()
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.strokeStyle = chatViewRoot.textSecondary
+                            ctx.fillStyle = chatViewRoot.textSecondary
+                            ctx.lineWidth = 1.6
+                            ctx.beginPath()
+                            ctx.arc(7, 6, 4, Math.PI, 0, false)
+                            ctx.stroke()
+                            ctx.beginPath()
+                            ctx.roundedRect(2, 7, 10, 8, 2, 2)
+                            ctx.fill()
+                        }
+                    }
+                    MouseArea {
+                        id: lockMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: chatViewRoot.openSafetyDialog()
+                    }
+                }
+
                 // More options - group info panel. Direct chats have nothing
                 // here yet (no contact-info screen has been built), so the
                 // button is only shown when there's somewhere for it to go.
@@ -1048,16 +1120,66 @@ Item {
                 baseColor: chatViewRoot.bgColor
                 baseOpacity: 0
                 patternColor: chatViewRoot.accentColor
-                // The same alpha reads much fainter against a pale background
-                // than a near-black one, so light mode needs a bit more to
-                // land at the same visual weight (same lesson as the hover
-                // highlights and input pills earlier).
                 patternOpacity: chatViewRoot.darkMode ? 0.05 : 0.09
+            }
+
+            Rectangle {
+                id: keyChangeBanner
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                visible: chatViewRoot.peerKeyPending && !chatViewRoot.isGroupChat
+                height: visible ? bannerCol.implicitHeight + 16 : 0
+                color: Qt.rgba(0.75, 0.2, 0.15, chatViewRoot.darkMode ? 0.35 : 0.18)
+                Column {
+                    id: bannerCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: 8
+                    spacing: 6
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        color: chatViewRoot.textColor
+                        font.pixelSize: 12
+                        text: "Security code changed. Messages still encrypt to the previous key until you accept."
+                    }
+                    Row {
+                        spacing: 12
+                        Text {
+                            text: "Verify"
+                            color: chatViewRoot.accentColor
+                            font.pixelSize: 13
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: chatViewRoot.openSafetyDialog()
+                            }
+                        }
+                        Text {
+                            text: "Accept new code"
+                            color: chatViewRoot.accentColor
+                            font.pixelSize: 13
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    chatService.acceptPeerKeyChange(chatViewRoot.currentChatId)
+                                    chatViewRoot.peerKeyPending = false
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
         ListView {
             id: messagesListView
-            anchors.fill: parent
+            anchors.top: keyChangeBanner.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
             anchors.rightMargin: 14
             clip: true
             spacing: 2
@@ -1242,7 +1364,9 @@ Item {
                         if (!model.rawContent || model.rawContent.length === 0) return model.messageText
                         return chatService.decryptMessage(chatViewRoot.currentChatId, model.rawContent,
                                                           model.rawEncrypted, model.senderId,
-                                                          model.rawKeyVersion)
+                                                          model.rawKeyVersion,
+                                                          model.rawEncryptionVersion || 1,
+                                                          model.rawSenderDeviceId || "")
                     }
                     messageTime: model.messageTime
                     isMine: model.isMine
@@ -1257,6 +1381,7 @@ Item {
                     messageId: model.messageId
                     senderId: model.senderId
                     keyVersion: model.rawKeyVersion || 0
+                    encryptionVersion: model.rawEncryptionVersion || 1
                     voiceUrl: model.voiceUrl
                     voiceDurationMs: model.voiceDurationMs
                     voiceEncrypted: model.voiceEncrypted
@@ -1898,7 +2023,7 @@ Item {
                         var localId = "local-" + Date.now()
                         chatViewRoot.addMessage(authService.currentUserId, "Me", text, chatViewRoot.formatTime(new Date().toISOString()), true, false,
                                                  "", 0, false, localId, "", "", 0, "",
-                                                 "", false, 0, false, "", replyId)
+                                                 "", false, 0, 1, false, "", replyId)
                         chatViewRoot.queueOutgoingText(localId, chatViewRoot.currentChatId, text,
                                                        chatViewRoot.currentChatType, replyId)
                         chatViewRoot.clearReply()
@@ -2217,7 +2342,7 @@ Item {
             chatViewRoot.addMessage(authService.currentUserId, "Me", item.text,
                                     chatViewRoot.formatTime(new Date().toISOString()), true, false,
                                     "", 0, false, item.localId, "", "", 0, "",
-                                    "", false, 0, false, "", item.replyToId || "")
+                                    "", false, 0, 1, false, "", item.replyToId || "")
         }
         chatViewRoot.pendingOutgoing = q.slice()
     }
@@ -2272,7 +2397,8 @@ Item {
 
     function addMessage(senderId, senderName, text, time, isMine, isRead, fileUrl, fileDurationMs, fileEncrypted,
                          messageId, contentType, fileName, fileSize, thumbnailUrl,
-                         rawContent, rawEncrypted, rawKeyVersion, isForwarded, forwardedFromName, replyToId) {
+                         rawContent, rawEncrypted, rawKeyVersion, rawEncryptionVersion,
+                         isForwarded, forwardedFromName, replyToId, senderDeviceId) {
         const prev = messagesModel.count > 0 ? messagesModel.get(messagesModel.count - 1) : null
         const showSender = !isMine && (!prev || prev.senderId !== senderId)
         // Sampled BEFORE the append, because appending changes contentHeight
@@ -2293,6 +2419,8 @@ Item {
             rawContent: rawContent || "",
             rawEncrypted: rawEncrypted === true,
             rawKeyVersion: rawKeyVersion || 0,
+            rawEncryptionVersion: rawEncryptionVersion || 1,
+            rawSenderDeviceId: senderDeviceId || "",
             messageTime: time,
             isMine: isMine,
             isRead: isRead === true,
@@ -2471,6 +2599,7 @@ Item {
             rawContent: "",
             rawEncrypted: false,
             rawKeyVersion: 0,
+            rawEncryptionVersion: 1,
             messageTime: "",
             isMine: false,
             isRead: false,
@@ -2567,6 +2696,7 @@ Item {
                 encrypted: row.voiceEncrypted === true || row.rawEncrypted === true,
                 senderId: row.senderId || "",
                 keyVersion: row.rawKeyVersion || 0,
+                encryptionVersion: row.rawEncryptionVersion || 1,
                 fileName: row.fileName || "",
                 fileSize: row.fileSize || 0,
                 durationMs: row.voiceDurationMs || 0,
@@ -2897,6 +3027,149 @@ MenuItem {
             onCancelRequested: chatViewRoot.cancelCapture()
             onPauseRequested: roundVideoService.togglePause()
             onFlipRequested: roundVideoService.switchCamera()
+        }
+    }
+
+    PairingQrScanner {
+        id: safetyQrScanner
+        onPreviewFrame: function(image) { safetyScanPreview.present(image) }
+        onCodeFound: function(code) {
+            var result = chatService.compareSafetyNumberScan(chatViewRoot.currentChatId, code)
+            if (result === "match") {
+                chatViewRoot.safetyVerified = true
+                safetyScanStatus.text = "Security codes match."
+                safetyQrScanner.stop()
+                safetyScanPreview.clear()
+            } else if (result === "mismatch") {
+                safetyScanStatus.text = "Codes do not match."
+            } else {
+                safetyScanStatus.text = "Not a security-code QR."
+            }
+        }
+    }
+
+    Dialog {
+        id: safetyDialog
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(360, chatViewRoot.width - 40)
+        padding: 16
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        title: ""
+        onClosed: {
+            safetyQrScanner.stop()
+            safetyScanPreview.clear()
+        }
+
+        background: GlassPanel {
+            darkMode: chatViewRoot.darkMode
+            radius: 12
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            Text {
+                Layout.fillWidth: true
+                text: "Encryption"
+                font.pixelSize: 16
+                font.bold: true
+                color: chatViewRoot.textColor
+            }
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: "Compare this code with " + chatViewRoot.currentChatName + " on their device, or scan their QR. If it matches, no one in the middle has swapped keys."
+                font.pixelSize: 13
+                color: chatViewRoot.textSecondary
+            }
+            Text {
+                visible: chatViewRoot.safetyVerified
+                Layout.fillWidth: true
+                text: "Verified on this device."
+                font.pixelSize: 13
+                color: chatViewRoot.accentColor
+            }
+            Image {
+                id: safetyQrImage
+                Layout.alignment: Qt.AlignHCenter
+                Layout.preferredWidth: 200
+                Layout.preferredHeight: 200
+                fillMode: Image.PreserveAspectFit
+                cache: false
+            }
+            Text {
+                id: safetyNumberText
+                Layout.fillWidth: true
+                font.family: "Consolas"
+                font.pixelSize: 13
+                font.bold: true
+                color: chatViewRoot.textColor
+                text: ""
+            }
+            Text {
+                id: safetyScanStatus
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pixelSize: 12
+                color: chatViewRoot.accentColor
+                text: ""
+            }
+            VideoFrame {
+                id: safetyScanPreview
+                Layout.fillWidth: true
+                Layout.preferredHeight: safetyQrScanner.scanning ? 180 : 0
+                visible: safetyQrScanner.scanning
+                fillMode: VideoFrame.Cover
+            }
+            RowLayout {
+                Layout.alignment: Qt.AlignRight
+                spacing: 16
+                Text {
+                    text: safetyQrScanner.scanning ? "Stop scan" : "Scan"
+                    font.pixelSize: 13
+                    color: chatViewRoot.accentColor
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -6
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (safetyQrScanner.scanning) {
+                                safetyQrScanner.stop()
+                                safetyScanPreview.clear()
+                            } else {
+                                safetyScanStatus.text = ""
+                                safetyQrScanner.start()
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: "Copy"
+                    font.pixelSize: 13
+                    color: chatViewRoot.accentColor
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -6
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            chatViewRoot.copyTextToClipboard(safetyNumberText.text)
+                            safetyDialog.close()
+                        }
+                    }
+                }
+                Text {
+                    text: "Close"
+                    font.pixelSize: 13
+                    color: chatViewRoot.textSecondary
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -6
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: safetyDialog.close()
+                    }
+                }
+            }
         }
     }
 

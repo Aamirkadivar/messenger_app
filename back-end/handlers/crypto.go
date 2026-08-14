@@ -3,6 +3,7 @@ package handlers
 import (
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -10,6 +11,19 @@ import (
 	"messenger-app/middleware"
 	"messenger-app/models"
 )
+
+func publicKeysEqual(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+// identityChangeBlocked is true when a client tries to replace an already
+// published identity and the account already has a vault or a live device.
+func identityChangeBlocked(existing, incoming string, hasVault, hasLiveDevice bool) bool {
+	if existing == "" || publicKeysEqual(existing, incoming) {
+		return false
+	}
+	return hasVault || hasLiveDevice
+}
 
 // CryptoHandler handles cryptographic operations
 type CryptoHandler struct{}
@@ -46,7 +60,23 @@ func (h *CryptoHandler) SavePublicKey(c *fiber.Ctx) error {
 		})
 	}
 
-	// Update user's public key
+	var user models.User
+	if err := database.DB.Select("id", "public_key").First(&user, "id = ?", userID).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "User not found"})
+	}
+
+	if user.PublicKey != "" && !publicKeysEqual(user.PublicKey, input.PublicKey) {
+		var vaultCount, deviceCount int64
+		database.DB.Model(&models.E2EEVault{}).Where("user_id = ?", userID).Count(&vaultCount)
+		database.DB.Model(&models.E2EEDevice{}).Where("user_id = ? AND revoked_at IS NULL", userID).Count(&deviceCount)
+		if identityChangeBlocked(user.PublicKey, input.PublicKey, vaultCount > 0, deviceCount > 0) {
+			return c.Status(http.StatusConflict).JSON(fiber.Map{
+				"error":   "identity_locked",
+				"message": "This account already has an E2EE identity. Unlock the vault on this device instead of publishing a new key.",
+			})
+		}
+	}
+
 	if err := database.DB.Model(&models.User{}).Where("id = ?", userID).
 		Select("public_key"). // Only update public_key, ignore other fields
 		Update("public_key", input.PublicKey).Error; err != nil {

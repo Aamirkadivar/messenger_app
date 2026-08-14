@@ -10,16 +10,16 @@
 | Go backend | golang.org/x/crypto/nacl/box | Relay + verify harness only |
 
 ## Shared requirements
-- Same vault CBOR schema
+- Same vault JSON schema (Phase 5; CBOR deferred)
 - Same suite / kdf identifiers
-- Same Argon2id parameter set (benchmarked; document chosen m/t/p)
+- Same Argon2id parameter set: m=65536 KiB (64 MiB), t=3, **p=1**, dklen=32
 - Same device registration semantics
-- Canonical test vectors in `test-vectors/e2ee/`
+- Canonical test vectors in `test-vectors/e2ee/` (wire v1/v2, sender-key secretbox, vault AEAD, KDFs). Verify with `cd back-end && go test ./e2ee/`
 
 ## Development aids (temporary)
 
 ### DEV 2FA code relay
-**Problem:** 2FA does not exist yet; tester needs a way to receive codes during development.
+**Problem:** Testers without an authenticator app need a way to receive codes during development. Production accounts should enable TOTP in Settings.
 
 **Plan (env-gated only):**
 - `DEV_2FA_RELAY_USERNAME=koueosh` (or similar)

@@ -84,7 +84,14 @@ class MessengerApplication : Application() {
 
         val senderName = resolveChatName(message.chatId)
         // Decrypt the E2EE ciphertext for the notification preview.
-        val text = chatRepository.decryptFor(message.chatId, message.content, message.encrypted)
+        val text = chatRepository.decryptFor(
+            message.chatId,
+            message.content,
+            message.encrypted,
+            message.senderId,
+            message.keyVersion,
+            message.encryptionVersion
+        )
 
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK

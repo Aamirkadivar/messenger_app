@@ -49,6 +49,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.messenger.app.R
 import com.messenger.app.ui.components.AmbientGlow
 import com.messenger.app.ui.components.Avatar
+import com.messenger.app.ui.components.ChatPeekDialog
 import com.messenger.app.ui.components.ConnectionStatusBanner
 import com.messenger.app.ui.components.GlassSurface
 import com.messenger.app.data.remote.websocket.WebSocketManager
@@ -78,6 +79,8 @@ fun ChatListScreen(
     var menuChat by remember { mutableStateOf<ChatListItemUi?>(null) }
     var pendingDelete by remember { mutableStateOf<ChatListItemUi?>(null) }
     var pendingBlock by remember { mutableStateOf<ChatListItemUi?>(null) }
+    // Non-null while the avatar peek is open for that chat.
+    var peekChat by remember { mutableStateOf<ChatListItemUi?>(null) }
     val listState by chatViewModel.chatListState.collectAsStateWithLifecycle()
     val sessionExpired by chatViewModel.sessionExpired.collectAsStateWithLifecycle()
     val keyTakeover by chatViewModel.keyTakeover.collectAsStateWithLifecycle()
@@ -203,7 +206,11 @@ fun ChatListScreen(
                                 ChatRow(
                                     chat,
                                     onClick = { onChatClick(chat.id, chat.name, chat.isGroup) },
-                                    onLongClick = { menuChat = chat }
+                                    onLongClick = { menuChat = chat },
+                                    onAvatarLongPress = {
+                                        peekChat = chat
+                                        chatViewModel.loadPreview(chat.id)
+                                    }
                                 )
                             }
                         }
@@ -221,6 +228,26 @@ fun ChatListScreen(
             )
         }
     }
+    }
+
+    peekChat?.let { chat ->
+        val previewMessages by chatViewModel.previewMessages.collectAsStateWithLifecycle()
+        val previewLoading by chatViewModel.previewLoading.collectAsStateWithLifecycle()
+        ChatPeekDialog(
+            chatName = chat.name,
+            avatarUrl = chat.avatarUrl,
+            messages = previewMessages,
+            loading = previewLoading,
+            onDismiss = {
+                peekChat = null
+                chatViewModel.clearPreview()
+            },
+            onOpenChat = {
+                peekChat = null
+                chatViewModel.clearPreview()
+                onChatClick(chat.id, chat.name, chat.isGroup)
+            }
+        )
     }
 
     menuChat?.let { chat ->
@@ -367,7 +394,12 @@ private fun KeyTakeoverBanner(onDismiss: () -> Unit) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ChatRow(chat: ChatListItemUi, onClick: () -> Unit, onLongClick: () -> Unit) {
+private fun ChatRow(
+    chat: ChatListItemUi,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    onAvatarLongPress: () -> Unit = {}
+) {
     val haptics = LocalHapticFeedback.current
     val dark = MessengerExtendedColors.isDark
     val accent = MaterialTheme.colorScheme.primary
@@ -545,7 +577,22 @@ private fun ChatRow(chat: ChatListItemUi, onClick: () -> Unit, onLongClick: () -
                                 CircleShape
                             )
                     )
-                    Avatar(name = chat.name, avatarUrl = chat.avatarUrl, size = 48.dp)
+                    // Holding the picture peeks at the conversation; holding
+                    // anywhere else on the row still opens the action sheet.
+                    Avatar(
+                        name = chat.name,
+                        avatarUrl = chat.avatarUrl,
+                        size = 48.dp,
+                        modifier = Modifier.combinedClickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = onClick,
+                            onLongClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                onAvatarLongPress()
+                            }
+                        )
+                    )
                     if (chat.isOnline) {
                         Box(
                             modifier = Modifier

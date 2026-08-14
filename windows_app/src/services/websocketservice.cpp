@@ -6,10 +6,14 @@
 #include <QDebug>
 #include <QUrlQuery>
 #include <QDateTime>
+#include <QNetworkInformation>
+#include <QRandomGenerator>
 
 namespace {
 constexpr int kHealthCheckIntervalMs = 12000;
-constexpr qint64 kStaleConnectionMs = 26000; // ~2 missed health checks
+constexpr qint64 kStaleConnectionMs = 26000;
+constexpr int kReconnectDelayMinMs = 1000;
+constexpr int kReconnectDelayMaxMs = 30000;
 }
 
 WebSocketService::WebSocketService(QObject* parent)
@@ -17,13 +21,31 @@ WebSocketService::WebSocketService(QObject* parent)
 {
     m_serverUrl = Config::websocketUrl();
 
-    m_reconnectTimer.setSingleShot(false);
-    m_reconnectTimer.setInterval(Config::reconnectDelayMs());
+    m_reconnectTimer.setSingleShot(true);
     connect(&m_reconnectTimer, &QTimer::timeout, this, &WebSocketService::onReconnect);
 
     m_healthTimer.setSingleShot(false);
     m_healthTimer.setInterval(kHealthCheckIntervalMs);
     connect(&m_healthTimer, &QTimer::timeout, this, &WebSocketService::checkConnectionHealth);
+
+    QNetworkInformation::loadDefaultBackend();
+    if (auto* net = QNetworkInformation::instance()) {
+        connect(net, &QNetworkInformation::reachabilityChanged, this,
+                [this](QNetworkInformation::Reachability reach) {
+            if (!m_autoReconnect || m_token.isEmpty()) return;
+            if (reach == QNetworkInformation::Reachability::Online ||
+                reach == QNetworkInformation::Reachability::Site ||
+                reach == QNetworkInformation::Reachability::Local) {
+                m_reconnectAttempts = 0;
+                if (!isConnected() && !m_reconnectTimer.isActive())
+                    scheduleReconnect();
+                else if (!isConnected()) {
+                    m_reconnectTimer.stop();
+                    onReconnect();
+                }
+            }
+        });
+    }
 }
 
 WebSocketService::~WebSocketService() {
@@ -51,6 +73,9 @@ void WebSocketService::connectToServer(const QString& token) {
     QUrl url(m_serverUrl);
     QUrlQuery query;
     query.addQueryItem(QStringLiteral("token"), m_token);
+    if (!m_deviceId.isEmpty()) {
+        query.addQueryItem(QStringLiteral("device_id"), m_deviceId);
+    }
     url.setQuery(query);
 
     m_webSocket->open(url);
@@ -134,6 +159,8 @@ void WebSocketService::rejoinRooms() {
 void WebSocketService::onConnected() {
     qDebug() << "[WebSocketService] Connected";
     m_hasConnectedBefore = true;
+    m_reconnectAttempts = 0;
+    m_reconnectTimer.stop();
     noteActivity();
     m_healthTimer.start();
     setConnectionState(QStringLiteral("connected"));
@@ -150,7 +177,7 @@ void WebSocketService::onDisconnected() {
     emit connectedChanged();
     if (m_autoReconnect) {
         emit connectionAttemptFailed();
-        m_reconnectTimer.start();
+        scheduleReconnect();
     }
 }
 
@@ -180,6 +207,9 @@ void WebSocketService::onTextMessageReceived(const QString& message) {
         m["durationMs"] = static_cast<qint64>(data[QStringLiteral("duration_ms")].toDouble(0));
         m["thumbnailUrl"] = data[QStringLiteral("thumbnail_url")].toString();
         m["keyVersion"] = data[QStringLiteral("key_version")].toInt(0);
+        int encVer = data[QStringLiteral("encryption_version")].toInt(1);
+        m["encryptionVersion"] = encVer <= 0 ? 1 : encVer;
+        m["senderDeviceId"] = data[QStringLiteral("sender_device_id")].toString();
         m["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
         m["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
         m["forwardedFromMessageId"] = data[QStringLiteral("forwarded_from_message_id")].toString();
@@ -222,8 +252,23 @@ void WebSocketService::onError(QAbstractSocket::SocketError /*error*/) {
     // fires for it - re-check here too so the UI doesn't miss the update.
     if (m_connectionState != QStringLiteral("connected")) {
         setConnectionState(m_autoReconnect ? nextRetryState() : QStringLiteral("disconnected"));
+        if (m_autoReconnect && !m_reconnectTimer.isActive())
+            scheduleReconnect();
     }
     emit connectedChanged();
+}
+
+void WebSocketService::scheduleReconnect() {
+    if (!m_autoReconnect || isConnected() || m_token.isEmpty()) return;
+    if (m_reconnectTimer.isActive()) return;
+
+    const int exp = qMin(m_reconnectAttempts, 10);
+    int delay = kReconnectDelayMinMs * (1 << exp);
+    if (delay > kReconnectDelayMaxMs) delay = kReconnectDelayMaxMs;
+    const int jitter = QRandomGenerator::global()->bounded(qMax(1, delay / 4));
+    ++m_reconnectAttempts;
+    qDebug() << "[WebSocketService] Reconnect in" << (delay + jitter) << "ms (attempt" << m_reconnectAttempts << ")";
+    m_reconnectTimer.start(delay + jitter);
 }
 
 void WebSocketService::onReconnect() {

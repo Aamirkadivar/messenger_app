@@ -50,6 +50,16 @@ QString CredentialManager::getToken(const QString& key) const {
     return value;
 }
 
+QMap<QString, QString> CredentialManager::tokensWithPrefix(const QString& prefix) const {
+    m_mutex.lock();
+    QMap<QString, QString> out;
+    for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it) {
+        if (it.key().startsWith(prefix)) out.insert(it.key(), it.value());
+    }
+    m_mutex.unlock();
+    return out;
+}
+
 bool CredentialManager::saveToken(const QString& key, const QString& value) {
     m_mutex.lock();
     m_tokens[key] = value;
@@ -125,15 +135,13 @@ void CredentialManager::clearAllTokens() {
     emit tokenChanged();
 }
 
-bool CredentialManager::saveUser(const QString& userId, const QString& username, const QString& pubKey, const QString& privKey) {
-    QString userKey = QString("user_%1").arg(userId);
+bool CredentialManager::saveUser(const QString& userId, const QString& username, const QString& pubKey) {
     QString pubKeyKey = QString("pubkey_%1").arg(userId);
-    QString privKeyKey = QString("privkey_%1").arg(userId);
     QString usernameKey = QString("username_%1").arg(userId);
 
     saveToken(pubKeyKey, pubKey);
-    saveToken(privKeyKey, privKey);
     saveToken(usernameKey, username);
+    removeToken(QString("privkey_%1").arg(userId));
 
     // Save user metadata as persistent data
     QString userDataPath = m_dataPath + "/users";
@@ -144,7 +152,6 @@ bool CredentialManager::saveUser(const QString& userId, const QString& username,
     userObj["id"] = userId;
     userObj["username"] = username;
     userObj["pubKey"] = pubKey;
-    userObj["privKey"] = privKey;
     
     QJsonDocument doc(userObj);
     QFile dataFile(filePath);
@@ -158,18 +165,32 @@ bool CredentialManager::saveUser(const QString& userId, const QString& username,
 
 void CredentialManager::loadLocalStore() {
     if (m_localStoreLoaded) return;
-    
+
     QFile file(m_dataPath + "/credentials.json");
     if (!file.exists()) {
         m_localStoreLoaded = true;
         return;
     }
 
+    bool migratedPlaintext = false;
     if (file.open(QIODevice::ReadOnly)) {
         QByteArray data = file.readAll();
         file.close();
 
-        QJsonDocument doc = QJsonDocument::fromJson(data);
+        QByteArray jsonBytes;
+        if (data.startsWith("DP1\n")) {
+            jsonBytes = dpapiDecrypt(data.mid(4));
+            if (jsonBytes.isEmpty()) {
+                qWarning() << "[CredentialManager] DPAPI decrypt of credentials.json failed";
+                m_localStoreLoaded = true;
+                return;
+            }
+        } else {
+            jsonBytes = data;
+            migratedPlaintext = true;
+        }
+
+        QJsonDocument doc = QJsonDocument::fromJson(jsonBytes);
         if (doc.isObject()) {
             QJsonObject obj = doc.object();
             QJsonObject tokens = obj["tokens"].toObject();
@@ -179,6 +200,9 @@ void CredentialManager::loadLocalStore() {
         }
     }
     m_localStoreLoaded = true;
+    if (migratedPlaintext && !m_tokens.isEmpty()) {
+        saveLocalStore();
+    }
 }
 
 void CredentialManager::saveLocalStore() {
@@ -191,11 +215,17 @@ void CredentialManager::saveLocalStore() {
     }
     obj["tokens"] = tokens;
 
-    QJsonDocument doc(obj);
+    const QByteArray json = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    const QByteArray sealed = dpapiEncrypt(json);
+    if (sealed.isEmpty()) {
+        qWarning() << "[CredentialManager] DPAPI encrypt failed; not writing plaintext credentials.json";
+        return;
+    }
 
     QFile file(m_dataPath + "/credentials.json");
     if (file.open(QIODevice::WriteOnly)) {
-        file.write(doc.toJson(QJsonDocument::Indented));
+        file.write("DP1\n");
+        file.write(sealed);
         file.close();
     }
 }
@@ -248,8 +278,8 @@ QByteArray CredentialManager::dpapiEncrypt(const QByteArray& data) {
     inData.cbData = data.size();
     
     QByteArray output;
-    if (CryptProtectData(&inData, L"MessengerAppCredential", nullptr, nullptr, nullptr, 
-                         CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN, &outData)) {
+    if (CryptProtectData(&inData, L"MessengerAppCredential", nullptr, nullptr, nullptr,
+                         CRYPTPROTECT_UI_FORBIDDEN, &outData)) {
         output = QByteArray(reinterpret_cast<char*>(outData.pbData), outData.cbData);
         LocalFree(outData.pbData);
     }
@@ -268,8 +298,8 @@ QByteArray CredentialManager::dpapiDecrypt(const QByteArray& data) const {
     inData.cbData = data.size();
     
     QByteArray output;
-    if (CryptUnprotectData(&inData, nullptr, nullptr, nullptr, nullptr, 
-                           CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN, &outData)) {
+    if (CryptUnprotectData(&inData, nullptr, nullptr, nullptr, nullptr,
+                           CRYPTPROTECT_UI_FORBIDDEN, &outData)) {
         output = QByteArray(reinterpret_cast<char*>(outData.pbData), outData.cbData);
         LocalFree(outData.pbData);
     }

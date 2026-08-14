@@ -196,8 +196,10 @@ shimmer = { group = "com.facebook.shimmer", name = "shimmer", version.ref = "shi
 # Glide (Image Loading)
 glide = { group = "com.github.bumptech.glide", name = "glide", version.ref = "glide" }
 
-# Permission
+# Permission / barcode
 permission-launcher = { group = "com.google.android.gms", name = "play-services-mlkit-barcode-scanning", version = "18.3.0" }
+mlkit-barcode-scanning = { group = "com.google.android.gms", name = "play-services-mlkit-barcode-scanning", version = "18.3.0" }
+zxing-core = { group = "com.google.zxing", name = "core", version = "3.5.3" }
 
 # Kotlin
 kotlin-stdlib = { group = "org.jetbrains.kotlin", name = "kotlin-stdlib", version.ref = "kotlinStdlib" }

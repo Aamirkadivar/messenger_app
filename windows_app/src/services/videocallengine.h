@@ -82,6 +82,9 @@ public:
     // Same for a group mesh peer - reassembly/decode are isolated per peerId.
     void handleRtpFromPeer(const QString& peerId, const QByteArray& packet);
 
+    // Next encoded frame will be a keyframe (RTCP PLI/FIR from the peer).
+    void requestKeyframe();
+
 signals:
     // Both are emitted on the GUI thread, sized for display (the local one is
     // the same image that gets encoded, so the self-view shows exactly what
@@ -115,6 +118,7 @@ private:
         uint32_t rxTimestamp = 0;
         bool rxActive = false;
         QMap<uint16_t, RxPart> rxParts;
+        qint64 lastPliMs = -1;
     };
 
     void onCaptureFrame(const QImage& image);
@@ -132,6 +136,7 @@ private:
     void tryAssembleFrameInto(PeerRx& rx, const QString& peerId);
     void decodeFrameInto(PeerRx& rx, const QByteArray& frame, const QString& peerId);
     void destroyPeerRx(PeerRx& rx);
+    void maybeRequestRemoteKeyframe(std::shared_ptr<rtc::Track> track, qint64& lastPliMs);
 
     // ---- capture ----
     QMediaCaptureSession m_session;
@@ -153,6 +158,8 @@ private:
     // Until a keyframe arrives (first frame, or the first after loss), delta
     // frames reference state the decoder doesn't have and only produce smear.
     bool m_waitingForKeyframe = true;
+    bool m_forceKeyframe = false;
+    qint64 m_lastPliMs = -1;
 
     // ---- RTP (1:1) ----
     std::shared_ptr<rtc::Track> m_track;

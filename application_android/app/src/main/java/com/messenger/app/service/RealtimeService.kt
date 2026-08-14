@@ -8,10 +8,19 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import com.messenger.app.R
 import com.messenger.app.data.call.CallRepository
 import com.messenger.app.data.repository.ChatRepository
@@ -49,9 +58,32 @@ class RealtimeService : Service() {
     @Inject
     lateinit var tokenManager: TokenManager
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val healthCheck = object : Runnable {
+        override fun run() {
+            if (tokenManager.isAuthenticated()) {
+                chatRepository.ensureRealtime()
+            }
+            mainHandler.postDelayed(this, HEALTH_CHECK_MS)
+        }
+    }
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            if (tokenManager.isAuthenticated()) chatRepository.nudgeRealtime()
+        }
+    }
+
+    private val foregroundObserver = object : DefaultLifecycleObserver {
+        override fun onStart(owner: LifecycleOwner) {
+            if (tokenManager.isAuthenticated()) chatRepository.nudgeRealtime()
+        }
+    }
+
     companion object {
         private const val NOTIFICATION_ID = 4243
         private const val CHANNEL_ID = "messenger_service"
+        private const val HEALTH_CHECK_MS = 15_000L
 
         /** Safe to call repeatedly - a second start just re-runs onStartCommand. */
         fun start(context: Context) {
@@ -66,11 +98,12 @@ class RealtimeService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannelIfNeeded()
+        registerNetworkCallback()
+        ProcessLifecycleOwner.get().lifecycle.addObserver(foregroundObserver)
+        mainHandler.postDelayed(healthCheck, HEALTH_CHECK_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // startForeground has to happen promptly whatever we decide below, or
-        // the system kills us for not becoming foreground in time.
         startForegroundCompat()
 
         if (!tokenManager.isAuthenticated()) {
@@ -79,12 +112,36 @@ class RealtimeService : Service() {
         }
 
         chatRepository.connectRealtime()
-        // START_STICKY so the system brings the connection back after it
-        // reclaims memory - the whole point is surviving without the UI.
         return START_STICKY
     }
 
+    override fun onDestroy() {
+        mainHandler.removeCallbacks(healthCheck)
+        ProcessLifecycleOwner.get().lifecycle.removeObserver(foregroundObserver)
+        unregisterNetworkCallback()
+        super.onDestroy()
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun registerNetworkCallback() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        try {
+            cm.registerNetworkCallback(request, networkCallback)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        try {
+            cm.unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) {
+        }
+    }
 
     private fun startForegroundCompat() {
         val notification = buildNotification()
@@ -120,8 +177,6 @@ class RealtimeService : Service() {
         val manager = getSystemService(NotificationManager::class.java) ?: return
         if (manager.getNotificationChannel(CHANNEL_ID) != null) return
         manager.createNotificationChannel(
-            // MIN keeps the permanent notification collapsed and silent - it is
-            // a status indicator the system requires, not something to read.
             NotificationChannel(CHANNEL_ID, "Background connection", NotificationManager.IMPORTANCE_MIN).apply {
                 description = "Keeps the app reachable for calls and messages"
                 setShowBadge(false)
