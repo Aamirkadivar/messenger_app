@@ -2,132 +2,292 @@
 
 #ifdef Q_OS_WIN
 
+#include <QQuickItem>
 #include <QQuickWindow>
 #include <QTimer>
+#include <QMetaObject>
+#include <dwmapi.h>
+#include <shellapi.h>
 #include <windows.h>
 #include <windowsx.h>
-#include <shellapi.h>
+
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWCP_ROUND
+#define DWMWCP_ROUND 2
+#endif
+#ifndef DWMWCP_DONOTROUND
+#define DWMWCP_DONOTROUND 1
+#endif
 
 namespace {
 
-// Thickness of the invisible resize border Windows keeps around a
-// WS_THICKFRAME window. Needed to inset the client area when maximized -
-// otherwise a maximized frameless window overhangs the monitor on every side
-// by this much and the edges of the UI are cut off.
 int resizeBorderX() {
     return ::GetSystemMetrics(SM_CXSIZEFRAME) + ::GetSystemMetrics(SM_CXPADDEDBORDER);
 }
+
 int resizeBorderY() {
     return ::GetSystemMetrics(SM_CYSIZEFRAME) + ::GetSystemMetrics(SM_CXPADDEDBORDER);
 }
 
-// True when an auto-hiding taskbar is docked on [edge] of the monitor the
-// window is on. A maximized window has to leave a sliver of space there, or
-// the taskbar can never be re-summoned by pointing at that edge.
 bool hasAutoHideTaskbar(UINT edge, const RECT& monitorRect) {
     APPBARDATA data{};
     data.cbSize = sizeof(data);
     data.uEdge = edge;
     data.rc = monitorRect;
-    // Returns the auto-hide bar's HWND as a UINT_PTR, 0 when there is none.
     return ::SHAppBarMessage(ABM_GETAUTOHIDEBAREX, &data) != 0;
 }
 
+bool itemContainsWindowPoint(QQuickItem* item, const QPointF& windowPos) {
+    if (!item || !item->isVisible() || item->width() <= 0 || item->height() <= 0)
+        return false;
+    const QPointF local = item->mapFromItem(nullptr, windowPos);
+    return item->contains(local);
+}
+
 } // namespace
+
+Win11Frameless::Win11Frameless(QObject* parent)
+    : QObject(parent) {}
 
 void Win11Frameless::applyTo(QQuickWindow* window) {
     if (!window) return;
     auto hwnd = reinterpret_cast<HWND>(window->winId());
     if (!hwnd) return;
 
-    // Put back everything FramelessWindowHint took away. WS_CAPTION looks
-    // wrong to add to a frameless window, but nothing is ever drawn from it -
-    // WM_NCCALCSIZE below collapses the non-client area to nothing. It has to
-    // be present for the shell to treat this as a real, snappable window.
+    m_window = window;
+    m_hwnd = reinterpret_cast<quintptr>(hwnd);
+
     LONG_PTR style = ::GetWindowLongPtr(hwnd, GWL_STYLE);
-    style |= WS_OVERLAPPEDWINDOW; // CAPTION | SYSMENU | THICKFRAME | MIN/MAXIMIZEBOX
+    style |= WS_OVERLAPPEDWINDOW;
     ::SetWindowLongPtr(hwnd, GWL_STYLE, style);
 
-    // Force the frame to be recalculated now, so WM_NCCALCSIZE runs against
-    // the new style rather than at some arbitrary later point.
+    extendDwmFrame();
+    updateCornerPreference(::IsZoomed(hwnd));
+
     ::SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
-    // Re-assert maximized state if Qt believes the window is maximized but
-    // Windows no longer agrees. Swapping the window style above drops the
-    // native maximized flag, while Qt goes on reporting Maximized - and that
-    // split makes the maximize button need two clicks: the first only flips
-    // Qt's property (so the icon changes but nothing moves), and the second
-    // finally performs the real transition.
-    //
-    // Deferred to the next event-loop pass as well as checked immediately:
-    // ApplicationWindow's declarative `visibility: "Maximized"` is applied
-    // asynchronously, so when this runs straight after engine.load() the
-    // property is often not Maximized yet and an immediate check alone
-    // silently does nothing.
     const auto syncMaximizedState = [window, hwnd]() {
-        if (window->visibility() == QWindow::Maximized && !::IsZoomed(hwnd)) {
+        if (window->visibility() == QWindow::Maximized && !::IsZoomed(hwnd))
             ::ShowWindow(hwnd, SW_MAXIMIZE);
-        }
     };
-
     syncMaximizedState();
     QTimer::singleShot(0, window, syncMaximizedState);
+}
+
+void Win11Frameless::bindChrome(QQuickItem* titleBar,
+                                QQuickItem* settingsButton,
+                                QQuickItem* minimizeButton,
+                                QQuickItem* maximizeButton,
+                                QQuickItem* closeButton) {
+    m_titleBar = titleBar;
+    m_settingsButton = settingsButton;
+    m_minimizeButton = minimizeButton;
+    m_maximizeButton = maximizeButton;
+    m_closeButton = closeButton;
+}
+
+void Win11Frameless::extendDwmFrame() const {
+    if (!m_hwnd) return;
+    auto hwnd = reinterpret_cast<HWND>(m_hwnd);
+    MARGINS margins{1, 1, 1, 1};
+    ::DwmExtendFrameIntoClientArea(hwnd, &margins);
+}
+
+void Win11Frameless::updateCornerPreference(bool maximized) const {
+    if (!m_hwnd) return;
+    auto hwnd = reinterpret_cast<HWND>(m_hwnd);
+    DWORD preference = maximized ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
+    ::DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference, sizeof(preference));
+}
+
+bool Win11Frameless::isOurWindow(void* hwnd) const {
+    return m_hwnd && reinterpret_cast<quintptr>(hwnd) == m_hwnd;
+}
+
+void Win11Frameless::setMaximizeHovered(bool hovered) {
+    if (m_maximizeHovered == hovered) return;
+    m_maximizeHovered = hovered;
+    // Do not emit from WM_NCHITTEST: updating QML (color/layout) on that
+    // stack re-enters the scene graph and can abort the process.
+    QMetaObject::invokeMethod(this, [this]() {
+        emit maximizeHoveredChanged();
+    }, Qt::QueuedConnection);
+}
+
+void Win11Frameless::applyWorkArea(void* nccalcParams) const {
+    auto* params = static_cast<NCCALCSIZE_PARAMS*>(nccalcParams);
+    RECT& clientRect = params->rgrc[0];
+    auto hwnd = reinterpret_cast<HWND>(m_hwnd);
+
+    HMONITOR monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!monitor) {
+        clientRect.left += resizeBorderX();
+        clientRect.right -= resizeBorderX();
+        clientRect.top += resizeBorderY();
+        clientRect.bottom -= resizeBorderY();
+        return;
+    }
+
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!::GetMonitorInfoW(monitor, &mi)) {
+        clientRect.left += resizeBorderX();
+        clientRect.right -= resizeBorderX();
+        clientRect.top += resizeBorderY();
+        clientRect.bottom -= resizeBorderY();
+        return;
+    }
+
+    clientRect = mi.rcWork;
+    if (hasAutoHideTaskbar(ABE_TOP, mi.rcMonitor) && clientRect.top <= mi.rcMonitor.top)
+        clientRect.top += 1;
+    if (hasAutoHideTaskbar(ABE_BOTTOM, mi.rcMonitor) && clientRect.bottom >= mi.rcMonitor.bottom)
+        clientRect.bottom -= 1;
+    if (hasAutoHideTaskbar(ABE_LEFT, mi.rcMonitor) && clientRect.left <= mi.rcMonitor.left)
+        clientRect.left += 1;
+    if (hasAutoHideTaskbar(ABE_RIGHT, mi.rcMonitor) && clientRect.right >= mi.rcMonitor.right)
+        clientRect.right -= 1;
+}
+
+void Win11Frameless::applyMaxTrackSize(void* minMaxInfo) const {
+    auto hwnd = reinterpret_cast<HWND>(m_hwnd);
+    auto* info = static_cast<MINMAXINFO*>(minMaxInfo);
+    HMONITOR monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!monitor) return;
+
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!::GetMonitorInfoW(monitor, &mi)) return;
+
+    info->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
+    info->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
+    info->ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
+    info->ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
+
+    if (m_window) {
+        const qreal dpr = m_window->devicePixelRatio();
+        info->ptMinTrackSize.x = qRound(m_window->minimumWidth() * dpr);
+        info->ptMinTrackSize.y = qRound(m_window->minimumHeight() * dpr);
+    }
+}
+
+qintptr Win11Frameless::hitTest(void* message) const {
+    auto* msg = static_cast<MSG*>(message);
+    auto hwnd = reinterpret_cast<HWND>(m_hwnd);
+    const bool maximized = ::IsZoomed(hwnd);
+
+    POINT native{GET_X_LPARAM(msg->lParam), GET_Y_LPARAM(msg->lParam)};
+    POINT clientPt = native;
+    ::ScreenToClient(hwnd, &clientPt);
+
+    RECT rc{};
+    ::GetClientRect(hwnd, &rc);
+
+    // WM_NCHITTEST reports physical screen pixels, while QQuickItem geometry -
+    // and anything mapFromGlobal() would hand back - is in logical pixels. The
+    // two only agree at 100% scaling; at 125% the unconverted point landed a
+    // quarter of the way past the window's right edge, so no caption button
+    // ever matched. That silently disabled the whole native-chrome path: no
+    // HTMAXBUTTON, so no hover state on the maximize button and no Snap
+    // Layouts flyout, and no WM_NCLBUTTONDOWN either - since that button
+    // deliberately takes no clicks in QML, only the title bar's own
+    // double-click-to-maximize was left working.
+    // clientPt is already relative to the client area, which WM_NCCALCSIZE has
+    // made the whole window, so scaling it is all the conversion needed.
+    QPointF windowPos;
+    if (m_window) {
+        const qreal dpr = m_window->devicePixelRatio();
+        windowPos = QPointF(clientPt.x / dpr, clientPt.y / dpr);
+    }
+
+    // Caption buttons beat the resize strip so they stay clickable along the
+    // top edge.
+    //
+    // The maximize button reports HTCLIENT rather than HTMAXBUTTON, which
+    // costs the Win11 Snap Layouts flyout. HTMAXBUTTON hands the pointer to
+    // Windows' caption-button machinery, and that path crashes the process
+    // (0xc0000005 inside this filter) within seconds of the button first
+    // being hovered. It went unnoticed because the hit test used to compare a
+    // physical-pixel point against logical-pixel item geometry, so on any
+    // scaled display no button ever matched and HTMAXBUTTON was never
+    // returned - the native chrome was dead code. Fixing the coordinates woke
+    // it up, along with the crash. Until that is diagnosed against a debug
+    // build, QML owns the button: it handles its own hover and clicks.
+    if (itemContainsWindowPoint(m_maximizeButton, windowPos)
+        || itemContainsWindowPoint(m_minimizeButton, windowPos)
+        || itemContainsWindowPoint(m_closeButton, windowPos)
+        || itemContainsWindowPoint(m_settingsButton, windowPos))
+        return HTCLIENT;
+
+    if (!maximized) {
+        const int bx = resizeBorderX();
+        const int by = resizeBorderY();
+        const bool left = clientPt.x < bx;
+        const bool right = clientPt.x >= rc.right - bx;
+        const bool top = clientPt.y < by;
+        const bool bottom = clientPt.y >= rc.bottom - by;
+        if (top && left) return HTTOPLEFT;
+        if (top && right) return HTTOPRIGHT;
+        if (bottom && left) return HTBOTTOMLEFT;
+        if (bottom && right) return HTBOTTOMRIGHT;
+        if (left) return HTLEFT;
+        if (right) return HTRIGHT;
+        if (top) return HTTOP;
+        if (bottom) return HTBOTTOM;
+    }
+
+    return HTCLIENT;
 }
 
 bool Win11Frameless::nativeEventFilter(const QByteArray& eventType, void* message, qintptr* result) {
     if (eventType != QByteArrayLiteral("windows_generic_MSG")) return false;
 
     auto* msg = static_cast<MSG*>(message);
-    if (!msg || !msg->hwnd) return false;
+    if (!msg || !isOurWindow(msg->hwnd)) return false;
 
     switch (msg->message) {
-    case WM_NCCALCSIZE: {
-        // wParam FALSE means only a rect is being proposed, nothing to strip.
+    case WM_NCCALCSIZE:
         if (msg->wParam == FALSE) return false;
-
-        auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(msg->lParam);
-        RECT& clientRect = params->rgrc[0];
-
-        const bool maximized = ::IsZoomed(msg->hwnd);
-        if (maximized) {
-            // A maximized WS_THICKFRAME window is deliberately sized larger
-            // than the monitor by the resize border. Left as-is on a
-            // frameless window that just means the outer edges of our own UI
-            // hang off-screen, so pull the client area back in by that much.
-            clientRect.left += resizeBorderX();
-            clientRect.right -= resizeBorderX();
-            clientRect.bottom -= resizeBorderY();
-            clientRect.top += resizeBorderY();
-
-            // Keep a 1px sliver against any auto-hide taskbar edge; a window
-            // flush to the edge blocks the taskbar from being summoned back.
-            if (HMONITOR monitor = ::MonitorFromWindow(msg->hwnd, MONITOR_DEFAULTTONEAREST)) {
-                MONITORINFO mi{};
-                mi.cbSize = sizeof(mi);
-                if (::GetMonitorInfoW(monitor, &mi)) {
-                    if (hasAutoHideTaskbar(ABE_TOP, mi.rcMonitor)) clientRect.top += 1;
-                    if (hasAutoHideTaskbar(ABE_BOTTOM, mi.rcMonitor)) clientRect.bottom -= 1;
-                    if (hasAutoHideTaskbar(ABE_LEFT, mi.rcMonitor)) clientRect.left += 1;
-                    if (hasAutoHideTaskbar(ABE_RIGHT, mi.rcMonitor)) clientRect.right -= 1;
-                }
-            }
-        }
-        // Returning 0 with the rect otherwise untouched tells Windows the
-        // client area occupies the entire window - i.e. draw no frame, no
-        // caption - while the window itself stays fully styled.
+        if (::IsZoomed(reinterpret_cast<HWND>(m_hwnd)))
+            applyWorkArea(reinterpret_cast<void*>(msg->lParam));
         *result = 0;
         return true;
-    }
 
     case WM_NCHITTEST: {
-        // The QML side owns hit-testing: it has its own edge/corner
-        // MouseAreas calling startSystemResize(), and a title bar calling
-        // startSystemMove(). Report plain client area so those keep working
-        // and Windows doesn't claim the edges for itself.
-        *result = HTCLIENT;
+        const qintptr ht = hitTest(message);
+        *result = ht;
+        setMaximizeHovered(ht == HTMAXBUTTON);
         return true;
     }
+
+    case WM_NCMOUSELEAVE:
+    case WM_MOUSELEAVE:
+        setMaximizeHovered(false);
+        return false;
+
+    case WM_NCLBUTTONDOWN:
+        if (hitTest(message) == HTMAXBUTTON) {
+            QMetaObject::invokeMethod(this, [this]() {
+                if (!m_hwnd) return;
+                auto hwnd = reinterpret_cast<HWND>(m_hwnd);
+                ::ShowWindow(hwnd, ::IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+            }, Qt::QueuedConnection);
+            *result = 0;
+            return true;
+        }
+        return false;
+
+    case WM_GETMINMAXINFO:
+        applyMaxTrackSize(reinterpret_cast<void*>(msg->lParam));
+        *result = 0;
+        return true;
+
+    case WM_SIZE:
+        updateCornerPreference(msg->wParam == SIZE_MAXIMIZED);
+        return false;
 
     default:
         return false;

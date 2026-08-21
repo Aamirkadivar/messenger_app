@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.messenger.app.data.model.UserSearchResult
 import com.messenger.app.data.repository.ChatRepository
+import com.messenger.app.data.repository.MlsRepository
 import com.messenger.app.data.repository.GroupRepository
 import com.messenger.app.security.TokenManager
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -59,6 +60,7 @@ data class CreateGroupUiState(
 class CreateGroupViewModel @Inject constructor(
     private val groupRepository: GroupRepository,
     private val chatRepository: ChatRepository,
+    private val mlsRepository: MlsRepository,
     private val tokenManager: TokenManager
 ) : ViewModel() {
 
@@ -149,6 +151,18 @@ class CreateGroupViewModel @Inject constructor(
                     // Join the room so live messages and membership events for
                     // the new group arrive immediately.
                     chatRepository.joinChatRoom(group.id)
+
+                    // Establish MLS for this group: create it, then add every
+                    // member by claiming a KeyPackage each. Best-effort — if a
+                    // member has no KeyPackage published yet, the group simply
+                    // stays on Sender Keys until they can be added, rather than
+                    // failing group creation outright.
+                    chatRepository.mls = mlsRepository
+                    runCatching {
+                        mlsRepository.createGroup(group.id).getOrThrow()
+                        mlsRepository.inviteMissingDevices(group.id)
+                    }.onFailure { Log.w(TAG, "MLS group setup failed: ${it.message}") }
+
                     _state.update { it.copy(isCreating = false, createdChatId = group.id) }
                 }
                 .onFailure { e ->

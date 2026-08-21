@@ -64,11 +64,16 @@ services:
     image: coturn/coturn:4.6.2
     container_name: messenger_coturn
     restart: unless-stopped
-    command: >
-      turnserver
-      -c /etc/coturn/turnserver.conf
-      --static-auth-secret=${TURN_SECRET}
-      --external-ip=${TURN_EXTERNAL_IP:-}
+    environment:
+      TURN_SECRET: ${TURN_SECRET}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        extra=""
+        if [ -n "$$TURN_EXTERNAL_IP" ]; then extra="--external-ip=$$TURN_EXTERNAL_IP"; fi
+        exec turnserver -c /etc/coturn/turnserver.conf --static-auth-secret="$$TURN_SECRET" $$extra
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
     ports:

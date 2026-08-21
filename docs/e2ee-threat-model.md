@@ -39,7 +39,7 @@
 ## Residual risks
 - Password + recovery key both stolen → full E2EE compromise
 - Malicious server can still substitute peer public keys. Direct chats **pin** the first identity (TOFU) and keep encrypting to it if the server later reports a different key; the user must tap **Accept new code**. Safety numbers can be compared as text or via QR (`sn1.` + SHA-256 hex). A successful scan is stored as verified until the pinned key changes.
-- Attachment filenames, duration, file size, and forward attribution live in the inner `EM1` ciphertext, not in server `file_name` / `forwarded_from_name` / `duration_ms` / `file_size` columns (those are empty or zero on new sends). Coarse `content_type` remains visible to the server.
+- Attachment filenames, duration, file size, forward attribution, thumbnail URLs, and media `file_url` live in the inner `EM1` ciphertext (`th`, `fu`), not in server columns (those are empty or zero on new sends). Coarse `content_type` / `file_type` remains visible so clients know which bubbles to render.
 - Direct v2 is sender-side FS only (historical); new directs use v3 Double Ratchet
 - Multiple devices can stay signed in; revoke still kicks a chosen device
 - Optional TOTP 2FA (password still unlocks the vault if stolen)

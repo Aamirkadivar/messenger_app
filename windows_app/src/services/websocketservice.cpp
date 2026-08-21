@@ -191,6 +191,23 @@ void WebSocketService::onTextMessageReceived(const QString& message) {
     QString type = obj[QStringLiteral("type")].toString();
     QJsonObject data = obj[QStringLiteral("data")].toObject();
 
+    // Another member advanced the MLS epoch - usually because they just added
+    // this device. Without acting on it, a Welcome issued while we are running
+    // is never fetched and this device never joins the group.
+    if (type == QStringLiteral("mls:commit")) {
+        // The server puts chat_id at the TOP level for this notice (see
+        // handlers/mls.go), unlike message events which nest it under "data".
+        // Reading only data.chat_id left chatId empty, so the signal never
+        // fired and a Welcome issued while we were running was never fetched.
+        QString chatId = obj.value(QStringLiteral("chat_id")).toString();
+        if (chatId.isEmpty()) {
+            chatId = obj.value(QStringLiteral("data")).toObject()
+                        .value(QStringLiteral("chat_id")).toString();
+        }
+        if (!chatId.isEmpty()) emit mlsCommitReceived(chatId);
+        return;
+    }
+
     if (type == QStringLiteral("message")) {
         QString chatId = data[QStringLiteral("chat_id")].toString();
 

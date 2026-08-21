@@ -103,7 +103,7 @@ fun PairingQrScanDialog(
                 }
                 Spacer(Modifier.height(Tokens.Space.sm))
                 Text(
-                    text = "Point at the QR on the new device",
+                    text = "Point at the QR on the other device",
                     style = Tokens.Type.rowSubtitle,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.align(Alignment.CenterHorizontally)
@@ -158,8 +158,19 @@ private fun PairingCameraPreview(
                 val image = InputImage.fromMediaImage(media, imageProxy.imageInfo.rotationDegrees)
                 scanner.process(image)
                     .addOnSuccessListener { barcodes ->
-                        val raw = barcodes.firstOrNull()?.rawValue?.trim().orEmpty()
-                        if (raw.startsWith("mp1.") && handled.compareAndSet(false, true)) {
+                        // Accept every code this app issues. Filtering to a
+                        // single prefix here meant a valid sign-in code was
+                        // decoded and then silently dropped, so the camera just
+                        // sat there looking broken:
+                        //   mp1. = link a device to the E2EE vault
+                        //   qr1. = approve a sign-in shown on another device
+                        // Anything else (a random QR in the wild) is ignored,
+                        // and the caller re-validates before acting on it.
+                        val raw = barcodes.firstOrNull { b ->
+                            val v = b.rawValue?.trim().orEmpty()
+                            v.startsWith("mp1.") || v.startsWith("qr1.")
+                        }?.rawValue?.trim().orEmpty()
+                        if (raw.isNotEmpty() && handled.compareAndSet(false, true)) {
                             onCode(raw)
                         }
                     }

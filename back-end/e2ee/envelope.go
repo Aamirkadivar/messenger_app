@@ -17,6 +17,8 @@ type EnvelopeMeta struct {
 	ForwardedFrom  string `json:"fwd,omitempty"`
 	DurationMs     int64  `json:"dur,omitempty"`
 	FileSize       int64  `json:"sz,omitempty"`
+	ThumbnailURL   string `json:"th,omitempty"`
+	FileURL        string `json:"fu,omitempty"`
 }
 
 func WrapEM1(payload []byte, meta EnvelopeMeta) []byte {

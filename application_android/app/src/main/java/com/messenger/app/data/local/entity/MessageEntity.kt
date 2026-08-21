@@ -49,6 +49,10 @@ data class MessageEntity(
     // (see ChatRepository's group E2EE). 0 outside a group chat.
     val keyVersion: Int = 0,
     val encryptionVersion: Int = 1,
+    // Which of the sender's devices sealed this message. v3/v4 ratchet
+    // sessions are keyed by "chatId|senderDeviceId"; a cached row without it
+    // decrypts against the wrong session on reopen.
+    val senderDeviceId: String = "",
     val isForwarded: Boolean = false,
     val forwardedFromName: String = "",
     val forwardedFromMessageId: String = ""

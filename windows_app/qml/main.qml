@@ -82,8 +82,29 @@ ApplicationWindow {
         intensity: appRoot.darkMode ? 0.85 : 0.7
     }
 
-    Item {
+    ColumnLayout {
         anchors.fill: parent
+        spacing: 0
+
+        TitleBar {
+            id: titleBar
+            Layout.fillWidth: true
+            darkMode: appRoot.darkMode
+            textColor: appRoot.textColor
+            textSecondary: appRoot.textSecondary
+            surfaceColorHover: appRoot.surfaceColorHover
+            borderColor: appRoot.borderColor
+            instantTheme: appRoot.instantTheme
+            loggedIn: appRoot.isLoggedIn
+            windowMaximized: appRoot.windowMaximized
+            onSettingsClicked: settingsPanel.open()
+            onMinimizeClicked: appRoot.visibility = Window.Minimized
+            onCloseClicked: Qt.quit()
+        }
+
+        Item {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
 
         // Login/Register screens
         Loader {
@@ -106,226 +127,6 @@ ApplicationWindow {
             visible: isLoggedIn
 
             // Custom title bar
-            GlassPanel {
-                Layout.fillWidth: true
-                height: 44
-                radius: 0
-                sheen: false
-                darkMode: appRoot.darkMode
-                z: 10
-
-                RowLayout {
-                    anchors.fill: parent
-                    anchors.leftMargin: 16
-                    spacing: 8
-
-                    // The real app icon, not a drawn stand-in - this is the
-                    // same artwork as the executable's icon and the tray, so
-                    // the app looks like itself everywhere it appears.
-                    Image {
-                        Layout.preferredWidth: 22
-                        Layout.preferredHeight: 22
-                        source: "qrc:/icons/app_icon.png"
-                        // Decode above display size so it stays crisp when
-                        // Windows is scaled to 125%/150%.
-                        sourceSize: Qt.size(64, 64)
-                        fillMode: Image.PreserveAspectFit
-                        smooth: true
-                    }
-
-                    Text {
-                        text: "Messenger"
-                        font.pixelSize: 13
-                        font.bold: true
-                        color: appRoot.textColor
-                    }
-
-                    Item { id: titleSpacer; Layout.fillWidth: true }
-
-                    // Settings
-                    Rectangle {
-                        Layout.preferredWidth: 36
-                        Layout.preferredHeight: 36
-                        radius: 8
-                        visible: appRoot.isLoggedIn
-                        color: settingsMouse.containsPress ? appRoot.borderColor : (settingsMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
-                        Behavior on color {
-                            enabled: !appRoot.instantTheme
-                            ColorAnimation { duration: 100 }
-                        }
-
-                        Canvas {
-                            anchors.centerIn: parent
-                            width: 16
-                            height: 16
-                            onPaint: {
-                                var ctx = getContext("2d")
-                                ctx.reset()
-                                ctx.fillStyle = appRoot.textSecondary
-                                var cx = 8, cy = 8
-                                var bodyR = 4.6
-                                var toothLen = 2.1
-                                var toothW = 2.0
-                                var teeth = 8
-
-                                ctx.beginPath()
-                                ctx.arc(cx, cy, bodyR, 0, Math.PI * 2)
-                                ctx.fill()
-
-                                for (var i = 0; i < teeth; i++) {
-                                    var angle = (i / teeth) * Math.PI * 2
-                                    ctx.save()
-                                    ctx.translate(cx, cy)
-                                    ctx.rotate(angle)
-                                    ctx.fillRect(-toothW / 2, -(bodyR + toothLen), toothW, toothLen + 0.5)
-                                    ctx.restore()
-                                }
-
-                                // Punch the center hole through everything
-                                // drawn so far, regardless of background.
-                                ctx.globalCompositeOperation = "destination-out"
-                                ctx.beginPath()
-                                ctx.arc(cx, cy, 1.9, 0, Math.PI * 2)
-                                ctx.fill()
-                                ctx.globalCompositeOperation = "source-over"
-                            }
-                        }
-
-                        ToolTip.visible: settingsMouse.containsMouse
-                        ToolTip.text: "Settings"
-                        ToolTip.delay: 400
-
-                        MouseArea {
-                            id: settingsMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: settingsPanel.open()
-                        }
-                    }
-
-                    // Logout lives in Settings only now (with its own confirm
-                    // dialog) - having a second, unconfirmed logout icon
-                    // sitting directly beside the window's Close button was
-                    // one accidental misclick away from signing the user out.
-                    // Theme toggle also lives in Settings only.
-
-                    // Minimize
-                    Rectangle {
-                        Layout.preferredWidth: 36
-                        Layout.preferredHeight: 36
-                        radius: 8
-                        color: minMouse.containsPress ? appRoot.borderColor : (minMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
-                        Behavior on color {
-                            enabled: !appRoot.instantTheme
-                            ColorAnimation { duration: 100 }
-                        }
-
-                        Rectangle {
-                            anchors.centerIn: parent
-                            width: 10
-                            height: 1.4
-                            color: appRoot.textSecondary
-                        }
-                        MouseArea {
-                            id: minMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: appRoot.visibility = Window.Minimized
-                        }
-                    }
-
-                    // Maximize / restore
-                    Rectangle {
-                        Layout.preferredWidth: 36
-                        Layout.preferredHeight: 36
-                        radius: 8
-                        color: maxMouse.containsPress ? appRoot.borderColor : (maxMouse.containsMouse ? appRoot.surfaceColorHover : "transparent")
-                        Behavior on color {
-                            enabled: !appRoot.instantTheme
-                            ColorAnimation { duration: 100 }
-                        }
-
-                        Canvas {
-                            id: maxIcon
-                            anchors.centerIn: parent
-                            width: 12
-                            height: 12
-                            property bool maximized: appRoot.windowMaximized
-                            onMaximizedChanged: requestPaint()
-                            onPaint: {
-                                var ctx = getContext("2d")
-                                ctx.reset()
-                                ctx.strokeStyle = appRoot.textSecondary
-                                ctx.lineWidth = 1.3
-                                if (maximized) {
-                                    ctx.strokeRect(0.5, 2.5, 8, 8)
-                                    ctx.strokeRect(3.5, 0.5, 8, 8)
-                                } else {
-                                    ctx.strokeRect(0.5, 0.5, 11, 11)
-                                }
-                            }
-                        }
-                        MouseArea {
-                            id: maxMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: appRoot.toggleMaximize()
-                        }
-                    }
-
-                    // Close
-                    Rectangle {
-                        Layout.preferredWidth: 36
-                        Layout.preferredHeight: 36
-                        radius: 8
-                        color: closeMouse.containsMouse ? "#E74C3C" : "transparent"
-                        Behavior on color {
-                            enabled: !appRoot.instantTheme
-                            ColorAnimation { duration: 100 }
-                        }
-
-                        Canvas {
-                            anchors.centerIn: parent
-                            width: 12
-                            height: 12
-                            onPaint: {
-                                var ctx = getContext("2d")
-                                ctx.reset()
-                                ctx.strokeStyle = closeMouse.containsMouse ? "#FFFFFF" : appRoot.textSecondary
-                                ctx.lineWidth = 1.4
-                                ctx.lineCap = "round"
-                                ctx.beginPath(); ctx.moveTo(1, 1); ctx.lineTo(11, 11); ctx.stroke()
-                                ctx.beginPath(); ctx.moveTo(11, 1); ctx.lineTo(1, 11); ctx.stroke()
-                            }
-                        }
-                        MouseArea {
-                            id: closeMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: Qt.quit()
-                        }
-                    }
-                }
-
-                // Drag region: the title bar minus the button cluster on the
-                // right. Bound to the fill spacer's own position rather than
-                // a hardcoded width - the last version of that number went
-                // stale the moment a button was added/removed from the
-                // cluster and silently ate into (or left a gap before) the
-                // window controls.
-                MouseArea {
-                    anchors.left: parent.left
-                    anchors.top: parent.top
-                    anchors.bottom: parent.bottom
-                    width: 16 + titleSpacer.x + titleSpacer.width // 16 = the row's own anchors.leftMargin
-                    onPressed: appRoot.startSystemMove()
-                    onDoubleClicked: appRoot.toggleMaximize()
-                }
-            }
 
             RowLayout {
                 Layout.fillWidth: true
@@ -689,6 +490,7 @@ ApplicationWindow {
                 }
             }
         }
+        }
     }
     } // frostedBlurSource
     // Above the main scene and resize chrome so the scrim truly blocks hover.
@@ -713,89 +515,14 @@ ApplicationWindow {
         onLogoutRequested: logoutDialog.open()
     }
 
-    // Resize handles - a frameless window has no native resize border, so we
-    // provide thin edge/corner hit-regions that hand off to the OS's own
-    // system resize (gets the right cursor and live edge-snapping for free).
-    // z above the call overlay: otherwise an active call swallows every edge
-    // press and the window cannot be resized until the call ends.
-    Item {
-        anchors.fill: parent
-        z: 3000
-        visible: !appRoot.windowMaximized
-        // Overlay sits below these edges; disable them while a modal dialog
-        // is up so Settings (etc.) is the only active surface.
-        enabled: visible && !appRoot.modalDialogOpen
-
-        property int edgeSize: 6
-        property int cornerSize: 12
-
-        MouseArea {
-            anchors.top: parent.top; anchors.left: parent.left; anchors.right: parent.right
-            height: parent.edgeSize
-            hoverEnabled: true
-            cursorShape: Qt.SizeVerCursor
-            onPressed: appRoot.startSystemResize(Qt.TopEdge)
-        }
-        MouseArea {
-            anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right
-            height: parent.edgeSize
-            hoverEnabled: true
-            cursorShape: Qt.SizeVerCursor
-            onPressed: appRoot.startSystemResize(Qt.BottomEdge)
-        }
-        MouseArea {
-            anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
-            width: parent.edgeSize
-            hoverEnabled: true
-            cursorShape: Qt.SizeHorCursor
-            onPressed: appRoot.startSystemResize(Qt.LeftEdge)
-        }
-        MouseArea {
-            anchors.right: parent.right; anchors.top: parent.top; anchors.bottom: parent.bottom
-            width: parent.edgeSize
-            hoverEnabled: true
-            cursorShape: Qt.SizeHorCursor
-            onPressed: appRoot.startSystemResize(Qt.RightEdge)
-        }
-        MouseArea {
-            anchors.top: parent.top; anchors.left: parent.left
-            width: parent.cornerSize; height: parent.cornerSize
-            hoverEnabled: true
-            cursorShape: Qt.SizeFDiagCursor
-            onPressed: appRoot.startSystemResize(Qt.TopEdge | Qt.LeftEdge)
-        }
-        MouseArea {
-            anchors.top: parent.top; anchors.right: parent.right
-            width: parent.cornerSize; height: parent.cornerSize
-            hoverEnabled: true
-            cursorShape: Qt.SizeBDiagCursor
-            onPressed: appRoot.startSystemResize(Qt.TopEdge | Qt.RightEdge)
-        }
-        MouseArea {
-            anchors.bottom: parent.bottom; anchors.left: parent.left
-            width: parent.cornerSize; height: parent.cornerSize
-            hoverEnabled: true
-            cursorShape: Qt.SizeBDiagCursor
-            onPressed: appRoot.startSystemResize(Qt.BottomEdge | Qt.LeftEdge)
-        }
-        MouseArea {
-            anchors.bottom: parent.bottom; anchors.right: parent.right
-            width: parent.cornerSize; height: parent.cornerSize
-            hoverEnabled: true
-            cursorShape: Qt.SizeFDiagCursor
-            onPressed: appRoot.startSystemResize(Qt.BottomEdge | Qt.RightEdge)
-        }
-    }
-
     // Call overlay fills the content area under the title bar so move /
-    // minimize / maximize / close keep working. Resize edges sit above this
-    // (z: 3000). Title bar height matches the GlassPanel above (44).
+    // minimize / maximize / close keep working.
     Loader {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         anchors.top: parent.top
-        anchors.topMargin: appRoot.isLoggedIn ? 44 : 0
+        anchors.topMargin: 44
         z: 2000
         active: typeof callService !== "undefined" && callService.isActive
         sourceComponent: CallOverlay {
@@ -817,4 +544,174 @@ ApplicationWindow {
             appRoot.showMaximized()
         }
     }
+
+    // ---- Unlock encrypted messages ----
+    // Shown when this device is signed in but holds no E2EE identity - the
+    // normal state after a QR sign-in, which grants a session but deliberately
+    // not message access. Without this the user gets a working app whose sends
+    // fail for no visible reason.
+    Dialog {
+        id: vaultUnlockDialog
+        anchors.centerIn: parent
+        width: Math.min(400, parent.width * 0.9)
+        modal: true
+        closePolicy: Popup.NoAutoClose
+        title: "Unlock your messages"
+
+        property string errorText: ""
+        property bool busy: false
+
+        background: Rectangle {
+            radius: 18
+            color: appRoot.darkMode ? "#1A1714" : "#FFFFFF"
+            border.width: 1
+            border.color: appRoot.darkMode ? "#2A2418" : "#E5E5EA"
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pixelSize: 13
+                color: appRoot.darkMode ? "#C9C2B4" : "#3C3C43"
+                text: "You're signed in, but this device can't read your " +
+                      "encrypted messages yet. Enter your account password to " +
+                      "unlock them here."
+            }
+
+            TextField {
+                id: vaultPasswordField
+                Layout.fillWidth: true
+                echoMode: TextInput.Password
+                placeholderText: "Account password"
+                enabled: !vaultUnlockDialog.busy
+                onAccepted: vaultUnlockDialog.submit()
+            }
+
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                visible: vaultUnlockDialog.errorText !== ""
+                text: vaultUnlockDialog.errorText
+                color: "#D9544F"
+                font.pixelSize: 12
+            }
+
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pixelSize: 11
+                color: appRoot.darkMode ? "#8A8175" : "#8E8E93"
+                // Be explicit that this is separate from signing in, and that
+                // there is a second route if the password no longer works.
+                text: "If you've reset your password, use your recovery key instead."
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                Button {
+                    text: "Use recovery key"
+                    flat: true
+                    enabled: !vaultUnlockDialog.busy
+                    onClicked: {
+                        vaultUnlockDialog.errorText = ""
+                        recoveryKeyDialog.open()
+                        vaultUnlockDialog.close()
+                    }
+                }
+                Item { Layout.fillWidth: true }
+                Button {
+                    text: "Later"
+                    flat: true
+                    enabled: !vaultUnlockDialog.busy
+                    onClicked: vaultUnlockDialog.close()
+                }
+                Button {
+                    text: vaultUnlockDialog.busy ? "Unlocking…" : "Unlock"
+                    enabled: !vaultUnlockDialog.busy && vaultPasswordField.text.length > 0
+                    onClicked: vaultUnlockDialog.submit()
+                }
+            }
+        }
+
+        function submit() {
+            if (vaultPasswordField.text.length === 0) return
+            vaultUnlockDialog.busy = true
+            vaultUnlockDialog.errorText = ""
+            authService.unlockVaultWithPassword(vaultPasswordField.text)
+        }
+    }
+
+    Dialog {
+        id: recoveryKeyDialog
+        anchors.centerIn: parent
+        width: Math.min(420, parent.width * 0.9)
+        modal: true
+        title: "Enter recovery key"
+
+        background: Rectangle {
+            radius: 18
+            color: appRoot.darkMode ? "#1A1714" : "#FFFFFF"
+            border.width: 1
+            border.color: appRoot.darkMode ? "#2A2418" : "#E5E5EA"
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+            Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pixelSize: 13
+                color: appRoot.darkMode ? "#C9C2B4" : "#3C3C43"
+                text: "Paste the recovery key you saved when encryption was set up."
+            }
+            TextField {
+                id: recoveryKeyField
+                Layout.fillWidth: true
+                placeholderText: "Recovery key"
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                Button {
+                    text: "Cancel"
+                    flat: true
+                    onClicked: recoveryKeyDialog.close()
+                }
+                Button {
+                    text: "Unlock"
+                    enabled: recoveryKeyField.text.length > 0
+                    onClicked: {
+                        authService.unlockWithRecoveryKey(recoveryKeyField.text.trim())
+                        recoveryKeyDialog.close()
+                    }
+                }
+            }
+        }
+    }
+
+    Connections {
+        target: authService
+
+        // Signed in with no usable identity - prompt rather than let sends fail.
+        function onVaultUnlockRequired() {
+            vaultPasswordField.text = ""
+            vaultUnlockDialog.errorText = ""
+            vaultUnlockDialog.busy = false
+            vaultUnlockDialog.open()
+        }
+        function onVaultUnlocked() {
+            vaultUnlockDialog.busy = false
+            vaultUnlockDialog.close()
+        }
+        function onVaultNeedsRecovery(message) {
+            vaultUnlockDialog.busy = false
+            vaultUnlockDialog.errorText = message
+        }
+    }
+
 }

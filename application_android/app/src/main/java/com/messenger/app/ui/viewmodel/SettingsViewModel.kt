@@ -12,6 +12,7 @@ import com.messenger.app.data.model.TotpConfirmRequest
 import com.messenger.app.data.model.TotpDisableRequest
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.data.repository.AvatarRepository
+import com.messenger.app.data.model.QrLoginApproveRequest
 import com.messenger.app.data.repository.ChatRepository
 import com.messenger.app.data.repository.E2EEVaultRepository
 import com.messenger.app.data.settings.AppSettings
@@ -412,6 +413,41 @@ class SettingsViewModel @Inject constructor(
             e2eeVaultRepository.approveDevicePairing(token, pairingCode.trim())
                 .onSuccess { _toast.value = "Device linked" }
                 .onFailure { e -> _toast.value = e.message ?: "Failed to link device" }
+        }
+    }
+
+    /**
+     * Approves a WhatsApp-style QR sign-in shown on another device.
+     *
+     * The scanned payload is "qr1.<session_id>.<scan_secret>". The scan secret
+     * exists only inside that image, so sending it proves this device actually
+     * scanned the code - knowing a session id alone is not enough to authorise
+     * a sign-in (see back-end/handlers/qrlogin.go).
+     *
+     * Approving grants the other device a SESSION, not message access: it still
+     * has to unlock the E2EE vault there. That is deliberate - otherwise the QR
+     * would be a bearer token for the entire message history.
+     */
+    fun approveQrLogin(scanned: String) {
+        viewModelScope.launch {
+            val parts = scanned.trim().split(".")
+            if (parts.size != 3 || parts[0] != "qr1" || parts[1].isBlank() || parts[2].isBlank()) {
+                _toast.value = "That is not a sign-in code"
+                return@launch
+            }
+            val token = tokenManager.getAccessToken().getOrNull() ?: run {
+                _toast.value = "Sign in first"
+                return@launch
+            }
+            runCatching {
+                chatApiService.approveQrLogin(
+                    "Bearer " + token,
+                    QrLoginApproveRequest(sessionId = parts[1], scanSecret = parts[2])
+                )
+            }.onSuccess { resp ->
+                _toast.value = if (resp.isSuccessful) "Sign-in approved"
+                               else "Code invalid or expired"
+            }.onFailure { _toast.value = "Could not approve sign-in" }
         }
     }
 

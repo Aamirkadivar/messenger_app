@@ -350,7 +350,9 @@ object E2ECrypto {
         val fileName: String = "",
         val forwardedFrom: String = "",
         val durationMs: Long = 0,
-        val fileSize: Long = 0
+        val fileSize: Long = 0,
+        val thumbnailUrl: String = "",
+        val fileUrl: String = ""
     )
 
     /**
@@ -362,13 +364,17 @@ object E2ECrypto {
         fileName: String = "",
         forwardedFrom: String = "",
         durationMs: Long = 0,
-        fileSize: Long = 0
+        fileSize: Long = 0,
+        thumbnailUrl: String = "",
+        fileUrl: String = ""
     ): ByteArray {
         val o = JSONObject()
         if (fileName.isNotBlank()) o.put("fn", fileName)
         if (forwardedFrom.isNotBlank()) o.put("fwd", forwardedFrom)
         if (durationMs > 0) o.put("dur", durationMs)
         if (fileSize > 0) o.put("sz", fileSize)
+        if (thumbnailUrl.isNotBlank()) o.put("th", thumbnailUrl)
+        if (fileUrl.isNotBlank()) o.put("fu", fileUrl)
         val meta = o.toString().toByteArray(Charsets.UTF_8)
         if (meta.size > 0xffff) return payload
         val out = ByteArrayOutputStream(6 + meta.size + payload.size)
@@ -396,7 +402,9 @@ object E2ECrypto {
                 fileName = meta.optString("fn"),
                 forwardedFrom = meta.optString("fwd"),
                 durationMs = meta.optLong("dur"),
-                fileSize = meta.optLong("sz")
+                fileSize = meta.optLong("sz"),
+                thumbnailUrl = meta.optString("th"),
+                fileUrl = meta.optString("fu")
             )
         } catch (_: Exception) {
             Envelope(data)
@@ -457,4 +465,29 @@ object E2ECrypto {
     fun isFanout(data: ByteArray): Boolean =
         data.size >= 4 && data[0] == 0x46.toByte() && data[1] == 0x4E.toByte() &&
             data[2] == 0x31.toByte() && data[3] == 0x0A.toByte()
+
+    /** All parts of an FN1 payload, or empty when [data] is not a fan-out. */
+    fun listFanout(data: ByteArray): List<FanoutPart> {
+        if (!isFanout(data) || data.size < 6) return emptyList()
+        val n = ((data[4].toInt() and 0xff) shl 8) or (data[5].toInt() and 0xff)
+        val parts = ArrayList<FanoutPart>(n)
+        var off = 6
+        repeat(n) {
+            if (off >= data.size) return parts
+            val idLen = data[off].toInt() and 0xff
+            off++
+            if (off + idLen + 4 > data.size) return parts
+            val id = String(data, off, idLen, Charsets.UTF_8)
+            off += idLen
+            val blobLen = ((data[off].toInt() and 0xff) shl 24) or
+                ((data[off + 1].toInt() and 0xff) shl 16) or
+                ((data[off + 2].toInt() and 0xff) shl 8) or
+                (data[off + 3].toInt() and 0xff)
+            off += 4
+            if (blobLen < 0 || off + blobLen > data.size) return parts
+            parts.add(FanoutPart(id, data.copyOfRange(off, off + blobLen)))
+            off += blobLen
+        }
+        return parts
+    }
 }

@@ -1258,6 +1258,19 @@ Item {
         }
 
         var unreadCount = chatData.unread_count || 0
+        var sortAt = 0
+        if (lastMessageData.created_at) {
+            var d = new Date(lastMessageData.created_at)
+            if (!isNaN(d.getTime())) sortAt = d.getTime()
+        }
+        if (sortAt === 0 && chatData.last_message_at) {
+            var d2 = new Date(chatData.last_message_at)
+            if (!isNaN(d2.getTime())) sortAt = d2.getTime()
+        }
+        if (sortAt === 0 && chatData.updated_at) {
+            var d3 = new Date(chatData.updated_at)
+            if (!isNaN(d3.getTime())) sortAt = d3.getTime()
+        }
 
         return {
             chatId: chatId,
@@ -1269,7 +1282,42 @@ Item {
             online: isOnline,
             avatarUrl: avatarUrl,
             chatType: chatType,
+            sortAt: sortAt,
             _rawData: chatData
+        }
+    }
+
+    function sortChatsArray(arr) {
+        arr.sort(function(a, b) { return (b.sortAt || 0) - (a.sortAt || 0) })
+    }
+
+    function formatNowTimestamp() {
+        return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    }
+
+    function bumpChatToTop(chatId, preview) {
+        var i
+        for (i = 0; i < originalChats.length; i++) {
+            if (originalChats[i].chatId === chatId) {
+                var row = originalChats[i]
+                if (preview !== undefined) row.lastMessage = preview
+                row.sortAt = Date.now()
+                row.timestamp = formatNowTimestamp()
+                originalChats.splice(i, 1)
+                originalChats.unshift(row)
+                break
+            }
+        }
+        for (i = 0; i < chatModel.count; i++) {
+            if (chatModel.get(i).chatId === chatId) {
+                var item = chatModel.get(i)
+                chatModel.move(i, 0, 1)
+                if (preview !== undefined) chatModel.setProperty(0, "lastMessage", preview)
+                chatModel.setProperty(0, "sortAt", Date.now())
+                chatModel.setProperty(0, "timestamp", formatNowTimestamp())
+                chatModel.setProperty(0, "unreadCount", originalChats[0].unreadCount || 0)
+                break
+            }
         }
     }
 
@@ -1279,9 +1327,11 @@ Item {
         chatModel.clear()
 
         for (var i = 0; i < chatsData.length; i++) {
-            var parsed = parseChatItem(chatsData[i])
-            originalChats.push(parsed)
-            chatModel.append(parsed)
+            originalChats.push(parseChatItem(chatsData[i]))
+        }
+        sortChatsArray(originalChats)
+        for (var j = 0; j < originalChats.length; j++) {
+            chatModel.append(originalChats[j])
         }
 
         chatsLoaded = true
@@ -1334,7 +1384,14 @@ Item {
     // a chat that isn't the one currently open - otherwise the list only
     // ever reflects unread state from the last full REST refetch.
     function onMessageReceived(chatId, message) {
-        if (authService !== undefined && message.senderId === authService.currentUserId) return
+        // Skip only the echo of a message THIS device sent. A message we sent
+        // from another device has no local echo here, so dropping it left the
+        // sidebar stale until a full refetch.
+        if (authService !== undefined && message.senderId === authService.currentUserId) {
+            var myDev = authService.getOrCreateDeviceId()
+            var srcDev = message.senderDeviceId || ""
+            if (srcDev === "" || srcDev === myDev) return
+        }
 
         var preview = chatService.decryptMessage(chatId, message.content, message.encrypted === true,
                                                  message.senderId || "", message.keyVersion || 0,
@@ -1351,6 +1408,8 @@ Item {
                 if (!isActive)
                     originalChats[i].unreadCount = (originalChats[i].unreadCount || 0) + 1
                 originalChats[i].lastMessage = preview
+                originalChats[i].sortAt = Date.now()
+                originalChats[i].timestamp = formatNowTimestamp()
                 found = true
                 break
             }
@@ -1362,14 +1421,7 @@ Item {
             return
         }
 
-        for (var j = 0; j < chatModel.count; j++) {
-            if (chatModel.get(j).chatId === chatId) {
-                if (!isActive)
-                    chatModel.setProperty(j, "unreadCount", (chatModel.get(j).unreadCount || 0) + 1)
-                chatModel.setProperty(j, "lastMessage", preview)
-                break
-            }
-        }
+        bumpChatToTop(chatId, preview)
     }
 
     // Symmetric to onMessageReceived: after a delete (local or for_everyone),
@@ -1388,6 +1440,19 @@ Item {
                 break
             }
         }
+    }
+
+    function onOutgoingMessage(chatId, message) {
+        var preview
+        if (message) {
+            var t = message.fileType || message.contentType || ""
+            if (t === "audio") preview = "🎤 Voice message"
+            else if (t === "image") preview = "📷 Photo"
+            else if (t === "video_note") preview = "📹 Video message"
+            else if (t === "file") preview = "📎 " + (message.fileName || "File")
+            else if (message.content) preview = message.content
+        }
+        bumpChatToTop(chatId, preview)
     }
 
     // for_everyone retraction over the socket - drop the cache row and refresh
@@ -1427,6 +1492,10 @@ Item {
             chatService.chatError.connect(onChatError)
             chatService.chatRead.connect(onChatRead)
             chatService.chatLastMessageChanged.connect(onChatLastMessageChanged)
+            chatService.messageSent.connect(onOutgoingMessage)
+            chatService.voiceMessageSent.connect(onOutgoingMessage)
+            chatService.attachmentMessageSent.connect(onOutgoingMessage)
+            chatService.videoNoteMessageSent.connect(onOutgoingMessage)
             loadChatsFromAPI()
         } else {
             populateChatModel([])

@@ -1,4 +1,5 @@
 #include "authservice.h"
+#include <QCryptographicHash>
 #include "../crypto/doubleratchet.h"
 #include "../utils/pairingqr.h"
 #include <QNetworkRequest>
@@ -73,6 +74,20 @@ void AuthService::restoreSession() {
     // cannot unlock a remote vault — do not mint a replacement identity here.
     ensureE2EEKeysAndPublish(false);
     fetchOwnProfile();
+
+    // Register this device even when the vault has not been unlocked yet.
+    // Every other registration call site sits behind a successful unlock, so a
+    // signed-in-but-locked device never appeared in e2ee_devices - and senders
+    // fan out one encrypted copy PER REGISTERED DEVICE, so nothing was ever
+    // encrypted for it. It could talk to the server and still never receive a
+    // readable message.
+    registerE2EEDevice();
+
+    // A restored session can be signed in yet hold no identity keys - the state
+    // a QR sign-in leaves behind, and it survives every restart. finishLogin-
+    // AfterVault() is not on this path, so without prompting here the user gets
+    // a working-looking app whose sends fail with no explanation, forever.
+    if (needsVaultUnlock()) emit vaultUnlockRequired();
 }
 
 void AuthService::setupNetworkManager() {
@@ -508,12 +523,40 @@ void AuthService::applyUnlockedVault(const VaultCrypto::UnlockedVault& unlocked)
     CredentialManager::instance().saveToken(
         QStringLiteral("e2ee_pub_%1").arg(m_currentUserId), unlocked.plaintext.identityPubHex);
     restoreVaultMaterial(unlocked.plaintext);
+    // The device can now read and send encrypted messages; let the UI dismiss
+    // any unlock prompt and refresh anything showing placeholders.
+    emit vaultUnlocked();
 }
 
 QString AuthService::getOrCreateDeviceId() const {
-    const QString key = QStringLiteral("e2ee_device_id");
+    // Scoped PER ACCOUNT. A single machine-wide id meant a second account
+    // signing in here inherited the first account's device identity: both users
+    // registered under one device_id, so per-device fan-out (FN1) and the
+    // ratchet sessions keyed by "chatId|deviceId" collided and messages
+    // stopped opening.
+    //
+    // The pre-scoping id is deliberately NOT adopted. There is no local way to
+    // tell which account originally registered it, and an earlier attempt to
+    // guess handed koueosh's device to mehdi - reproducing the exact collision
+    // this is meant to fix. Every account simply mints its own; the old device
+    // row lingers server-side until revoked, and v4 re-keys cleanly against a
+    // new device id because its root comes from the identity keys, not the
+    // session.
+    if (m_currentUserId.isEmpty()) {
+        // No account context yet (early startup). Do not mint here: an id
+        // stored under no user would never be looked up again.
+        return QString();
+    }
+
+    // Key version 2. v1 scoped keys were written by an earlier build whose
+    // migration adopted the machine-wide id, which handed one account another
+    // account's device identity - exactly the collision this scoping exists to
+    // prevent. Those values cannot be trusted, so v2 ignores them and mints
+    // fresh.
+    const QString key = QStringLiteral("e2ee_device_id_v2_%1").arg(m_currentUserId);
     QString id = CredentialManager::instance().getToken(key);
     if (!id.isEmpty()) return id;
+
     id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     CredentialManager::instance().saveToken(key, id);
     return id;
@@ -711,6 +754,129 @@ void AuthService::startDevicePairing() {
         emit devicePairingStarted(code);
         pollPairingPayload();
         reply->deleteLater();
+    });
+}
+
+// ---- WhatsApp-style scan-to-sign-in ----
+//
+// This client shows a QR; a phone that is already signed in scans it and
+// approves. Two secrets keep that safe (see back-end/handlers/qrlogin.go):
+// the verifier below never leaves this process (only its SHA-256 is sent), and
+// the scan secret exists only inside the QR image. Knowing a session id is
+// therefore useless to an attacker.
+
+void AuthService::startQrLogin() {
+    cancelQrLogin();
+
+    // Secret proving we are the client that started this session. Never sent.
+    QByteArray raw(32, '\0');
+    randombytes_buf(raw.data(), raw.size());
+    m_qrLoginVerifier = QString::fromLatin1(raw.toBase64(
+        QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+    const QString verifierHash = QString::fromLatin1(
+        QCryptographicHash::hash(m_qrLoginVerifier.toUtf8(),
+                                 QCryptographicHash::Sha256).toHex());
+
+    QNetworkRequest req(QUrl(Config::apiBaseUrl() + QStringLiteral("/auth/qr/start")));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    QJsonObject body;
+    body["verifier_hash"] = verifierHash;
+    body["client_name"] = QSysInfo::machineHostName();
+    body["client_platform"] = QStringLiteral("windows");
+
+    QNetworkReply* reply =
+        m_networkManager->post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            emit qrLoginFailed(QStringLiteral("Could not start QR sign-in"));
+            return;
+        }
+        const QJsonObject o = QJsonDocument::fromJson(reply->readAll()).object();
+        m_qrLoginSessionId = o.value(QStringLiteral("session_id")).toString();
+        const QString payload = o.value(QStringLiteral("qr_payload")).toString();
+        if (m_qrLoginSessionId.isEmpty() || payload.isEmpty()) {
+            emit qrLoginFailed(QStringLiteral("Could not start QR sign-in"));
+            return;
+        }
+
+        const QString path = QDir::temp().filePath(
+            QStringLiteral("messenger-qrlogin-%1.png").arg(m_qrLoginSessionId));
+        if (PairingQr::savePng(payload, path)) {
+            if (!m_qrLoginPath.isEmpty() && m_qrLoginPath != path)
+                QFile::remove(m_qrLoginPath);
+            m_qrLoginPath = path;
+        }
+        m_qrLoginStatus = QStringLiteral("pending");
+        emit qrLoginChanged();
+
+        if (!m_qrLoginPoll) {
+            m_qrLoginPoll = new QTimer(this);
+            connect(m_qrLoginPoll, &QTimer::timeout, this, &AuthService::pollQrLogin);
+        }
+        m_qrLoginPoll->start(2000);
+    });
+}
+
+void AuthService::cancelQrLogin() {
+    if (m_qrLoginPoll) m_qrLoginPoll->stop();
+    if (!m_qrLoginPath.isEmpty()) {
+        QFile::remove(m_qrLoginPath);
+        m_qrLoginPath.clear();
+    }
+    m_qrLoginSessionId.clear();
+    m_qrLoginVerifier.clear();
+    m_qrLoginStatus.clear();
+    emit qrLoginChanged();
+}
+
+void AuthService::pollQrLogin() {
+    if (m_qrLoginSessionId.isEmpty()) {
+        if (m_qrLoginPoll) m_qrLoginPoll->stop();
+        return;
+    }
+    QNetworkRequest req(QUrl(Config::apiBaseUrl() +
+        QStringLiteral("/auth/qr/%1").arg(m_qrLoginSessionId)));
+    QNetworkReply* reply = m_networkManager->get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) return;
+        const QString status = QJsonDocument::fromJson(reply->readAll())
+                                   .object().value(QStringLiteral("status")).toString();
+        if (status == m_qrLoginStatus) return;
+        m_qrLoginStatus = status;
+        emit qrLoginChanged();
+
+        if (status == QStringLiteral("approved")) {
+            if (m_qrLoginPoll) m_qrLoginPoll->stop();
+            claimQrLogin();
+        } else if (status == QStringLiteral("expired")) {
+            if (m_qrLoginPoll) m_qrLoginPoll->stop();
+            emit qrLoginFailed(QStringLiteral("Sign-in code expired - show a new one"));
+        }
+    });
+}
+
+void AuthService::claimQrLogin() {
+    if (m_qrLoginSessionId.isEmpty() || m_qrLoginVerifier.isEmpty()) return;
+
+    QNetworkRequest req(QUrl(Config::apiBaseUrl() + QStringLiteral("/auth/qr/claim")));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    QJsonObject body;
+    body["session_id"] = m_qrLoginSessionId;
+    body["verifier"] = m_qrLoginVerifier;
+
+    QNetworkReply* reply =
+        m_networkManager->post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
+    // The claim returns exactly the envelope a password login returns, so reuse
+    // that slot: token storage, user id, WebSocket connect and vault sync then
+    // behave identically for both sign-in routes.
+    connect(reply, &QNetworkReply::finished, this, &AuthService::onLoginReplyFinished);
+    connect(reply, &QNetworkReply::finished, this, [this]() {
+        // Clears the QR + its temp PNG once the session has been spent. The
+        // vault still needs unlocking separately on this device - signing in
+        // never grants message access on its own.
+        cancelQrLogin();
     });
 }
 
@@ -1422,6 +1588,28 @@ void AuthService::finishLoginAfterVault() {
     emit currentUsernameChanged();
     emit tokenReady(m_accessToken);
     emit loginSuccess(m_currentUserId, m_currentUsername);
+
+    // Signed in but with no identity keys: the device can talk to the server
+    // yet cannot read or send encrypted messages. This is the normal state
+    // after a QR sign-in (which grants a session, deliberately not message
+    // access) and after any sign-in whose vault unlock did not run. Surface it
+    // instead of leaving the user with sends that fail for no visible reason.
+    if (needsVaultUnlock()) emit vaultUnlockRequired();
+}
+
+bool AuthService::needsVaultUnlock() const {
+    return m_loggedIn && !m_currentUserId.isEmpty() && e2eePrivateKey().isEmpty();
+}
+
+void AuthService::unlockVaultWithPassword(const QString& password) {
+    if (password.isEmpty() || m_accessToken.isEmpty()) {
+        emit vaultNeedsRecovery(QStringLiteral("Enter your account password"));
+        return;
+    }
+    // syncE2EEVaultAfterLogin() downloads the vault and unlocks it with this
+    // password, restoring the account identity onto this device.
+    m_pendingVaultPassword = password;
+    syncE2EEVaultAfterLogin();
 }
 
 void AuthService::verify2FA(const QString& challengeId, const QString& code) {

@@ -1,10 +1,69 @@
 # E2EE Architecture
 
-Status: **Implemented** (Android + Windows + Go relay). iOS / Web are not in this repo.  
-Date: 2026-08-14  
+Status: **Code-complete but DORMANT.** The vault/device/pairing system is fully
+written and wired into routes, but has never run in production. iOS / Web are not
+in this repo.
+Date: 2026-08-14 (design); operational state re-audited **2026-08-15**.
 Scope: `back-end/`, `application_android/`, `windows_app/`
 
-Trust this file and the code. The original Phase 0 audit described a pre-vault system; that world is gone.
+Trust the code and the measured-state section below. The design sections that
+follow are accurate to the source; the *operational* claims in the original
+draft ("Implemented", "that world is gone", most "Mitigated" rows) were
+aspirational — they describe what the code would do **once a vault exists**, not
+the live system. See §1.5.
+
+---
+
+## 1.5 Current operational state (measured 2026-08-15)
+
+Direct database inspection of the running `messenger` DB:
+
+```
+e2_ee_vaults:      0 rows
+e2_ee_devices:     0 rows
+e2_ee_pairing:     0 rows
+messages:        218 × encryption_version=1 (static box, no device id)
+                   9 × encryption_version=3
+```
+
+**Nothing has ever populated the vault, device, or pairing tables.** Every
+security property that depends on them is therefore inert:
+
+1. **Identity-overwrite lock — FIXED 2026-08-15 (pending backend restart).**
+   Previously `identityChangeBlocked` (`handlers/crypto.go`) only blocked a
+   changed `public_key` when `hasVault || hasLiveDevice`; with both tables empty
+   both flags were false, so **any login could silently replace the account
+   identity** — observed live when a user's `public_key` was rewritten as a
+   second client signed in. The guard now blocks *any* change to an
+   already-published identity regardless of vault/device state; the only way to
+   replace an established key is an explicit, user-acknowledged reset
+   (`reset:true`, audit-logged). Regression pinned in
+   `handlers/crypto_test.go`. **The running server must be restarted to load
+   this** — the live process predates the fix.
+2. **v1 backlog is cryptographically lost.** The 218 `encryption_version=1`
+   messages were sealed with static `crypto_box(peerPub, myIdentityPriv)` to an
+   identity that has since been replaced (see #1). No device holds the matching
+   private key; no vault preserved it. Per the 2026-08-15 decision, this loss is
+   **accepted** — the goal is to protect everything from activation forward, not
+   to recover the orphaned backlog.
+3. **New-device recovery cannot work yet.** The restore flow reads a vault that
+   does not exist. Until clients create + upload a vault and register a device on
+   login, "sign in on a new phone → history restored" fails by construction.
+
+**Activation deadlock to resolve:** the identity lock needs a vault to exist, but
+the vault never gets created, so every fresh login re-orphans history. Activation
+must make the client **create + upload the vault and register the device before
+(or atomically with) publishing an identity key**, so the lock has something to
+protect from the very first login.
+
+**Known design simplification vs. the target spec (§5 "envelope encryption"):**
+the persisted schema wraps the **Master Key** directly (`pw_wrapped_master`,
+`rk_wrapped_master`) and seals the vault with the MK as the AEAD key. The
+separate **Vault Encryption Key (VEK)** layer is present in code
+(`e2ee.VEKAAD`, the `vek` parameter of `SealVault`) but not in the stored model,
+so in practice `vek == MK`. This is cryptographically sound (MK is a 256-bit
+CSPRNG key), but it means rotating the vault key requires re-deriving both KEK
+wraps rather than just re-wrapping a VEK. Flagged, not yet changed.
 
 ---
 
@@ -24,7 +83,7 @@ The messenger uses **client-side NaCl/libsodium**. The Go backend is a **dumb re
 | Devices | `e2ee_devices` registry; revoke kicks WS and blocks API via `X-Device-Id` |
 | Server storage | `users.public_key`, opaque `messages.encrypted_content`, `group_sender_keys`, `e2ee_vaults` |
 
-Wire (text): v1 `hex(nonce\|\|ct)`; v2 `hex(eph_pk\|\|nonce\|\|ct)`. Binary media: the same layout as raw bytes. Inner plaintext uses an `EM1` envelope so filenames and forward attribution are not stored in server columns.
+Wire (text): v1 `hex(nonce\|\|ct)`; v2 `hex(eph_pk\|\|nonce\|\|ct)`. Binary media: the same layout as raw bytes. Inner plaintext uses an `EM1` envelope so filenames, duration, thumbnail, and media URLs are not stored in server columns.
 
 Platforms: **Android** (LazySodium), **Windows** (libsodium). **No iOS / Web client.**
 
@@ -105,7 +164,7 @@ Identity private keys never leave the client except inside vault ciphertext or a
 |----|-------|----------|
 | V1 | Server `users.private_key` | **Closed** — column dropped |
 | V2 / V3 | Client at-rest identity | Mitigated (Keystore / user DPAPI) |
-| V4 | New device overwriting identity | **Mitigated** — server rejects a different `public_key` once a vault or live device exists |
+| V4 | New device overwriting identity | **FIXED 2026-08-15** (needs backend restart) — guard now blocks any change to an established identity independent of vault/device state; only an explicit acknowledged reset can rotate. Regression test `handlers/crypto_test.go`. |
 | V5 | Cleartext send | Mitigated (API reject + client fail-closed) |
 | V6 | Direct chat FS | **Mitigated** — v3 Double Ratchet (identity SK does not open post-ratchet messages); v2 still sender-only |
 | V7 | Historical own Sender Keys | Mitigated (disk + vault) |
@@ -117,7 +176,7 @@ Identity private keys never leave the client except inside vault ciphertext or a
 | — | Windows camera QR scan | Mitigated (camera + paste) |
 | — | Multi-device v3 vault | Mitigated — 409 merge by `seq`; pull on reconnect; **FN1** fan-out per device (`GET /e2ee/chats/:id/devices`) so simultaneous send does not share one chain |
 | — | Peer key substitution | Mitigated — TOFU pin; QR/text safety-number verify (`sn1.`) |
-| — | Filename / forward-name / duration / size on server | Mitigated — `EM1` inner envelope (`fn`,`fwd`,`dur`,`sz`); API columns empty/zero on new sends |
+| — | Filename / forward-name / duration / size / thumbnail / media URL on server | Mitigated — `EM1` (`fn`,`fwd`,`dur`,`sz`,`th`,`fu`); API columns empty/zero on new sends |
 | — | Cross-NAT calls | Needs public TURN / `TURN_EXTERNAL_IP` |
 | — | Windows video loss | Mitigated (RTCP NACK responder + PLI keyframe) |
 

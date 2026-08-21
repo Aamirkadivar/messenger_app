@@ -20,6 +20,9 @@ class AuthService : public QObject {
     Q_PROPERTY(QString currentUserEmail READ currentUserEmail NOTIFY profileChanged)
     Q_PROPERTY(QString currentUserAvatarUrl READ currentUserAvatarUrl NOTIFY profileChanged)
     Q_PROPERTY(QString pairingQrPath READ pairingQrPath NOTIFY pairingQrPathChanged)
+    // WhatsApp-style scan-to-sign-in, shown on the login screen.
+    Q_PROPERTY(QString qrLoginPath READ qrLoginPath NOTIFY qrLoginChanged)
+    Q_PROPERTY(QString qrLoginStatus READ qrLoginStatus NOTIFY qrLoginChanged)
     Q_PROPERTY(bool totpEnabled READ totpEnabled NOTIFY totpStatusChanged)
 
 public:
@@ -31,6 +34,13 @@ public:
     const QString& currentUserEmail() const { return m_currentUserEmail; }
     const QString& currentUserAvatarUrl() const { return m_currentUserAvatarUrl; }
     const QString& pairingQrPath() const { return m_pairingQrPath; }
+    const QString& qrLoginPath() const { return m_qrLoginPath; }
+    const QString& qrLoginStatus() const { return m_qrLoginStatus; }
+
+    // Begins a scan-to-sign-in session: asks the server for a session, renders
+    // the QR, and polls until an already-signed-in device approves it.
+    Q_INVOKABLE void startQrLogin();
+    Q_INVOKABLE void cancelQrLogin();
     bool totpEnabled() const { return m_totpEnabled; }
 
     // GET /users/me - fills in email/avatar (not returned by login/restoreSession).
@@ -43,6 +53,12 @@ public:
     Q_INVOKABLE void startPasswordReset(const QString& email);
     Q_INVOKABLE void completePasswordReset(const QString& challengeId, const QString& code, const QString& newPassword, const QString& totpCode);
     Q_INVOKABLE void unlockWithRecoveryKey(const QString& recoveryKeyB64);
+    // Unlocks the E2EE vault on a device that is already signed in but has no
+    // identity keys - the state a QR sign-in leaves you in, since scanning
+    // grants a session but deliberately not message access.
+    Q_INVOKABLE void unlockVaultWithPassword(const QString& password);
+    // True when this device is signed in but cannot read encrypted messages.
+    Q_INVOKABLE bool needsVaultUnlock() const;
     Q_INVOKABLE void refreshVaultContents();
     void pullAndMergeVault(bool force = false);
     Q_INVOKABLE void fetchE2EEDevices();
@@ -75,7 +91,9 @@ public:
     // locally on first login. Empty if not logged in / not yet generated.
     QString e2eePrivateKey() const;
     // Stable per-install device id (also sent as X-Device-Id / WS device_id).
-    QString getOrCreateDeviceId() const;
+    // Q_INVOKABLE so QML can tell "my own echo on this device"
+    // apart from "my message from another device".
+    Q_INVOKABLE QString getOrCreateDeviceId() const;
     QString e2eePublicKey() const;
 
 signals:
@@ -100,6 +118,11 @@ signals:
     void recoveryKeyReady(const QString& recoveryKeyB64);
     // Password wrap failed — enter recovery key (tokens already valid).
     void vaultNeedsRecovery(const QString& message);
+    // Emitted after a sign-in that produced no usable E2EE identity, so the UI
+    // can prompt for the password or recovery key instead of leaving the user
+    // with a working session that silently cannot send.
+    void vaultUnlockRequired();
+    void vaultUnlocked();
     void e2eeDevicesLoaded(const QVariantList& devices);
     void e2eeDeviceRevoked(const QString& deviceId);
     void passwordChangeSucceeded();
@@ -108,6 +131,8 @@ signals:
     void devicePairingSucceeded();
     void devicePairingFailed(const QString& message);
     void pairingQrPathChanged();
+    void qrLoginChanged();
+    void qrLoginFailed(const QString& message);
     void totpStatusChanged();
     void totpSetupReady(const QString& secret, const QString& otpauthUrl);
     void totpConfirmSucceeded(const QStringList& backupCodes);
@@ -170,5 +195,15 @@ private:
     QByteArray m_pairingEphPriv;
     QString m_pairingSessionId;
     QString m_pairingQrPath;
+    // QR sign-in state. m_qrLoginVerifier is this client's secret proof that it
+    // started the session; it is never transmitted, only its SHA-256 is.
+    QString m_qrLoginPath;
+    QString m_qrLoginStatus;
+    QString m_qrLoginSessionId;
+    QString m_qrLoginVerifier;
+    QTimer* m_qrLoginPoll = nullptr;
+
+    void pollQrLogin();
+    void claimQrLogin();
     bool m_totpEnabled = false;
 };

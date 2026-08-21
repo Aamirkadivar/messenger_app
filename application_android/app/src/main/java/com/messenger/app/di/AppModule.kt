@@ -14,6 +14,7 @@ import com.messenger.app.data.remote.websocket.WebSocketManager
 import com.messenger.app.data.repository.AttachmentRepository
 import com.messenger.app.data.repository.AuthRepository
 import com.messenger.app.data.repository.ChatRepository
+import com.messenger.app.data.repository.MlsRepository
 import com.messenger.app.data.repository.E2EEVaultRepository
 import com.messenger.app.data.repository.AvatarRepository
 import com.messenger.app.data.repository.GroupRepository
@@ -209,6 +210,13 @@ object AppModule {
         chatRepository: ChatRepository,
         @ApplicationScope appScope: CoroutineScope
     ): StorageAnalyzer = StorageAnalyzer(context, chatRepository, appScope)
+
+    @Provides
+    @Singleton
+    fun provideMlsRepository(
+        chatApiService: ChatApiService,
+        tokenManager: TokenManager
+    ): MlsRepository = MlsRepository(chatApiService, tokenManager)
 
     @Provides
     @Singleton

@@ -323,3 +323,188 @@ data class E2EEPairingPayloadDto(
     @SerialName("payload_b64") val payloadB64: String = "",
     @SerialName("sender_pub_hex") val senderPubHex: String = ""
 )
+
+// ==================== MLS (RFC 9420) Delivery Service ====================
+// Every payload below is opaque protocol material, base64 on the wire. The
+// server stores and relays it without parsing; see back-end/handlers/mls.go.
+
+@Serializable
+data class MlsKeyPackageItem(
+    @SerialName("device_id") val deviceId: String,
+    @SerialName("cipher_suite") val cipherSuite: Int,
+    @SerialName("key_package_b64") val keyPackageB64: String,
+    @SerialName("ref_hash") val refHash: String,
+    /**
+     * Which incarnation of the publisher's MLS store made this package. Opaque
+     * to the server; blank means "unattributed", which is what a client that
+     * cannot name its store must send rather than inventing a value.
+     */
+    @SerialName("store_id") val storeId: String
+)
+
+@Serializable
+data class MlsPublishKeyPackagesRequest(
+    @SerialName("key_packages") val keyPackages: List<MlsKeyPackageItem>
+)
+
+@Serializable
+data class MlsPublishKeyPackagesResponse(val stored: Int = 0)
+
+@Serializable
+data class MlsKeyPackageCountResponse(val available: Int = 0)
+
+@Serializable
+data class MlsClaimKeyPackageRequest(
+    @SerialName("user_id") val userId: String,
+    @SerialName("device_id") val deviceId: String = "",
+    @SerialName("cipher_suite") val cipherSuite: Int = 0
+)
+
+@Serializable
+data class MlsClaimKeyPackageResponse(
+    @SerialName("key_package_b64") val keyPackageB64: String = "",
+    @SerialName("user_id") val userId: String = "",
+    @SerialName("device_id") val deviceId: String = "",
+    @SerialName("cipher_suite") val cipherSuite: Int = 0
+)
+
+@Serializable
+data class MlsCreateGroupRequest(
+    @SerialName("chat_id") val chatId: String,
+    @SerialName("group_id_b64") val groupIdB64: String,
+    @SerialName("cipher_suite") val cipherSuite: Int
+)
+
+/**
+ * Abandons a chat's MLS group and starts a fresh incarnation under the same
+ * chat_id.
+ *
+ * [expectedInstanceId] is a compare-and-swap: the server only recreates while
+ * that incarnation is still current. Two devices deciding to recover at the same
+ * moment therefore yield exactly one new group - the loser gets 409 with the
+ * winner's identity and adopts it.
+ */
+@Serializable
+data class MlsRecreateGroupRequest(
+    @SerialName("group_id_b64") val groupIdB64: String,
+    @SerialName("cipher_suite") val cipherSuite: Int,
+    @SerialName("expected_instance_id") val expectedInstanceId: String = ""
+)
+
+/** Response to a recreate attempt. Also the 409 body, carrying the winner. */
+@Serializable
+data class MlsRecreateGroupResponse(
+    @SerialName("chat_id") val chatId: String = "",
+    @SerialName("instance_id") val instanceId: String = "",
+    @SerialName("group_id_b64") val groupIdB64: String = "",
+    val epoch: Long = 0,
+    val error: String = ""
+)
+
+@Serializable
+data class MlsGroupDto(
+    @SerialName("chat_id") val chatId: String = "",
+    @SerialName("group_id_b64") val groupIdB64: String = "",
+    @SerialName("cipher_suite") val cipherSuite: Int = 0,
+    val epoch: Long = 0,
+    /** Identifies this incarnation: a recreated group reuses the chat_id. */
+    @SerialName("instance_id") val instanceId: String = ""
+)
+
+@Serializable
+data class MlsCoverageDeviceDto(
+    @SerialName("user_id") val userId: String = "",
+    @SerialName("device_id") val deviceId: String = "",
+    val claimable: Boolean = false
+)
+
+/**
+ * DS-visible join progress. The server cannot read the ratchet tree, but it
+ * does know which devices have acked a Welcome. Clients send MLS only when
+ * every other live device is in [ackedDeviceIds].
+ */
+@Serializable
+data class MlsCoverageDto(
+    val exists: Boolean = false,
+    val epoch: Long = 0,
+    @SerialName("instance_id") val instanceId: String = "",
+    @SerialName("live_devices") val liveDevices: List<MlsCoverageDeviceDto> = emptyList(),
+    @SerialName("claimable_device_ids") val claimableDeviceIds: List<String> = emptyList(),
+    @SerialName("acked_device_ids") val ackedDeviceIds: List<String> = emptyList(),
+    @SerialName("pending_device_ids") val pendingDeviceIds: List<String> = emptyList()
+)
+
+@Serializable
+data class MlsWelcomeItem(
+    @SerialName("user_id") val userId: String,
+    @SerialName("device_id") val deviceId: String = "",
+    @SerialName("welcome_b64") val welcomeB64: String
+)
+
+@Serializable
+data class MlsCommitRequest(
+    // The epoch this client last observed; the server rejects a stale commit
+    // with 409 so two members cannot fork the group.
+    @SerialName("expected_epoch") val expectedEpoch: Long,
+    @SerialName("commit_b64") val commitB64: String,
+    @SerialName("sender_device_id") val senderDeviceId: String = "",
+    val welcomes: List<MlsWelcomeItem> = emptyList()
+)
+
+@Serializable
+data class MlsCommitResponse(val epoch: Long = 0)
+
+@Serializable
+data class MlsHandshakeDto(
+    val epoch: Long = 0,
+    val kind: String = "",
+    @SerialName("sender_user_id") val senderUserId: String = "",
+    @SerialName("sender_device_id") val senderDeviceId: String = "",
+    @SerialName("payload_b64") val payloadB64: String = ""
+)
+
+@Serializable
+data class MlsHandshakesResponse(val handshakes: List<MlsHandshakeDto> = emptyList())
+
+@Serializable
+data class MlsPendingWelcomeDto(
+    val id: String = "",
+    @SerialName("chat_id") val chatId: String = "",
+    val epoch: Long = 0,
+    @SerialName("welcome_b64") val welcomeB64: String = ""
+)
+
+@Serializable
+data class MlsWelcomesResponse(val welcomes: List<MlsPendingWelcomeDto> = emptyList())
+
+/** Retires Welcomes only after the join actually succeeded. */
+@Serializable
+data class MlsWelcomeAckRequest(val ids: List<String>)
+
+@Serializable
+data class MlsPutGroupInfoRequest(
+    val epoch: Long,
+    @SerialName("group_info_b64") val groupInfoB64: String
+)
+
+@Serializable
+data class MlsGroupInfoDto(
+    @SerialName("group_info_b64") val groupInfoB64: String = "",
+    @SerialName("group_info_epoch") val groupInfoEpoch: Long = 0,
+    val epoch: Long = 0,
+    /** False when the published GroupInfo is stale; joining against it fails. */
+    @SerialName("is_current") val isCurrent: Boolean = false
+)
+
+/**
+ * Approves a WhatsApp-style QR sign-in shown on another device.
+ *
+ * [scanSecret] exists only inside the scanned QR image - sending it is what
+ * proves this device physically scanned the code rather than merely knowing a
+ * session id. See back-end/handlers/qrlogin.go.
+ */
+@Serializable
+data class QrLoginApproveRequest(
+    @SerialName("session_id") val sessionId: String,
+    @SerialName("scan_secret") val scanSecret: String
+)

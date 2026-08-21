@@ -608,20 +608,39 @@ Item {
 
         function onMessageReceived(chatId, message) {
             if (chatId !== chatViewRoot.currentChatId) return
-            // Our own sends are already shown optimistically when we hit send
-            if (message.senderId === authService.currentUserId) return
+            // Skip only the echo of a send from THIS device - it is already on
+            // screen optimistically. The same message arriving from another of
+            // our devices has no local echo here, so dropping it left the open
+            // chat stale until it was closed and reopened.
+            if (message.senderId === authService.currentUserId) {
+                var myDev = authService.getOrCreateDeviceId()
+                var srcDev = message.senderDeviceId || ""
+                if (srcDev === "" || srcDev === myDev) return
+            }
             var hasFile = (message.fileType === "audio" || message.fileType === "image"
                            || message.fileType === "file" || message.fileType === "video_note")
-                          && message.fileUrl && message.fileUrl.length > 0
             var text = hasFile ? "" : chatService.decryptMessage(chatId, message.content, message.encrypted === true,
                                                                   message.senderId, message.keyVersion || 0,
                                                                   message.encryptionVersion || 1, message.senderDeviceId || "")
-            chatViewRoot.addMessage(message.senderId, chatViewRoot.currentChatName, text,
-                                     chatViewRoot.formatTime(message.createdAt), false, false,
-                                     hasFile ? message.fileUrl : "", message.durationMs,
+            var env = (message.encrypted === true && message.content)
+                      ? chatService.peekEnvelope(chatId, message.content, true,
+                                                 message.senderId, message.keyVersion || 0,
+                                                 message.encryptionVersion || 1, message.senderDeviceId || "")
+                      : ({})
+            // isMine: true when this is our own message relayed from another of
+            // our devices, so it renders on the sender's side rather than as an
+            // incoming bubble from ourselves.
+            var fromMe = message.senderId === authService.currentUserId
+            chatViewRoot.addMessage(message.senderId,
+                                     fromMe ? "Me" : chatViewRoot.currentChatName, text,
+                                     chatViewRoot.formatTime(message.createdAt), fromMe, false,
+                                     hasFile ? (message.fileUrl || env.fileUrl || "") : "",
+                                     (message.durationMs > 0 ? message.durationMs : (env.durationMs || 0)),
                                      hasFile && message.encrypted === true, message.id,
-                                     message.fileType, message.fileName, message.fileSize,
-                                     message.thumbnailUrl || "",
+                                     message.fileType,
+                                     message.fileName || env.fileName || "",
+                                     message.fileSize > 0 ? message.fileSize : (env.fileSize || 0),
+                                     message.thumbnailUrl || env.thumbnailUrl || "",
                                      hasFile ? "" : message.content,
                                      message.encrypted === true, message.keyVersion || 0,
                                      message.encryptionVersion || 1,

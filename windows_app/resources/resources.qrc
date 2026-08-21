@@ -1,6 +1,7 @@
 <RCC>
     <qresource prefix="/">
         <file>../qml/main.qml</file>
+        <file>../qml/TitleBar.qml</file>
         <file>../qml/Login.qml</file>
         <file>../qml/Register.qml</file>
         <file>../qml/ChatList.qml</file>

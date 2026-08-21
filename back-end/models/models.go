@@ -389,6 +389,11 @@ func MigrateDB(db *gorm.DB) error {
 		&E2EEVault{},
 		&E2EEDevice{},
 		&E2EEPairingSession{},
+		&MLSKeyPackage{},
+		&MLSGroup{},
+		&MLSHandshake{},
+		&MLSWelcome{},
+		&QRLoginSession{},
 	); err != nil {
 		return err
 	}

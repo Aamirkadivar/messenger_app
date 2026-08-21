@@ -52,6 +52,19 @@ android {
         compose = true
     }
 
+    packaging {
+        resources {
+            // BouncyCastle ships an OSGi manifest in every artifact (bcmls,
+            // bcprov, bcutil, bcpkix) and jspecify adds a fifth copy, which
+            // collides during resource merge. None of it is needed at runtime.
+            excludes += "/META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+            excludes += "/META-INF/LICENSE.md"
+            excludes += "/META-INF/LICENSE-notice.md"
+            excludes += "/META-INF/NOTICE.md"
+            excludes += "/META-INF/DEPENDENCIES"
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -59,6 +72,16 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    testOptions {
+        unitTests {
+            // JVM unit tests run against a stub android.jar whose methods throw
+            // by default. TokenManager logs through android.util.Log, which is
+            // incidental to what these tests assert, so let the stubs return
+            // defaults rather than failing a test on a log call.
+            isReturnDefaultValues = true
+        }
     }
 
     lint {
@@ -207,6 +230,11 @@ dependencies {
     // libsodium (NaCl crypto_box) for real E2EE. lazysodium pulls JNA as a jar
     // transitively; exclude it and use only the Android aar variant to avoid
     // duplicate-class conflicts.
+    // BouncyCastle MLS (RFC 9420) for group messaging. Audited, maintained
+    // implementation - TreeKEM is never hand-rolled here.
+    implementation(libs.bcmls)
+    implementation(libs.bcprov)
+
     implementation(libs.lazysodium.android) {
         exclude(group = "net.java.dev.jna", module = "jna")
     }
@@ -244,6 +272,7 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     testImplementation(libs.mockk)
+    testImplementation(libs.kotlin.coroutines.test)
 }
 
 secrets {

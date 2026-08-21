@@ -1,4 +1,5 @@
 #include "messagecache.h"
+#include <QSet>
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QStandardPaths>
@@ -58,6 +59,11 @@ void MessageCache::ensureSchema() {
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN forwarded_from_name TEXT"));
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN reply_to_id TEXT"));
     query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN encryption_version INTEGER NOT NULL DEFAULT 1"));
+    // v3/v4 key their ratchet session by "chatId|senderDeviceId". Without this
+    // column a cached message reloaded on reopen decrypted against the wrong
+    // session and rendered as a placeholder, even though the same message had
+    // decrypted fine when it first arrived over the network.
+    query.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN sender_device_id TEXT"));
     query.exec(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS chats ("
         "  id TEXT PRIMARY KEY,"
@@ -75,12 +81,29 @@ void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entri
         "INSERT OR REPLACE INTO messages "
         "(id, chat_id, sender_id, sender_name, content, encrypted, read_at, created_at, "
         " file_url, file_type, duration_ms, file_name, file_size, key_version, "
-        " is_forwarded, forwarded_from_name, reply_to_id, encryption_version) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " is_forwarded, forwarded_from_name, reply_to_id, encryption_version, "
+        " sender_device_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ));
+
+    // Rows we already hold in the clear (our own sends, cached as plaintext
+    // because a sender cannot decrypt its own ciphertext) must not be replaced
+    // by the server's encrypted copy on the next fetch - that would turn them
+    // back into placeholders.
+    QSet<QString> keepPlaintext;
+    {
+        QSqlQuery probe(m_db);
+        probe.prepare(QStringLiteral(
+            "SELECT id FROM messages WHERE chat_id = ? AND encrypted = 0"));
+        probe.addBindValue(chatId);
+        if (probe.exec()) {
+            while (probe.next()) keepPlaintext.insert(probe.value(0).toString());
+        }
+    }
 
     m_db.transaction();
     for (const Entry& e : entries) {
+        if (e.encrypted && keepPlaintext.contains(e.id)) continue;
         query.addBindValue(e.id);
         query.addBindValue(chatId);
         query.addBindValue(e.senderId);
@@ -99,6 +122,7 @@ void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entri
         query.addBindValue(e.forwardedFromName);
         query.addBindValue(e.replyToId);
         query.addBindValue(e.encryptionVersion <= 0 ? 1 : e.encryptionVersion);
+        query.addBindValue(e.senderDeviceId);
         if (!query.exec()) {
             qWarning() << "[MessageCache] Failed to save message:" << query.lastError().text();
         }
@@ -114,7 +138,8 @@ QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int
     query.prepare(QStringLiteral(
         "SELECT id, sender_id, sender_name, content, encrypted, read_at, created_at, "
         "       file_url, file_type, duration_ms, file_name, file_size, key_version, "
-        "       is_forwarded, forwarded_from_name, reply_to_id, encryption_version "
+        "       is_forwarded, forwarded_from_name, reply_to_id, encryption_version, "
+        "       sender_device_id "
         "FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?"
     ));
     query.addBindValue(chatId);
@@ -143,6 +168,7 @@ QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int
         e.isForwarded = query.value(13).toInt() != 0;
         e.forwardedFromName = query.value(14).toString();
         e.replyToId = query.value(15).toString();
+        e.senderDeviceId = query.value(17).toString();
         e.encryptionVersion = query.value(16).toInt();
         if (e.encryptionVersion <= 0) e.encryptionVersion = 1;
         result.prepend(e); // rows came back newest-first; flip to oldest-first

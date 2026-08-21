@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"time"
 
 	"messenger-app/database"
@@ -130,9 +131,15 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		message.EncryptionVersion = 1
 	}
 
+	if req.FileType != "" {
+		message.ContentType = req.FileType
+	} else if req.ContentType != "" {
+		message.ContentType = req.ContentType
+	}
+	// New clients keep file_url / names / duration / thumbnail in EM1.
+	// Legacy sends that still include file_url are stored as-is.
 	if req.FileURL != "" {
 		message.FileURL = req.FileURL
-		message.ContentType = req.FileType
 		message.DurationMs = req.DurationMs
 		message.FileName = req.FileName
 		message.FileSize = req.FileSize
@@ -156,6 +163,11 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 			"message": "Failed to save message",
 		})
 	}
+	now := time.Now()
+	database.DB.Model(&models.Chat{}).Where("id = ?", chatID).Updates(map[string]interface{}{
+		"last_message_at": now,
+		"updated_at":      now,
+	})
 
 	var forwardedFromMsgID interface{}
 	if message.ForwardedFromMessageID != nil {
@@ -885,9 +897,20 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 		chatsList = append(chatsList, item)
 	}
 
-	// Sort by last_message_at descending (or last_read_at if no message)
-	// Already sorted by last_read_at via query, but let's ensure proper ordering
+	sort.SliceStable(chatsList, func(i, j int) bool {
+		return chatActivityTime(chatsList[i]).After(chatActivityTime(chatsList[j]))
+	})
 	return c.JSON(fiber.Map{
 		"data": chatsList,
 	})
+}
+
+func chatActivityTime(item ChatListItem) time.Time {
+	if item.LastMessage != nil && !item.LastMessage.CreatedAt.IsZero() {
+		return item.LastMessage.CreatedAt
+	}
+	if item.LastMessageAt != nil && !item.LastMessageAt.IsZero() {
+		return *item.LastMessageAt
+	}
+	return item.UpdatedAt
 }

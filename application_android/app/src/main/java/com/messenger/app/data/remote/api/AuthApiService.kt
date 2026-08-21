@@ -327,6 +327,109 @@ interface ChatApiService {
         @Path("sessionId") sessionId: String
     ): Response<E2EEPairingPayloadDto>
 
+    // ==================== MLS (RFC 9420) Delivery Service ====================
+    // The server relays opaque bytes and orders commits; see handlers/mls.go.
+
+    // Approves a QR sign-in displayed on another device. Requires this device
+    // to be authenticated - that session is what authorises the new one.
+    @POST("auth/qr/approve")
+    suspend fun approveQrLogin(
+        @Header("Authorization") token: String,
+        @Body body: QrLoginApproveRequest
+    ): Response<Map<String, String>>
+
+    @POST("e2ee/mls/keypackages")
+    suspend fun publishMlsKeyPackages(
+        @Header("Authorization") token: String,
+        @Body body: MlsPublishKeyPackagesRequest
+    ): Response<MlsPublishKeyPackagesResponse>
+
+    // The count is scoped per device: a KeyPackage commits to one device's init
+    // key, so a device must know its OWN stock, not the account's. It is scoped
+    // per store incarnation too, because a rebuilt store cannot open anything
+    // the previous one published - counting those would report a full stock and
+    // suppress the republish the device needs. Null omits the filter, which is
+    // the pre-store_id behaviour.
+    @GET("e2ee/mls/keypackages/count")
+    suspend fun countMlsKeyPackages(
+        @Header("Authorization") token: String,
+        @Header("X-Device-Id") deviceId: String,
+        @Query("store_id") storeId: String? = null
+    ): Response<MlsKeyPackageCountResponse>
+
+    @POST("e2ee/mls/keypackages/claim")
+    suspend fun claimMlsKeyPackage(
+        @Header("Authorization") token: String,
+        @Body body: MlsClaimKeyPackageRequest
+    ): Response<MlsClaimKeyPackageResponse>
+
+    @POST("e2ee/mls/groups")
+    suspend fun createMlsGroup(
+        @Header("Authorization") token: String,
+        @Body body: MlsCreateGroupRequest
+    ): Response<MlsGroupDto>
+
+    @GET("e2ee/mls/groups/{chatId}")
+    suspend fun getMlsGroup(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String
+    ): Response<MlsGroupDto>
+
+    /** Abandons the chat's MLS group and starts a fresh incarnation. */
+    @POST("e2ee/mls/groups/{chatId}/recreate")
+    suspend fun recreateMlsGroup(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Body body: MlsRecreateGroupRequest
+    ): Response<MlsRecreateGroupResponse>
+
+    @GET("e2ee/mls/groups/{chatId}/coverage")
+    suspend fun getMlsCoverage(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String
+    ): Response<MlsCoverageDto>
+
+    @POST("e2ee/mls/groups/{chatId}/commit")
+    suspend fun submitMlsCommit(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Body body: MlsCommitRequest
+    ): Response<MlsCommitResponse>
+
+    @POST("e2ee/mls/groups/{chatId}/group-info")
+    suspend fun putMlsGroupInfo(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Body body: MlsPutGroupInfoRequest
+    ): Response<Map<String, Long>>
+
+    @GET("e2ee/mls/groups/{chatId}/group-info")
+    suspend fun getMlsGroupInfo(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String
+    ): Response<MlsGroupInfoDto>
+
+    @GET("e2ee/mls/groups/{chatId}/handshakes")
+    suspend fun getMlsHandshakes(
+        @Header("Authorization") token: String,
+        @Path("chatId") chatId: String,
+        @Query("since_epoch") sinceEpoch: Long
+    ): Response<MlsHandshakesResponse>
+
+    @GET("e2ee/mls/welcomes")
+    suspend fun getMlsWelcomes(
+        @Header("Authorization") token: String,
+        @Header("X-Device-Id") deviceId: String
+    ): Response<MlsWelcomesResponse>
+
+    // Only called after joinFromWelcome succeeded; an unacked Welcome stays
+    // pending so a failed join can be retried instead of locking the device out.
+    @POST("e2ee/mls/welcomes/ack")
+    suspend fun ackMlsWelcomes(
+        @Header("Authorization") token: String,
+        @Body body: MlsWelcomeAckRequest
+    ): Response<Unit>
+
     @POST("e2ee/pairing/{sessionId}/complete")
     suspend fun completeE2EEPairing(
         @Header("Authorization") token: String,

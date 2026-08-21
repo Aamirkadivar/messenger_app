@@ -2,7 +2,9 @@ package com.messenger.app.data.repository
 
 import android.util.Log
 import com.messenger.app.data.encryption.E2ECrypto
+import com.messenger.app.data.encryption.MlsProcessed
 import com.messenger.app.data.encryption.DoubleRatchet
+import com.messenger.app.data.encryption.DoubleRatchetV4
 import com.messenger.app.data.local.dao.CachedChatDao
 import com.messenger.app.data.local.dao.ConversationDao
 import com.messenger.app.data.local.dao.MessageDao
@@ -54,8 +56,45 @@ class ChatRepository(
     /** Pull+merge vault from server (sibling device ratchets). */
     private val onVaultPullNeeded: (suspend (token: String, force: Boolean) -> Unit)? = null
 ) {
+    /**
+     * MLS group messaging (encryption_version 5). Optional and set after
+     * construction to avoid a DI cycle. When a chat has no MLS group
+     * established, group sends fall back to Sender Keys exactly as before —
+     * the cutover is per-group, not a flag day.
+     */
+    @Volatile var mls: MlsRepository? = null
     companion object {
         private const val TAG = "ChatRepository"
+        /** Temporary decrypt-failure diagnostics. */
+        private const val DEC = "DecryptTrace"
+
+        /**
+         * The version to file a freshly generated group Sender Key under.
+         *
+         * Invariant: a version identifies exactly one key. It must strictly
+         * advance whenever the key material changes, and must never be reused -
+         * recipients select a key by (chat, sender, version), so a reused number
+         * hands them the wrong key and secretbox authentication fails.
+         *
+         * [groupKeyEpoch] alone is not enough. It only advances on membership
+         * changes, so a key regenerated for any other reason kept the same
+         * number while the material underneath it changed. Taking one past the
+         * highest version ever issued locally preserves the epoch's meaning when
+         * it does advance, and guarantees a regenerated key gets a number of its
+         * own.
+         *
+         * Extracted so the rule is testable: its callers need libsodium and the
+         * network, this does not.
+         */
+        internal fun nextSenderKeyVersion(groupKeyEpoch: Int, existingVersions: Set<Int>): Int =
+            maxOf(groupKeyEpoch, (existingVersions.maxOrNull() ?: -1) + 1)
+
+        /**
+         * MLS (RFC 9420) group messages. Distinct from the direct-message
+         * versions (1/2/4) because the whole key schedule differs: TreeKEM
+         * group state rather than a pairwise ratchet.
+         */
+        const val MLS_ENCRYPTION_VERSION = 5
 
         /** Shown when a message can't be decrypted on this device (no/stale key). */
         const val ENCRYPTED_PLACEHOLDER = "🔒 Encrypted message"
@@ -88,6 +127,13 @@ class ChatRepository(
     private val chatOtherPub = mutableMapOf<String, String>()
     // chatId -> "direct" | "group", learned from the chat list.
     private val chatTypeMap = mutableMapOf<String, String>()
+
+    /**
+     * Group messaging over the shared Rust core (mls-core / OpenMLS). Inert
+     * while [MlsV2Repository.ENABLED] is false - v1 Sender Keys stay the
+     * shipping path until v2 is proven on real devices.
+     */
+    private val mlsV2 by lazy { MlsV2Repository(chatApiService, tokenManager) }
     // Cached local keys so encrypt/decrypt don't hit disk on every message.
     @Volatile private var myPrivateHex: String? = null
     @Volatile private var myUserId: String? = null
@@ -125,6 +171,42 @@ class ChatRepository(
     fun takePendingSecurityNotice(chatId: String): Boolean = pendingSecurityNotices.remove(chatId)
 
     /** The chat's type ("direct"/"group"), if this device has seen it in the chat list yet. */
+    /**
+     * Chat-open hook for MLS v2: publish KeyPackages, consume any pending
+     * Welcome, and either create the group or wait to be added. Best-effort
+     * and off the critical path - if it cannot be established the chat keeps
+     * working on the existing scheme rather than failing to send.
+     */
+    suspend fun ensureMlsV2Group(chatId: String): Boolean =
+        if (MlsV2Repository.ENABLED) mlsV2.ensureGroup(chatId) else false
+
+    suspend fun processMlsV2Welcomes(): List<String> =
+        if (MlsV2Repository.ENABLED) mlsV2.processWelcomes() else emptyList()
+
+    suspend fun syncMlsV2Handshakes(chatId: String) {
+        if (MlsV2Repository.ENABLED) mlsV2.syncHandshakes(chatId)
+    }
+
+    suspend fun ensureMlsV2KeyPackages() {
+        if (MlsV2Repository.ENABLED) mlsV2.ensureKeyPackages()
+    }
+
+    /**
+     * Abandons this chat's MLS group and joins a fresh incarnation.
+     *
+     * The recovery action for a device whose local MLS state is gone: it cannot
+     * rejoin the existing tree, so the group is replaced and every current device
+     * is Welcomed into the new one. Messages sent under the old group stop being
+     * decryptable.
+     *
+     * Deliberately explicit and never automatic - it is destructive to the old
+     * group - and bounded to one attempt per chat per run, so a repeated failure
+     * cannot leave a trail of dead incarnations. Returns true only once this
+     * device holds durably persisted state for the new group.
+     */
+    suspend fun recreateMlsV2Group(chatId: String): Boolean =
+        if (MlsV2Repository.ENABLED) mlsV2.recreateMlsGroup(chatId) else false
+
     fun chatTypeFor(chatId: String): String = chatTypeMap[chatId] ?: "direct"
 
     /**
@@ -330,12 +412,11 @@ class ChatRepository(
 
     private suspend fun sealDirectV3(chatId: String, otherPub: String, priv: String, inner: ByteArray): ByteArray? {
         val me = myUserId ?: tokenManager.getCurrentUserId().getOrNull().orEmpty()
-        val myDev = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
         val myPub = myPubHex() ?: otherPub
         val devices = chatDevices[chatId].orEmpty()
         val targets = LinkedHashMap<String, String>()
         for ((uid, did) in devices) {
-            if (did.isBlank() || did == myDev) continue
+            if (did.isBlank()) continue
             val pub = if (uid == me) myPub else otherPub
             if (pub.isNotBlank()) targets[did] = pub
         }
@@ -355,15 +436,147 @@ class ChatRepository(
         otherPub: String,
         priv: String,
         payload: ByteArray,
+        senderId: String,
         senderDeviceId: String
     ): ByteArray? {
         val myDev = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
         val blob = E2ECrypto.pickFanout(payload, myDev) ?: return null
         val keyed = if (senderDeviceId.isNotBlank()) "$chatId|$senderDeviceId" else chatId
-        decryptDirectV3(keyed, otherPub, priv, blob)?.let { return it }
+        // Same self-session rule as openDirectV4.
+        val sessPub = if (senderId.isNotBlank() && senderId == currentUserIdOrEmpty())
+            (myPubHex() ?: otherPub) else otherPub
+        decryptDirectV3(keyed, sessPub, priv, blob)?.let { return it }
         if (keyed != chatId) decryptDirectV3(chatId, otherPub, priv, blob)?.let { return it }
         return null
     }
+
+    // ==================== Direct v4 (X3DH-lite two-root ratchet) ====================
+    // Glare-safe replacement for v3 (see DoubleRatchetV4 / docs/e2ee-protocol-v4.md).
+    // Sessions are role-free: InitSession is symmetric from the two identity keys.
+    // Stored under a "v4:" prefix so they never clobber legacy v3 vault entries.
+
+    private val drV4Sessions = mutableMapOf<String, DoubleRatchetV4.Session>()
+
+    private suspend fun loadRatchetV4(sessionKey: String, otherPub: String): DoubleRatchetV4.Session? {
+        // Sessions created by earlier builds' failed decrypt attempts were
+        // initialized with the other user's key even for this account's own
+        // traffic; their rk0 can never open those blobs. A stored session
+        // whose peerIdent disagrees with [otherPub] is stale — discard it and
+        // re-derive from the right identity.
+        val expected = E2ECrypto.fromHex(otherPub)
+        fun identityOk(st: DoubleRatchetV4.Session): Boolean =
+            expected == null || st.peerIdent.contentEquals(expected)
+        drV4Sessions[sessionKey]?.let { if (identityOk(it)) return it }
+        tokenManager.loadDirectRatchet("v4:$sessionKey").getOrNull()?.let { json ->
+            DoubleRatchetV4.Session.fromJson(json)?.let {
+                if (identityOk(it)) {
+                    drV4Sessions[sessionKey] = it
+                    return it
+                }
+            }
+        }
+        val myPk = E2ECrypto.fromHex(myPubHex() ?: return null) ?: return null
+        val mySk = E2ECrypto.fromHex(myPriv() ?: return null) ?: return null
+        val peer = expected ?: return null
+        return DoubleRatchetV4.initSession(myPk, mySk, peer)?.also { drV4Sessions[sessionKey] = it }
+    }
+
+    private suspend fun persistRatchetV4(sessionKey: String, st: DoubleRatchetV4.Session) {
+        st.seq += 1
+        drV4Sessions[sessionKey] = st
+        tokenManager.saveDirectRatchet("v4:$sessionKey", st.toJson())
+        tokenManager.getAccessToken().getOrNull()?.let { notifyVaultMaterialChanged(it) }
+    }
+
+    private suspend fun encryptDirectV4(sessionKey: String, otherPub: String, plain: ByteArray): ByteArray? {
+        val st = loadRatchetV4(sessionKey, otherPub) ?: return null
+        val out = st.encrypt(plain) ?: return null
+        persistRatchetV4(sessionKey, st)
+        return out
+    }
+
+    private suspend fun decryptDirectV4(sessionKey: String, otherPub: String, payload: ByteArray): ByteArray? {
+        val st = loadRatchetV4(sessionKey, otherPub) ?: return null
+        val plain = st.decrypt(payload) ?: return null
+        persistRatchetV4(sessionKey, st)
+        return plain
+    }
+
+    /**
+     * Seal a copy for THIS device with a throwaway self-session. Using the
+     * stored chatId|myDev session poisoned it: decrypting our own blob on a
+     * history refetch flipped its recvFirst/turnPending, after which every
+     * later send became a NORMAL-type message whose DH (ephemeral with itself)
+     * can never be reproduced — those rows rendered as encrypted forever. A
+     * fresh session per send always emits an INITIAL-type message, which the
+     * stateless path in DoubleRatchetV4.decrypt can re-read any number of times.
+     */
+    private suspend fun sealSelfV4(inner: ByteArray): ByteArray? {
+        val pk = E2ECrypto.fromHex(myPubHex() ?: return null) ?: return null
+        val sk = E2ECrypto.fromHex(myPriv() ?: return null) ?: return null
+        val tmp = DoubleRatchetV4.initSession(pk, sk, pk) ?: return null
+        return tmp.encrypt(inner)
+    }
+
+    private suspend fun sealDirectV4(chatId: String, otherPub: String, inner: ByteArray): ByteArray? {
+        val me = myUserId ?: tokenManager.getCurrentUserId().getOrNull().orEmpty()
+        val myPub = myPubHex() ?: otherPub
+        val myDev = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
+        val devices = chatDevices[chatId].orEmpty()
+        val targets = LinkedHashMap<String, String>()
+        for ((uid, did) in devices) {
+            if (did.isBlank()) continue
+            val pub = if (uid == me) myPub else otherPub
+            if (pub.isNotBlank()) targets[did] = pub
+        }
+        // Always seal a copy for THIS device, even when the server's registry
+        // doesn't list it (fresh install that hasn't registered yet). Without
+        // this, our own history is sealed only for other devices and can never
+        // be read back here.
+        if (myDev.isNotBlank() && myPub.isNotBlank() && targets.isNotEmpty()) {
+            targets[myDev] = myPub
+        }
+        if (targets.size <= 1) {
+            return encryptDirectV4(chatId, otherPub, inner)
+        }
+        val parts = ArrayList<E2ECrypto.FanoutPart>(targets.size)
+        for ((did, pub) in targets) {
+            val blob = if (did == myDev) sealSelfV4(inner)
+                       else encryptDirectV4("$chatId|$did", pub, inner)
+            if (blob == null) return null
+            parts.add(E2ECrypto.FanoutPart(did, blob))
+        }
+        return E2ECrypto.wrapFanout(parts)
+    }
+
+    private suspend fun openDirectV4(chatId: String, otherPub: String, payload: ByteArray, senderId: String, senderDeviceId: String): ByteArray? {
+        val myDev = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
+        val keyed = if (senderDeviceId.isNotBlank()) "$chatId|$senderDeviceId" else chatId
+        // A message from one of this account's own devices rides a
+        // self-session whose root pairs our identity with itself; initializing
+        // that session with the peer's key derives the wrong rk0 and even the
+        // stateless INITIAL path cannot open it.
+        val sessPub = if (senderId.isNotBlank() && senderId == currentUserIdOrEmpty())
+            (myPubHex() ?: otherPub) else otherPub
+        val blob = E2ECrypto.pickFanout(payload, myDev)
+        if (blob != null) {
+            decryptDirectV4(keyed, sessPub, blob)?.let { return it }
+            if (keyed != chatId) decryptDirectV4(chatId, otherPub, blob)?.let { return it }
+        }
+        // No blob for this device id (or it failed): this install may be
+        // missing from the registry the sender fanned out to (fresh install,
+        // changed device id). INITIAL blobs open statelessly with just the
+        // account identity, so try the copies addressed to other devices —
+        // wrong ones simply fail authentication.
+        for (part in E2ECrypto.listFanout(payload)) {
+            if (part.deviceId == myDev) continue
+            decryptDirectV4(keyed, sessPub, part.blob)?.let { return it }
+        }
+        return null
+    }
+
+    private suspend fun currentUserIdOrEmpty(): String =
+        myUserId ?: tokenManager.getCurrentUserId().getOrNull().orEmpty()
 
     /** Encrypt for a direct chat with protocol v3 Double Ratchet when possible. */
     data class SealedText(
@@ -379,18 +592,25 @@ class ChatRepository(
         forwardedFrom: String = "",
         fileName: String = "",
         durationMs: Long = 0,
-        fileSize: Long = 0
+        fileSize: Long = 0,
+        thumbnailUrl: String = "",
+        fileUrl: String = ""
     ): SealedText {
+        // Pairwise (direct) path. Group text is sealed with Sender Keys in
+        // encryptGroupText; do not send MLS from here.
         val otherPub = chatOtherPub[chatId] ?: return SealedText(plaintext, false, 1)
         val priv = myPriv() ?: return SealedText(plaintext, false, 1)
         val inner = E2ECrypto.wrapEnvelope(
-            plaintext.toByteArray(Charsets.UTF_8), fileName, forwardedFrom, durationMs, fileSize
+            plaintext.toByteArray(Charsets.UTF_8), fileName, forwardedFrom, durationMs, fileSize, thumbnailUrl, fileUrl
         )
         syncVaultDown()
         tokenManager.getAccessToken().getOrNull()?.let { refreshChatDevices(it, chatId) }
         drMutex.withLock {
-            val v3 = sealDirectV3(chatId, otherPub, priv, inner)
-            if (v3 != null) return SealedText(E2ECrypto.toHex(v3), true, 3)
+            // v4 X3DH-lite (glare-safe) is the default; v3 is retired for new
+            // sends because it breaks under simultaneous send. v2/v1 remain as
+            // fallbacks if the ratchet cannot be established.
+            val v4 = sealDirectV4(chatId, otherPub, inner)
+            if (v4 != null) return SealedText(E2ECrypto.toHex(v4), true, 4)
         }
         val v2 = E2ECrypto.encryptBytesEphemeral(inner, otherPub)
         if (v2 != null) return SealedText(E2ECrypto.toHex(v2), true, 2)
@@ -422,10 +642,15 @@ class ChatRepository(
         fileName: String = "",
         forwardedFrom: String = "",
         durationMs: Long = 0,
-        fileSize: Long = 0
+        fileSize: Long = 0,
+        thumbnailUrl: String = "",
+        fileUrl: String = ""
     ): SealedBytes? {
-        val inner = E2ECrypto.wrapEnvelope(plain, fileName, forwardedFrom, durationMs, fileSize)
+        val inner = E2ECrypto.wrapEnvelope(plain, fileName, forwardedFrom, durationMs, fileSize, thumbnailUrl, fileUrl)
         if (chatTypeMap[chatId].equals("group", ignoreCase = true)) {
+            // v5 (BouncyCastle MLS) removed: it never interoperated with the
+            // Windows mlspp stack and its group state could not be rebuilt after
+            // a restart. Group media is Sender Keys until v6 covers binary too.
             val state = ensureGroupSenderKeyReady(token, chatId) ?: return null
             val cipher = E2ECrypto.secretBoxEncryptBytes(inner, state.keyHex) ?: return null
             return SealedBytes(cipher, state.version)
@@ -435,8 +660,8 @@ class ChatRepository(
         syncVaultDown()
         refreshChatDevices(token, chatId)
         drMutex.withLock {
-            val v3 = sealDirectV3(chatId, otherPub, priv, inner)
-            if (v3 != null) return SealedBytes(v3, 0, 3)
+            val v4 = sealDirectV4(chatId, otherPub, inner)
+            if (v4 != null) return SealedBytes(v4, 0, 4)
         }
         val eph = E2ECrypto.encryptBytesEphemeral(inner, otherPub)
         if (eph != null) return SealedBytes(eph, 0, 2)
@@ -475,35 +700,117 @@ class ChatRepository(
         val fileName: String = "",
         val forwardedFrom: String = "",
         val durationMs: Long = 0,
-        val fileSize: Long = 0
+        val fileSize: Long = 0,
+        val thumbnailUrl: String = "",
+        val fileUrl: String = ""
     )
 
+    /**
+     * [chatType] is the server's own classification for the row being opened,
+     * and takes precedence over [chatTypeMap].
+     *
+     * encryption_version 1 is overloaded: it means pairwise crypto_box in a
+     * direct chat and group Sender Keys in a group, with nothing in the payload
+     * to tell them apart. Dispatch therefore depends on knowing the chat type -
+     * and chatTypeMap is an in-memory map that is empty until the chat list
+     * loads. On a cold start a group v1 row was routed to the pairwise
+     * decryptor, failed its tag check, and rendered as the encrypted
+     * placeholder. Passing the row's own chat_type removes that dependency.
+     *
+     * Blank falls back to chatTypeMap for callers that genuinely have no row
+     * metadata; those keep the previous behaviour rather than guessing.
+     */
     private suspend fun decryptToBytes(
         chatId: String,
         payload: ByteArray,
         senderId: String,
         keyVersion: Int,
         encryptionVersion: Int,
-        senderDeviceId: String = ""
+        senderDeviceId: String = "",
+        chatType: String = ""
     ): ByteArray? {
-        if (chatTypeMap[chatId].equals("group", ignoreCase = true)) {
-            ensurePeerSenderKeysLoaded(chatId)
-            val keyHex = groupSenderKeyFor(chatId, senderId, keyVersion) ?: return null
-            return E2ECrypto.secretBoxDecryptBytes(payload, keyHex)
+        // MLS v2 (v6): the shared Rust/OpenMLS core. Must come first - v6 rows
+        // are unreadable by the v5 BouncyCastle stack and vice versa, which is
+        // exactly why they carry different version numbers.
+        //
+        // Note the sender cannot open its own message: OpenMLS drops the key at
+        // encrypt time for forward secrecy, so our own rows are served from the
+        // local plaintext cache, never from here.
+        if (encryptionVersion == MlsV2Repository.ENCRYPTION_VERSION) {
+            val out = mlsV2.process(chatId, payload)
+            if (out is MlsProcessed.Application) {
+                return out.plaintext
+            }
+            android.util.Log.w(DEC, "FAIL v6(mls2): no group state or open failed chat=" + chatId)
+            return null
         }
-        val priv = myPriv() ?: return null
+        // v5 was the BouncyCastle MLS stack. It is removed: it never
+        // interoperated with the Windows mlspp client and its group state could
+        // not be rebuilt after a restart, so no device holds keys for these rows
+        // any more. They are permanently unreadable - say so once instead of
+        // retrying on every repaint.
+        if (encryptionVersion == 5) {
+            android.util.Log.w(DEC, "v5 row is unreadable (BouncyCastle MLS removed) chat=" + chatId)
+            return null
+        }
+        val isGroupRow = if (chatType.isNotBlank()) {
+            chatType.equals("group", ignoreCase = true)
+        } else {
+            chatTypeMap[chatId].equals("group", ignoreCase = true)
+        }
+        if (isGroupRow) {
+            ensurePeerSenderKeysLoaded(chatId)
+            val keyHex = groupSenderKeyFor(chatId, senderId, keyVersion) ?: run {
+                android.util.Log.w(DEC, "FAIL group: no sender key chat=$chatId sender=$senderId ver=$keyVersion")
+                return null
+            }
+            return E2ECrypto.secretBoxDecryptBytes(payload, keyHex).also {
+                if (it == null) android.util.Log.w(DEC, "FAIL group: secretBox open returned null chat=$chatId")
+            }
+        }
+        val priv = myPriv() ?: run {
+            android.util.Log.w(DEC, "FAIL direct: no private key (vault empty/locked) chat=$chatId")
+            return null
+        }
         val otherPub = chatOtherPub[chatId] ?: ""
+        android.util.Log.d(
+            DEC,
+            "try chat=$chatId encV=$encryptionVersion payload=${payload.size} " +
+                "otherPub=${if (otherPub.isEmpty()) "MISSING" else "len${otherPub.length}"} " +
+                "devId=${senderDeviceId.ifEmpty { "EMPTY" }}"
+        )
+        if (encryptionVersion == 4) {
+            if (otherPub.isEmpty()) {
+                android.util.Log.w(DEC, "FAIL v4: peer identity key missing chat=$chatId")
+                return null
+            }
+            syncVaultDown()
+            drMutex.withLock { openDirectV4(chatId, otherPub, payload, senderId, senderDeviceId) }?.let { return it }
+            syncVaultDown(force = true)
+            return drMutex.withLock { openDirectV4(chatId, otherPub, payload, senderId, senderDeviceId) }.also {
+                if (it == null) android.util.Log.w(DEC, "FAIL v4: ratchet open failed even after vault resync chat=$chatId devId=${senderDeviceId.ifEmpty { "EMPTY" }}")
+            }
+        }
         if (encryptionVersion == 3) {
             syncVaultDown()
-            drMutex.withLock { openDirectV3(chatId, otherPub, priv, payload, senderDeviceId) }?.let { return it }
+            drMutex.withLock { openDirectV3(chatId, otherPub, priv, payload, senderId, senderDeviceId) }?.let { return it }
             syncVaultDown(force = true)
-            return drMutex.withLock { openDirectV3(chatId, otherPub, priv, payload, senderDeviceId) }
+            return drMutex.withLock { openDirectV3(chatId, otherPub, priv, payload, senderId, senderDeviceId) }.also {
+                if (it == null) android.util.Log.w(DEC, "FAIL v3: ratchet open failed even after vault resync chat=$chatId devId=${senderDeviceId.ifEmpty { "EMPTY" }}")
+            }
         }
         if (encryptionVersion >= 2) {
-            return E2ECrypto.decryptBytesEphemeral(payload, priv)
+            return E2ECrypto.decryptBytesEphemeral(payload, priv).also {
+                if (it == null) android.util.Log.w(DEC, "FAIL v2: ephemeral open failed chat=$chatId")
+            }
         }
-        if (otherPub.isEmpty()) return null
-        return E2ECrypto.decryptBytes(payload, otherPub, priv)
+        if (otherPub.isEmpty()) {
+            android.util.Log.w(DEC, "FAIL v1: peer public key missing chat=$chatId")
+            return null
+        }
+        return E2ECrypto.decryptBytes(payload, otherPub, priv).also {
+            if (it == null) android.util.Log.w(DEC, "FAIL v1: box open failed chat=$chatId")
+        }
     }
 
     suspend fun openFor(
@@ -513,16 +820,17 @@ class ChatRepository(
         senderId: String = "",
         keyVersion: Int = 0,
         encryptionVersion: Int = 1,
-        senderDeviceId: String = ""
+        senderDeviceId: String = "",
+        chatType: String = ""
     ): OpenedMessage {
         if (!encrypted) return OpenedMessage(content)
         if (content.isBlank()) return OpenedMessage("")
         val payload = E2ECrypto.fromHex(content) ?: return OpenedMessage(ENCRYPTED_PLACEHOLDER)
-        val plain = decryptToBytes(chatId, payload, senderId, keyVersion, encryptionVersion, senderDeviceId)
+        val plain = decryptToBytes(chatId, payload, senderId, keyVersion, encryptionVersion, senderDeviceId, chatType)
             ?: return OpenedMessage(ENCRYPTED_PLACEHOLDER)
         val env = E2ECrypto.unwrapEnvelope(plain)
         val text = runCatching { String(env.payload, Charsets.UTF_8) }.getOrDefault(ENCRYPTED_PLACEHOLDER)
-        return OpenedMessage(text, env.fileName, env.forwardedFrom, env.durationMs, env.fileSize)
+        return OpenedMessage(text, env.fileName, env.forwardedFrom, env.durationMs, env.fileSize, env.thumbnailUrl, env.fileUrl)
     }
 
     suspend fun decryptFor(
@@ -532,8 +840,9 @@ class ChatRepository(
         senderId: String = "",
         keyVersion: Int = 0,
         encryptionVersion: Int = 1,
-        senderDeviceId: String = ""
-    ): String = openFor(chatId, content, encrypted, senderId, keyVersion, encryptionVersion, senderDeviceId).text
+        senderDeviceId: String = "",
+        chatType: String = ""
+    ): String = openFor(chatId, content, encrypted, senderId, keyVersion, encryptionVersion, senderDeviceId, chatType).text
 
     // ==================== Group "Sender Keys" ====================
 
@@ -544,7 +853,10 @@ class ChatRepository(
      */
     private fun groupSenderKeyFor(chatId: String, senderId: String, keyVersion: Int): String? {
         if (senderId.isNotEmpty() && senderId == myUserId) {
-            return mySenderKeys[chatId]?.get(keyVersion)
+            mySenderKeys[chatId]?.get(keyVersion)?.let { return it }
+            // Other installs of this account fetch our key as a "peer" copy
+            // published to ourselves; use that when this device never generated it.
+            return groupOtherKeys["$chatId|$senderId|$keyVersion"]
         }
         return groupOtherKeys["$chatId|$senderId|$keyVersion"]
     }
@@ -588,18 +900,36 @@ class ChatRepository(
             val newKeyHex = E2ECrypto.secretBoxGenerateKey() ?: return@withLock current
             val newKeyBytes = E2ECrypto.fromHex(newKeyHex) ?: return@withLock current
             val priv = myPriv() ?: return@withLock current
-            val myId = myUserId
+
+            // The version must never name two different keys.
+            //
+            // This used to be group.keyEpoch alone. The epoch only moves when
+            // group membership changes, so a key regenerated for any other
+            // reason - local state lost, storage cleared - got a fresh random
+            // key under the SAME version. That overwrote the previous entry
+            // locally while every recipient still held the old key filed under
+            // the same number, so they looked up the version, found the stale
+            // key, and secretbox authentication failed on every message. The
+            // sender could not even read its own history back.
+            //
+            // Taking one past the highest version we have ever issued keeps the
+            // epoch's meaning when it does advance, guarantees a regenerated key
+            // is never confused with its predecessor, and leaves older versions
+            // in place so existing ciphertext stays readable.
+            val nextVersion = nextSenderKeyVersion(group.keyEpoch, versions.keys)
 
             val recipients = group.members.mapNotNull { member ->
-                if (member.id == myId) return@mapNotNull null
                 val pub = member.publicKey.takeIf { it.isNotBlank() } ?: return@mapNotNull null
                 val encrypted = E2ECrypto.encryptBytes(newKeyBytes, pub, priv) ?: return@mapNotNull null
                 SenderKeyRecipientDto(userId = member.id, encryptedKey = E2ECrypto.toHex(encrypted))
             }
 
-            val state = SenderKeyState(group.keyEpoch, newKeyHex)
+            val state = SenderKeyState(nextVersion, newKeyHex)
             if (recipients.isNotEmpty()) {
-                groupRepository.publishSenderKey(token, chatId, group.keyEpoch, recipients)
+                // Publish under the same version the ciphertext will advertise -
+                // distributing under a different number is what left senders and
+                // recipients disagreeing.
+                groupRepository.publishSenderKey(token, chatId, nextVersion, recipients)
                     .onFailure { Log.w(TAG, "publishSenderKey failed for $chatId - keeping key locally anyway", it) }
             }
             versions[state.version] = state.keyHex
@@ -641,15 +971,19 @@ class ChatRepository(
         forwardedFrom: String = "",
         fileName: String = "",
         durationMs: Long = 0,
-        fileSize: Long = 0
-    ): Triple<String, Boolean, Int> {
-        val state = ensureGroupSenderKeyReady(token, chatId) ?: return Triple(plaintext, false, 0)
+        fileSize: Long = 0,
+        thumbnailUrl: String = "",
+        fileUrl: String = ""
+    ): SealedText {
         val inner = E2ECrypto.wrapEnvelope(
-            plaintext.toByteArray(Charsets.UTF_8), fileName, forwardedFrom, durationMs, fileSize
+            plaintext.toByteArray(Charsets.UTF_8), fileName, forwardedFrom, durationMs, fileSize, thumbnailUrl, fileUrl
         )
+        // v5 (BouncyCastle MLS) removed - see encryptBytesForChat. Group text
+        // now goes v6 (Rust/OpenMLS) in sendMessage, or Sender Keys here.
+        val state = ensureGroupSenderKeyReady(token, chatId) ?: return SealedText(plaintext, false, 1, 0)
         val cipher = E2ECrypto.secretBoxEncryptBytes(inner, state.keyHex)
-            ?: return Triple(plaintext, false, 0)
-        return Triple(E2ECrypto.toHex(cipher), true, state.version)
+            ?: return SealedText(plaintext, false, 1, 0)
+        return SealedText(E2ECrypto.toHex(cipher), true, 1, state.version)
     }
 
     suspend fun sealMessage(
@@ -660,13 +994,14 @@ class ChatRepository(
         forwardedFrom: String = "",
         fileName: String = "",
         durationMs: Long = 0,
-        fileSize: Long = 0
+        fileSize: Long = 0,
+        thumbnailUrl: String = "",
+        fileUrl: String = ""
     ): SealedText {
         return if (chatType.equals("group", ignoreCase = true)) {
-            val t = encryptGroupText(token, chatId, plaintext, forwardedFrom, fileName, durationMs, fileSize)
-            SealedText(t.first, t.second, 1, t.third)
+            encryptGroupText(token, chatId, plaintext, forwardedFrom, fileName, durationMs, fileSize, thumbnailUrl, fileUrl)
         } else {
-            encryptFor(chatId, plaintext, forwardedFrom, fileName, durationMs, fileSize)
+            encryptFor(chatId, plaintext, forwardedFrom, fileName, durationMs, fileSize, thumbnailUrl, fileUrl)
         }
     }
 
@@ -844,21 +1179,72 @@ class ChatRepository(
             val keyVersion: Int
             val encVer: Int
             if (chatType.equals("group", ignoreCase = true)) {
-                val t = encryptGroupText(token, chatId, plaintext, forwardedFrom = forward.fromName)
-                if (!t.second) {
-                    return@withContext Result.failure(
-                        Exception("Cannot send: group encryption key is not ready")
+                // v2 (Rust/OpenMLS) first. null means this device is not a
+                // member of the v2 group yet, and falling through to Sender
+                // Keys is correct rather than an error.
+                val v2 = if (MlsV2Repository.ENABLED) {
+                    mlsV2.encrypt(
+                        chatId,
+                        E2ECrypto.wrapEnvelope(
+                            plaintext.toByteArray(Charsets.UTF_8), "", forward.fromName,
+                            0L, 0L, "", ""
+                        )
                     )
+                } else null
+                Log.i(TAG, "MLS v2 gate for " + chatId + ": produced=" + (v2 != null))
+                if (v2 != null) {
+                    outContent = E2ECrypto.toHex(v2)
+                    encrypted = true
+                    keyVersion = 0
+                    encVer = MlsV2Repository.ENCRYPTION_VERSION
+                } else {
+                    // MLS produced nothing. Before this fell straight through to
+                    // Sender Keys, which is how a device that had lost its MLS
+                    // state kept emitting encryption_version=1 into an MLS group -
+                    // messages no member could read, with nothing to say so.
+                    //
+                    // Whether that fallback is legitimate depends on the group,
+                    // and only the Delivery Service knows: if it holds an MLS
+                    // group for this chat, the conversation is MLS-governed and a
+                    // Sender-Key message is simply wrong. Fail closed and let the
+                    // caller surface it; recovery is a separate, explicit act.
+                    if (MlsV2Repository.ENABLED && mlsV2.serverHasGroup(chatId)) {
+                        Log.e(
+                            TAG,
+                            "MLS group state unavailable; refusing group send for $chatId " +
+                                "(this device is not a member of the MLS group)"
+                        )
+                        return@withContext Result.failure(MlsGroupStateUnavailableException(chatId))
+                    }
+
+                    // Legacy, non-MLS group: Sender Keys remain correct here.
+                    val t = encryptGroupText(token, chatId, plaintext, forwardedFrom = forward.fromName)
+                    if (!t.encrypted) {
+                        return@withContext Result.failure(
+                            Exception("Cannot send: group encryption key is not ready")
+                        )
+                    }
+                    outContent = t.content
+                    encrypted = true
+                    keyVersion = t.keyVersion
+                    encVer = t.encryptionVersion
                 }
-                outContent = t.first
-                encrypted = true
-                keyVersion = t.third
-                encVer = 1
             } else {
                 val s = encryptFor(chatId, plaintext, forwardedFrom = forward.fromName)
                 if (!s.encrypted) {
+                    // Two very different causes; naming the wrong one sends the
+                    // user hunting through the other person's account. The
+                    // common case is this device having no identity key yet
+                    // (signed in without unlocking the vault).
+                    val mine = myPriv().isNullOrBlank()
                     return@withContext Result.failure(
-                        Exception("Cannot send: peer encryption key is missing")
+                        Exception(
+                            if (mine) "Encryption isn't set up on this device yet. " +
+                                "Unlock your encrypted messages with your password " +
+                                "or recovery key to send."
+                            else "Cannot send: this contact hasn't published an " +
+                                "encryption key yet."
+                        )
                     )
                 }
                 outContent = s.content
@@ -891,17 +1277,27 @@ class ChatRepository(
                         id = sent.id,
                         conversation_id = sent.chatId,
                         senderId = sent.senderId,
-                        // Store what was actually sent over the wire (ciphertext when
-                        // E2EE is active), never the decrypted plaintext - matches the
-                        // "server never sees plaintext, and neither does disk" principle.
-                        content = sent.content ?: outContent,
+                        // Cache our OWN message as plaintext. A ratchet sender
+                        // does not retain the message keys it just used, and
+                        // the wire self-copy only exists when the device list
+                        // was available at send time - without this, our own
+                        // messages turn into the encrypted placeholder when
+                        // the chat is reopened from cache. Same as Windows.
+                        content = plaintext,
                         type = "text",
                         status = "SENT",
                         timestamp = parseTimestamp(sent.createdAt),
-                        isEncrypted = sent.encrypted,
+                        isEncrypted = false,
                         readAt = null,
                         keyVersion = keyVersion,
+                        // The version we actually sent, not a hardcoded 1. A v5
+                        // row mislabelled as v1 invites any later pass to
+                        // "re-decrypt" it with the wrong scheme, and an MLS
+                        // sender can never recover its own plaintext once this
+                        // cached copy is lost - it holds no key for its own
+                        // message.
                         encryptionVersion = encVer,
+                        senderDeviceId = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty(),
                         replyTo = replyToId.ifBlank { null },
                         isForwarded = forward.isForwarded,
                         forwardedFromName = forward.fromName,
@@ -945,7 +1341,7 @@ class ChatRepository(
                     content = sealedContent,
                     contentType = VOICE_CONTENT_TYPE,
                     encrypted = encrypted,
-                    fileUrl = fileUrl,
+                    fileUrl = "",
                     fileType = VOICE_CONTENT_TYPE,
                     durationMs = 0,
                     keyVersion = keyVersion,
@@ -996,10 +1392,10 @@ class ChatRepository(
                     content = sealedContent,
                     contentType = VIDEO_NOTE_CONTENT_TYPE,
                     encrypted = encrypted,
-                    fileUrl = fileUrl,
+                    fileUrl = "",
                     fileType = VIDEO_NOTE_CONTENT_TYPE,
                     durationMs = 0,
-                    thumbnailUrl = thumbnailUrl,
+                    thumbnailUrl = "",
                     keyVersion = keyVersion,
                     encryptionVersion = encryptionVersion,
                     replyToId = replyToId,
@@ -1050,7 +1446,7 @@ class ChatRepository(
                     content = sealedContent,
                     contentType = contentType,
                     encrypted = encrypted,
-                    fileUrl = fileUrl,
+                    fileUrl = "",
                     fileType = contentType,
                     fileName = "",
                     fileSize = 0,
@@ -1118,6 +1514,7 @@ class ChatRepository(
                 durationMs = e.durationMs,
                 keyVersion = e.keyVersion,
                 encryptionVersion = e.encryptionVersion,
+                senderDeviceId = e.senderDeviceId,
                 replyToId = e.replyTo,
                 isForwarded = e.isForwarded,
                 forwardedFromName = e.forwardedFromName,
@@ -1128,24 +1525,70 @@ class ChatRepository(
         }
     }
 
+    /** Decrypts a fetched text row, or null when it cannot be opened. */
+    private suspend fun openTextOrNull(chatId: String, dto: MessageDto): OpenedMessage? {
+        val payload = E2ECrypto.fromHex(dto.content) ?: return null
+        val ver = if (dto.encryptionVersion == 0) 1 else dto.encryptionVersion
+        // dto.type carries the server's chat_type for this row (GetMessages sets
+        // Type: m.ChatType). Authoritative, and available before the chat list
+        // has populated chatTypeMap.
+        val plain = decryptToBytes(
+            chatId, payload, dto.senderId, dto.keyVersion, ver, dto.senderDeviceId, dto.type.orEmpty()
+        ) ?: return null
+        val env = E2ECrypto.unwrapEnvelope(plain)
+        val text = runCatching { String(env.payload, Charsets.UTF_8) }.getOrNull() ?: return null
+        return OpenedMessage(text, env.fileName, env.forwardedFrom, env.durationMs, env.fileSize, env.thumbnailUrl, env.fileUrl)
+    }
+
     private suspend fun cacheMessages(chatId: String, dtos: List<MessageDto>) {
         if (dtos.isEmpty()) return
         // Messages carry a FK to conversations; upsert a placeholder row only if
         // one doesn't exist yet so we never REPLACE (and thus cascade-delete) an
         // existing conversation's already-cached messages.
         if (conversationDao.getConversationById(chatId) == null) {
-            conversationDao.insertConversation(ConversationEntity(id = chatId, type = chatTypeMap[chatId] ?: "direct"))
+            // Prefer the rows' own server-side chat_type. Using chatTypeMap alone
+            // durably recorded a group as "direct" whenever the map was still
+            // cold - the cache then carried that wrong type indefinitely.
+            val authoritativeType = dtos.firstOrNull { !it.type.isNullOrBlank() }?.type
+                ?: chatTypeMap[chatId]
+                ?: "direct"
+            conversationDao.insertConversation(ConversationEntity(id = chatId, type = authoritativeType))
         }
         val entities = dtos.map { dto ->
+            // Decrypt-on-store for text rows. Ratchet message keys are consumed
+            // on first use, so a row cached as ciphertext may never open again
+            // on a later read; the decrypted copy is what makes reopening a
+            // chat show text instead of the encrypted placeholder. On failure,
+            // never clobber an already-readable row (e.g. our own send, stored
+            // open at send time) with ciphertext the ratchet cannot reopen.
+            var content = dto.content
+            var encrypted = dto.encrypted
+            var fwdName = dto.forwardedFromName
+            val isMedia = !dto.fileType.isNullOrBlank()
+            if (encrypted && !isMedia && content.isNotBlank()) {
+                val opened = openTextOrNull(chatId, dto)
+                if (opened != null) {
+                    content = opened.text
+                    fwdName = fwdName.ifBlank { opened.forwardedFrom }
+                    encrypted = false
+                } else {
+                    val existing = messageDao.getMessageById(dto.id)
+                    if (existing != null && !existing.isEncrypted && existing.content.isNotBlank()) {
+                        content = existing.content
+                        fwdName = fwdName.ifBlank { existing.forwardedFromName }
+                        encrypted = false
+                    }
+                }
+            }
             MessageEntity(
                 id = dto.id,
                 conversation_id = chatId,
                 senderId = dto.senderId,
-                content = dto.content,
+                content = content,
                 type = "text",
                 status = "SENT",
                 timestamp = parseTimestamp(dto.createdAt),
-                isEncrypted = dto.encrypted,
+                isEncrypted = encrypted,
                 readAt = dto.readAt,
                 fileUrl = dto.fileUrl,
                 fileType = dto.fileType,
@@ -1154,13 +1597,21 @@ class ChatRepository(
                 durationMs = dto.durationMs,
                 keyVersion = dto.keyVersion,
                 encryptionVersion = if (dto.encryptionVersion == 0) 1 else dto.encryptionVersion,
+                senderDeviceId = dto.senderDeviceId,
                 replyTo = dto.replyToId,
                 isForwarded = dto.isForwarded,
-                forwardedFromName = dto.forwardedFromName,
+                forwardedFromName = fwdName,
                 forwardedFromMessageId = dto.forwardedFromMessageId.orEmpty()
             )
         }
-        messageDao.insertMessages(entities)
+        // Rows we already hold in the clear (our own sends) must not be
+        // replaced by the server's encrypted copy - that would turn them back
+        // into placeholders on the next refresh.
+        val keepPlain = entities.mapNotNull { ent ->
+            val existing = runCatching { messageDao.getMessageById(ent.id) }.getOrNull()
+            if (existing != null && !existing.isEncrypted) ent.id else null
+        }.toSet()
+        messageDao.insertMessages(entities.filterNot { it.isEncrypted && keepPlain.contains(it.id) })
     }
 
     suspend fun searchUsers(token: String, query: String): Result<List<UserSearchResult>> =
@@ -1279,6 +1730,9 @@ class ChatRepository(
     /** Retractions pushed by the server when someone deletes for everyone. */
     val deletedMessages = webSocketManager.deletedMessages
 
+    /** chatIds whose MLS group advanced an epoch (see WebSocketManager). */
+    val mlsCommits = webSocketManager.mlsCommits
+
     /** Drops a locally cached message, for a retraction that arrived over the socket. */
     suspend fun removeCachedMessage(messageId: String) = withContext(Dispatchers.IO) {
         runCatching { messageDao.deleteMessage(messageId) }
@@ -1302,7 +1756,8 @@ class ChatRepository(
                 latest.isEncrypted,
                 latest.senderId,
                 latest.keyVersion,
-                latest.encryptionVersion
+                latest.encryptionVersion,
+                latest.senderDeviceId
             )
         }
     }

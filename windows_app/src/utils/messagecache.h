@@ -41,6 +41,11 @@ public:
         // message - 0/unused outside a group chat.
         int keyVersion = 0;
         int encryptionVersion = 1;
+        // Which of the sender's devices encrypted this. v3/v4 key their ratchet
+        // session by "chatId|senderDeviceId", so dropping it on the cache path
+        // made a reopened chat decrypt against the wrong session and show
+        // placeholders where the first (network) load had worked.
+        QString senderDeviceId;
         // Display-only forward attribution (payload is always a fresh
         // ciphertext for this chat; the server never copies source blobs).
         bool isForwarded = false;

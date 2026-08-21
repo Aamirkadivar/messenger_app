@@ -62,6 +62,26 @@ interface TokenManager {
     suspend fun exportVaultPeerSenderKeys(): Result<Map<String, String>>
     suspend fun restoreVaultPeerSenderKeys(keys: Map<String, String>): Result<Unit>
 
+    /**
+     * MLS restore bundles. Neither BouncyCastle nor mlspp can serialize a live
+     * MLS group, so a device rebuilds groups after restart from this material
+     * (identity keys, published KeyPackage + init key, Welcome) plus the
+     * commits the Delivery Service retains. Keystore-wrapped like the ratchets.
+     */
+    suspend fun saveMlsBundle(key: String, json: String): Result<Unit>
+
+    /**
+     * Reads a bundle. Fails - rather than reporting absence - when a stored
+     * bundle cannot be unwrapped, so callers can tell "no state yet" apart from
+     * "state exists but is unreadable". Conflating the two destroys MLS groups.
+     */
+    suspend fun loadMlsBundle(key: String): Result<String?>
+
+    /** Whether a bundle is stored, without needing to unwrap it. */
+    suspend fun hasMlsBundle(key: String): Result<Boolean>
+    suspend fun listMlsBundles(prefix: String): Result<Map<String, String>>
+    suspend fun deleteMlsBundle(key: String): Result<Unit>
+
     suspend fun saveDirectRatchet(chatId: String, json: String): Result<Unit>
     suspend fun loadDirectRatchet(chatId: String): Result<String?>
     suspend fun exportVaultDirectRatchets(): Result<Map<String, String>>
@@ -89,6 +109,7 @@ class TokenManagerImpl(
         private const val KEY_EXPIRES_AT = "access_token_expires_at"
         private const val KEY_CURRENT_USER_ID = "current_user_id"
         private const val KEY_E2EE_DEVICE_ID = "e2ee_device_id"
+        private const val KEY_E2EE_DEVICE_OWNER = "e2ee_device_owner"
         private const val KEY_ALIAS_TOKEN = "messenger_token_key"
         private const val KS_WRAP_PREFIX = "ks1:"
     }
@@ -469,10 +490,34 @@ class TokenManagerImpl(
 
     override suspend fun getOrCreateDeviceId(): Result<String> = withContext(Dispatchers.IO) {
         try {
-            val existing = sharedPreferences.getString(KEY_E2EE_DEVICE_ID, null)
-            if (!existing.isNullOrBlank()) return@withContext Result.success(existing)
+            // Scoped PER ACCOUNT. A single install-wide id meant a second
+            // account signing in here inherited the first account's device
+            // identity: both users registered under one device_id, so
+            // per-device fan-out (FN1) and the ratchet sessions keyed by
+            // "chatId|deviceId" collided and messages stopped opening.
+            //
+            // The pre-scoping id is deliberately NOT adopted. There is no local
+            // way to tell which account originally registered it, and guessing
+            // reproduced the very collision this fixes. Each account mints its
+            // own; the old device row lingers server-side until revoked, and v4
+            // re-keys cleanly against a new device id because its root comes
+            // from the identity keys rather than the session.
+            val userId = sharedPreferences.getString(KEY_CURRENT_USER_ID, null).orEmpty()
+            if (userId.isBlank()) {
+                // No account context yet. Do not mint: an id stored under no
+                // user would never be looked up again.
+                return@withContext Result.success("")
+            }
+
+            // Key version 2: v1 scoped values may have been written by an
+            // earlier build whose migration adopted the install-wide id and so
+            // handed one account another account's device identity.
+            val scopedKey = KEY_E2EE_DEVICE_ID + "_v2_" + userId
+            sharedPreferences.getString(scopedKey, null)?.takeIf { it.isNotBlank() }
+                ?.let { return@withContext Result.success(it) }
+
             val id = java.util.UUID.randomUUID().toString()
-            sharedPreferences.edit().putString(KEY_E2EE_DEVICE_ID, id).apply()
+            sharedPreferences.edit().putString(scopedKey, id).apply()
             Result.success(id)
         } catch (e: Exception) {
             Result.failure(e)
@@ -605,8 +650,102 @@ class TokenManagerImpl(
                 remove(KEY_REFRESH_TOKEN)
                 remove(KEY_EXPIRES_AT)
                 remove(KEY_CURRENT_USER_ID)
+                // The MLS store belongs to the account that just signed out.
+                // Leaving it behind let the NEXT account restore it and publish
+                // KeyPackages carrying the previous account's credential and
+                // signature key - two accounts presenting one MLS identity,
+                // which MLS then refuses to admit to the same group.
+                //
+                // Scoped to the mls1_ prefix: message history, cached chats and
+                // the per-account device id are deliberately untouched.
+                for (key in sharedPreferences.all.keys) {
+                    if (key.startsWith("mls1_")) remove(key)
+                }
                 apply()
             }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun saveMlsBundle(key: String, json: String): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val wrapped = wrapSecret(json).getOrElse { json }
+            sharedPreferences.edit().putString("mls1_$key", wrapped).apply()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Reads an MLS bundle, keeping "absent" and "unreadable" distinguishable.
+     *
+     *   no stored value            -> success(null)
+     *   stored and unwrapped       -> success(plaintext)
+     *   stored but not unwrappable -> failure
+     *
+     * The third case used to be indistinguishable from the second: this returned
+     * `unwrapSecret(stored) ?: stored`, handing back the still-wrapped ciphertext
+     * as though it were the plaintext. MLS restore then failed its magic check,
+     * the caller concluded the device had no MLS state at all, and the next
+     * persist replaced a complete whole-store snapshot with an empty one -
+     * destroying every group irrecoverably.
+     *
+     * The stored value is left untouched on failure so recovery stays possible.
+     */
+    override suspend fun loadMlsBundle(key: String): Result<String?> = withContext(Dispatchers.IO) {
+        try {
+            val stored = sharedPreferences.getString("mls1_$key", null)
+                ?: return@withContext Result.success(null)
+            val plain = unwrapSecret(stored)
+                ?: return@withContext Result.failure(
+                    IllegalStateException(
+                        "MLS bundle '$key' is present but could not be unwrapped; " +
+                            "refusing to report it as absent"
+                    )
+                )
+            Result.success(plain)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Whether a bundle is physically stored, regardless of whether it can be
+     * unwrapped. Lets a caller tell "absent" from "unreadable" without a read
+     * that might itself fail.
+     */
+    override suspend fun hasMlsBundle(key: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            Result.success(!sharedPreferences.getString("mls1_$key", null).isNullOrBlank())
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun listMlsBundles(prefix: String): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+        try {
+            val full = "mls1_$prefix"
+            val out = mutableMapOf<String, String>()
+            for ((key, value) in sharedPreferences.all) {
+                if (key !is String || value !is String) continue
+                if (!key.startsWith(full)) continue
+                val id = key.removePrefix("mls1_")
+                if (id.isBlank()) continue
+                val plain = unwrapSecret(value) ?: continue
+                if (plain.isNotBlank()) out[id] = plain
+            }
+            Result.success(out)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun deleteMlsBundle(key: String): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            sharedPreferences.edit().remove("mls1_$key").apply()
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)

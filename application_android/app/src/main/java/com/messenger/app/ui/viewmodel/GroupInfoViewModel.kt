@@ -71,6 +71,7 @@ class GroupInfoViewModel @Inject constructor(
     private val groupRepository: GroupRepository,
     private val avatarRepository: AvatarRepository,
     private val chatRepository: ChatRepository,
+    private val mlsRepository: com.messenger.app.data.repository.MlsRepository,
     private val tokenManager: TokenManager
 ) : ViewModel() {
 
@@ -241,6 +242,13 @@ class GroupInfoViewModel @Inject constructor(
                 .onSuccess {
                     _addMembers.value = AddMembersUiState()
                     _state.update { it.copy(message = "Added ${selected.size} member(s)") }
+                    // MLS-invite the new members too; before this they only
+                    // ever got the Sender Keys path, so a group already on MLS
+                    // was unreadable for anyone added after creation.
+                    viewModelScope.launch {
+                        mlsRepository.inviteMissingDevices(chatId)
+                            .onFailure { e -> Log.w(TAG, "MLS invite after add: ${e.message}") }
+                    }
                     reload()
                     onDone()
                 }
@@ -281,6 +289,48 @@ class GroupInfoViewModel @Inject constructor(
                 .onFailure { e ->
                     _state.update { it.copy(isBusy = false, error = e.message) }
                 }
+        }
+    }
+
+    /**
+     * Abandons this group's MLS group and joins a fresh incarnation.
+     *
+     * The manual recovery action for a device that has lost its local MLS state.
+     * Such a device cannot rejoin the existing tree, so the group is replaced and
+     * every current device is Welcomed into the new one - which means messages
+     * sent under the old group stop being decryptable.
+     *
+     * Deliberately manual: it is destructive to the old group, so it never runs
+     * at startup and never during normal messaging. The repository additionally
+     * bounds it to one attempt per chat per process, and a concurrent attempt
+     * from another device is adopted rather than duplicated.
+     */
+    fun recoverMlsGroup(targetChatId: String = chatId) {
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, error = null, message = null) }
+            val ok = runCatching { chatRepository.recreateMlsV2Group(targetChatId) }
+                .getOrElse { e ->
+                    Log.e(TAG, "MLS recovery failed for $targetChatId", e)
+                    _state.update {
+                        it.copy(isBusy = false, error = e.message ?: "Encryption reset failed")
+                    }
+                    return@launch
+                }
+            _state.update {
+                if (ok) {
+                    it.copy(
+                        isBusy = false,
+                        message = "Encryption reset. This device rejoined the group; " +
+                            "messages sent before now stay unreadable."
+                    )
+                } else {
+                    it.copy(
+                        isBusy = false,
+                        error = "Could not reset encryption for this group. Check the " +
+                            "connection, then restart the app before trying again."
+                    )
+                }
+            }
         }
     }
 

@@ -50,18 +50,54 @@ routes `qDebug` somewhere readable:
 PATH="/d/qt/6.11.1/mingw_64/bin:/d/Qt/Tools/mingw1310_64/bin:$PATH" QT_FORCE_STDERR_LOGGING=1 ./messenger_app.exe
 ```
 
-There is essentially **no test suite** (one Android accessibility test). Verify
-changes by building and exercising the real apps.
+E2EE wire tests live in `back-end/e2ee/` (`cd back-end && go test ./e2ee/`) and
+`test-vectors/e2ee/`. There is essentially no client test suite (one Android
+accessibility test). Verify UI/call changes by building and exercising the apps.
 
 ## Architecture notes
 
-**Encryption.** Direct chats use pairwise NaCl `crypto_box` (X25519 +
-XSalsa20-Poly1305). Group chats use WhatsApp/Signal-style **Sender Keys**: each
-member generates a `crypto_secretbox` key, encrypts a copy for every other
-member pairwise, and publishes those blobs. `Chat.KeyEpoch` (bumped server-side
-on every membership change) is the rotation signal; `Message.KeyVersion` records
-which key encrypted a message. Wire formats must match byte-for-byte across all
-three clients — hex(`nonce||ciphertext`) for text, raw bytes for binary.
+**Encryption.** Direct chats: **v4 X3DH-lite ratchet** is the default for new
+sends (`encryption_version=4`, libsodium — not AGPL libsignal). Decrypt v3
+(Double Ratchet), v2 (ephemeral `crypto_box`) and v1 (static pairwise
+`crypto_box`) forever. **v4 sends are always INITIAL-type chains rooted at the
+immutable rk0** (fresh ephemeral, rotated every 1000 messages) — never
+DH-turn/NORMAL. This is deliberate: clients re-download ciphertext from the
+server and re-decrypt on every chat reopen, and turned-chain message keys are
+consumed on first read, so NORMAL rows became "encrypted message" forever.
+INITIAL rows decrypt statelessly from rk0 + identity key any number of times
+(`decryptInitialStateless`). The sender's own fan-out blob is sealed with a
+throwaway self-session (peer = own identity). Stored sessions whose
+`peerIdent` doesn't match the expected identity are stale (early builds
+created them with the wrong key) and are discarded on load. Group
+chats stay WhatsApp/Signal-style **Sender Keys** (`crypto_secretbox`);
+`Chat.KeyEpoch` is the membership rotation signal; `Message.KeyVersion` records
+which key sealed a group message. One X25519 identity per account, shared
+across devices via the vault. Wire formats must match byte-for-byte across
+Android and Windows.
+
+**Inner envelope (EM1).** Before NaCl, plaintext is
+`EM1\n || u16be metaLen || UTF-8 JSON {fn,fwd,dur,sz,th,fu} || payload`.
+New sends leave server `file_name`, `forwarded_from_name`, `duration_ms`,
+`file_size`, `thumbnail_url`, and `file_url` empty/zero. Recipients decrypt
+`content`, then read `fu`/`th` to fetch media. Classify bubbles by
+`file_type` / `content_type` even when those URL columns are blank. Unknown
+blobs unwrap as raw payload.
+
+**Per-device fan-out (FN1).** Direct v3 with more than one live device uses
+`GET /e2ee/chats/:id/devices` and wraps
+`FN1\n || u16be n || (u8 idLen || id || u32be blobLen || blob)*n`. Session key
+is `chatId|deviceId`. Include **this device** in the fan-out so the sender can
+decrypt their own history after a refetch. `messages.sender_device_id` comes
+from `X-Device-Id`. Single-device chats still send one shared `chatId` blob.
+
+**Vault.** JSON AEAD (XChaCha20-Poly1305) under the E2EE master key; password
+Argon2id wrap + recovery wrap; QR/text pairing (`sn1.` safety numbers). Ratchet
+state is `direct_ratchets` keyed by `chatId` or `chatId|deviceId`; persist
+bumps `seq`. Stale PUT returns **409** — merge by `seq` then retry. Pull on
+reconnect.
+
+Docs: `docs/e2ee-architecture.md`, `docs/e2ee-protocol.md`,
+`docs/e2ee-protocol-v3.md`.
 
 **Calls.** 1:1 and group (max 4, full mesh) audio and video. Android
 uses Google WebRTC (`io.github.webrtc-sdk`); Windows uses **libdatachannel +
@@ -136,6 +172,12 @@ These each cost hours. Most are not discoverable by reading the code.
   device is echoed to the account's other sockets so they stop ringing.
 - A test harness that reuses a real client's `device_id` will kick that
   install's socket. Use a distinct device id for harnesses.
+- **Go files saved as UTF-16 fail with `unexpected NUL`.** Prefer `StrReplace`.
+  After a `Write` of `.go`, if `go test` complains, convert
+  `decode('utf-16')` → UTF-8. This bit `back-end/e2ee/envelope.go`.
+- Media messages need **`file_type` even when `file_url` is empty** (EM1 holds
+  `fu`). Restart the backend after that handler change.
+- GORM adds `sender_device_id` on migrate; restart after that column lands.
 
 ### Android
 - **A Hilt `@AndroidEntryPoint` BroadcastReceiver injects nothing on its own.**
@@ -194,6 +236,8 @@ theories.
 
 ## Known gaps
 
+- **iOS / Web** — no clients in this repo.
+- **Group Double Ratchet** — groups stay Sender Keys on purpose (not libsignal).
 - **TURN:** `GET /calls/ice-servers` advertises the API Host (not `localhost`)
   when `TURN_HOST` is loopback, so a phone talking to a LAN IP gets
   `turn:<that-ip>:3478`. Start coturn with `docker compose up -d coturn` in
@@ -206,3 +250,6 @@ theories.
   fans RTP to each peer. Cross-NAT still needs TURN (same as 1:1).
 - Windows video advertises NACK/PLI and forces a keyframe on PLI (and
   requests one after decode loss). Periodic keyframes remain a fallback.
+- Uploaded media still sits on disk at unguessable UUID `.bin` paths; the
+  message row no longer stores `file_url` / `thumbnail_url` for new sends.
+  Coarse `content_type` remains visible to the server.

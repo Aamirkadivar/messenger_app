@@ -81,6 +81,9 @@ Popup {
             newGroupDialog.close()
             newGroupDialog.groupCreated(group.id, group.name, group.avatarUrl)
             chatService.fetchChats()
+            // Establish MLS for the new group right away; opening the chat
+            // would do it too, but this way invites go out immediately.
+            chatService.mlsEnsureGroup(group.id)
         }
         function onGroupError(message) {
             newGroupDialog.creating = false

@@ -11,20 +11,8 @@ func TestPublicKeysEqual(t *testing.T) {
 	}
 }
 
-func TestIdentityChangeBlocked(t *testing.T) {
-	if identityChangeBlocked("", "new", true, true) {
-		t.Fatal("first publish must be allowed")
-	}
-	if identityChangeBlocked("abc", "ABC", true, true) {
-		t.Fatal("same key republish must be allowed")
-	}
-	if !identityChangeBlocked("old", "new", true, false) {
-		t.Fatal("vault should lock identity")
-	}
-	if !identityChangeBlocked("old", "new", false, true) {
-		t.Fatal("live device should lock identity")
-	}
-	if identityChangeBlocked("old", "new", false, false) {
-		t.Fatal("empty account may still take over")
-	}
-}
+// TestIdentityChangeBlocked now lives in crypto_test.go against the hardened
+// three-argument guard. The prior version here asserted "empty account may
+// still take over" — i.e. that a silent identity replacement was allowed when no
+// vault/device existed. That was the security hole (docs/e2ee-architecture.md
+// §1.5), not intended behavior, so it has been removed rather than updated.

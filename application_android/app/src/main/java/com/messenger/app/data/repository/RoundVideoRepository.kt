@@ -100,12 +100,6 @@ class RoundVideoRepository @Inject constructor(
             }
 
             val chatType = chatRepository.chatTypeFor(chatId)
-            val sealedMeta = chatRepository.sealMessage(
-                token, chatId, chatType, "", forwardedFrom = forwardedFrom, durationMs = durationMs
-            )
-            if (!sealedMeta.encrypted) {
-                return@withContext Result.failure(IOException("Cannot encrypt video note"))
-            }
 
             val sealed = chatRepository.encryptBytesFor(token, chatId, raw, durationMs = durationMs)
                 ?: return@withContext Result.failure(IOException("Cannot encrypt video note"))
@@ -128,10 +122,18 @@ class RoundVideoRepository @Inject constructor(
             thumb?.let { t ->
                 val thumbBytes = t.readBytes()
                 val sealedThumb = chatRepository.encryptBytesFor(token, chatId, thumbBytes)?.bytes
-                    ?: thumbBytes
+                    ?: return@withContext Result.failure(IOException("Cannot encrypt video thumbnail"))
                 thumbUrl = uploadWithRetry("thumb", sealedThumb, key = "thumbnail_url") { part ->
                     chatApiService.uploadVideoThumb(bearer(token), part)
                 }.getOrDefault("")
+            }
+
+            val sealedMeta = chatRepository.sealMessage(
+                token, chatId, chatType, "", forwardedFrom = forwardedFrom,
+                durationMs = durationMs, thumbnailUrl = thumbUrl, fileUrl = videoUrl
+            )
+            if (!sealedMeta.encrypted) {
+                return@withContext Result.failure(IOException("Cannot encrypt video note"))
             }
 
             Result.success(Prepared(videoUrl, thumbUrl, durationMs, true, sealed.keyVersion, sealed.encryptionVersion, sealedMeta.content))

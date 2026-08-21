@@ -615,6 +615,9 @@ Popup {
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
                                     groupService.addMembers(panel.chatId, [model.id])
+                                    // MLS-invite too (no-op when this client
+                                    // doesn't hold the group's MLS state).
+                                    chatService.mlsAddMembers(panel.chatId, [model.id])
                                 }
                             }
                         }

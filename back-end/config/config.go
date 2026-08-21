@@ -28,6 +28,9 @@ type Config struct {
 	TURNSecret string `mapstructure:"TURN_SECRET"`
 	TURNHost   string `mapstructure:"TURN_HOST"`
 	TURNPort   string `mapstructure:"TURN_PORT"`
+	// DEV-only 2FA (ignored unless Env == "development").
+	Dev2FAEnabled       bool   `mapstructure:"DEV_2FA_ENABLED"`
+	Dev2FARelayUsername string `mapstructure:"DEV_2FA_RELAY_USERNAME"`
 }
 
 // LoadConfig loads configuration from environment variables
@@ -51,6 +54,8 @@ func LoadConfig() *Config {
 		TURNSecret:                 getEnv("TURN_SECRET", ""),
 		TURNHost:                   getEnv("TURN_HOST", "localhost"),
 		TURNPort:                   getEnv("TURN_PORT", "3478"),
+		Dev2FAEnabled:              getEnv("DEV_2FA_ENABLED", "false") == "true",
+		Dev2FARelayUsername:        getEnv("DEV_2FA_RELAY_USERNAME", "koueosh"),
 	}
 	return config
 }

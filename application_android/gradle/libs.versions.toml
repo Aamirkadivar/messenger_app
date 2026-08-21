@@ -33,6 +33,8 @@ jackson = "2.18.2"
 signalProtocol = "2.10.0"
 opensslJni = "0.0.8"
 lazysodium = "5.1.0"
+# BouncyCastle MLS (RFC 9420) for group messaging.
+bouncycastle = "1.85"
 webrtc = "144.7559.09"
 # Pinned to what the offline Gradle cache holds - this machine cannot reach
 # Google Maven, so an unavailable version fails the whole build.
@@ -42,7 +44,12 @@ jna = "5.13.0"
 mockk = "1.13.16"
 coroutines = "1.9.0"
 androidxTest = "1.2.1"
+# androidx.test.ext:junit - the instrumentation helper, not JUnit itself.
 junit = "1.2.1"
+# junit:junit - the actual JUnit 4 runner for JVM unit tests. Separate from the
+# version above, which is an androidx artifact that merely shares the name;
+# pointing junit-v4 at it resolved to a junit:junit:1.2.1 that does not exist.
+junit4 = "4.13.2"
 espresso = "3.6.1"
 darkMode = "1.0.0"
 secretsGradle = "2.0.1"
@@ -174,6 +181,8 @@ androidx-security-crypto = { group = "androidx.security", name = "security-crypt
 # libsodium (NaCl crypto_box) for real E2EE - interoperates with the Windows
 # client (libsodium) and Go backend (nacl/box).
 lazysodium-android = { group = "com.goterl", name = "lazysodium-android", version.ref = "lazysodium" }
+bcmls = { group = "org.bouncycastle", name = "bcmls-jdk18on", version.ref = "bouncycastle" }
+bcprov = { group = "org.bouncycastle", name = "bcprov-jdk18on", version.ref = "bouncycastle" }
 jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
 
 # Signal Protocol (E2E Encryption)
@@ -204,9 +213,12 @@ zxing-core = { group = "com.google.zxing", name = "core", version = "3.5.3" }
 # Kotlin
 kotlin-stdlib = { group = "org.jetbrains.kotlin", name = "kotlin-stdlib", version.ref = "kotlinStdlib" }
 kotlin-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+# Test-only: Dispatchers.setMain, so a ViewModel's viewModelScope is drivable in
+# a JVM unit test.
+kotlin-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 
 # Testing
-junit-v4 = { group = "junit", name = "junit", version.ref = "junit" }
+junit-v4 = { group = "junit", name = "junit", version.ref = "junit4" }
 androidx-test-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junit" }
 androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espresso" }
 mockk = { group = "io.mockk", name = "mockk", version.ref = "mockk" }

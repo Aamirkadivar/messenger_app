@@ -27,6 +27,7 @@ import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.outlined.AdminPanelSettings
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.DeleteForever
+import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.NotificationsOff
@@ -67,6 +68,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.messenger.app.BuildConfig
 import com.messenger.app.data.model.GroupMemberDto
 import com.messenger.app.data.model.GroupRole
 import com.messenger.app.ui.components.Avatar
@@ -85,6 +87,9 @@ private sealed interface GroupDialog {
     data object ConfirmLeave : GroupDialog
     data object ConfirmDelete : GroupDialog
     data class ConfirmRemove(val member: GroupMemberDto) : GroupDialog
+
+    /** Debug-only MLS recovery. See the DangerRow guarded by BuildConfig.DEBUG. */
+    data object ConfirmResetMls : GroupDialog
 }
 
 /**
@@ -259,6 +264,20 @@ fun GroupInfoScreen(
                                 onClick = { dialog = GroupDialog.ConfirmDelete }
                             )
                         }
+
+                        // Debug builds only. Recovery for a device that has lost
+                        // its MLS state: it cannot rejoin the existing group, so
+                        // this abandons that group and starts a fresh one. Not a
+                        // production affordance - it discards readable history.
+                        if (BuildConfig.DEBUG) {
+                            DangerRow(
+                                title = "Reset MLS Group",
+                                subtitle = "Debug: rejoin encryption. Earlier messages " +
+                                    "become unreadable.",
+                                icon = Icons.Outlined.Lock,
+                                onClick = { dialog = GroupDialog.ConfirmResetMls }
+                            )
+                        }
                         Spacer(Modifier.height(Tokens.Space.xxl))
                     }
                 }
@@ -303,6 +322,18 @@ fun GroupInfoScreen(
             confirmLabel = "Delete",
             destructive = true,
             onConfirm = { viewModel.deleteGroup(); dialog = null },
+            onDismiss = { dialog = null }
+        )
+
+        GroupDialog.ConfirmResetMls -> ConfirmDialog(
+            title = "Reset encryption for this group?",
+            message = "This device will leave the group's encryption and rejoin it " +
+                "fresh. Messages sent before now become permanently unreadable for " +
+                "everyone. Use this only when messages cannot be decrypted.",
+            amountAtRisk = "All existing messages in this group become unreadable",
+            confirmLabel = "Reset",
+            destructive = true,
+            onConfirm = { viewModel.recoverMlsGroup(chatId); dialog = null },
             onDismiss = { dialog = null }
         )
 

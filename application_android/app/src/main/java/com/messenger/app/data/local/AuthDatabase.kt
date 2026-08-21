@@ -23,7 +23,7 @@ import com.messenger.app.data.local.entity.UserEntity
         UserEntity::class,
         CachedChatEntity::class
     ],
-    version = 6,
+    version = 7,
     exportSchema = true
 )
 abstract class AuthDatabase : RoomDatabase() {
@@ -44,7 +44,15 @@ abstract class AuthDatabase : RoomDatabase() {
                     AuthDatabase::class.java,
                     "messenger_database"
                 )
-                    .fallbackToDestructiveMigration()
+                    // Destructive fallback ONLY when going backwards (a debug
+                    // build older than the installed data). A forward schema
+                    // bump must never wipe this database: it holds the only
+                    // readable copy of our own MLS group messages, since an MLS
+                    // sender cannot decrypt its own ciphertext and the server
+                    // copy is therefore unrecoverable. Losing it is permanent
+                    // data loss, not a cache miss. Add a Migration for each
+                    // version bump instead.
+                    .fallbackToDestructiveMigrationOnDowngrade()
                     .build()
                 INSTANCE = instance
                 instance

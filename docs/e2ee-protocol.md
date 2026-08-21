@@ -38,10 +38,10 @@ Not CBOR.
 Before NaCl, clients wrap plaintext as:
 
 ```
-magic "EM1\n" (4 bytes) || u16be metaLen || UTF-8 JSON {"fn","fwd","dur","sz"} || payload
+magic "EM1\n" (4 bytes) || u16be metaLen || UTF-8 JSON {"fn","fwd","dur","sz","th","fu"} || payload
 ```
 
-Direct v3 fan-out (FN1) encrypts a copy per live recipient/own device (`chatId|deviceId` sessions). Legacy single-blob v3 still decrypts. Two devices sending at once no longer share one sending chain.
+Direct v3 fan-out (FN1) encrypts a copy per live recipient/own device (`chatId|deviceId` sessions) on Android and Windows send. Legacy single-blob v3 still decrypts. Two devices sending at once no longer share one sending chain.
 
 Unknown / legacy blobs decrypt as raw payload.
 

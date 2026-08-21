@@ -41,14 +41,18 @@ const MaxGroupCallParticipants = 4
 
 // handleCallSignal validates and relays call signaling. Pairwise messages go
 // to one recipient; group session messages fan out to other chat members.
-func handleCallSignal(hub *Hub, fromUserID uuid.UUID, wsMsg models.WebSocketMessage) {
+func handleCallSignal(hub *Hub, from *Client, wsMsg models.WebSocketMessage) {
+	if from == nil {
+		return
+	}
+	fromUserID := from.UserID
 	data, ok := wsMsg.Data.(map[string]interface{})
 	if !ok {
 		return
 	}
 
 	if groupCallSignalTypes[wsMsg.Type] {
-		handleGroupCallSignal(hub, fromUserID, wsMsg, data)
+		handleGroupCallSignal(hub, from, wsMsg, data)
 		return
 	}
 
@@ -129,12 +133,53 @@ func handleCallSignal(hub *Hub, fromUserID uuid.UUID, wsMsg models.WebSocketMess
 			})
 		}
 	}
+
+	switch wsMsg.Type {
+	case "call:answer":
+		notifySiblings(hub, from, "call:end", map[string]interface{}{
+			"call_id": callIDStr,
+			"reason":  "answered_elsewhere",
+		})
+	case "call:reject":
+		notifySiblings(hub, from, "call:end", map[string]interface{}{
+			"call_id": callIDStr,
+			"reason":  "rejected_elsewhere",
+		})
+	case "call:end":
+		reason, _ := data["reason"].(string)
+		if reason == "" {
+			reason = "ended_elsewhere"
+		}
+		notifySiblings(hub, from, "call:end", map[string]interface{}{
+			"call_id": callIDStr,
+			"reason":  reason,
+		})
+	}
+}
+
+func notifySiblings(hub *Hub, from *Client, typ string, data map[string]interface{}) {
+	if from == nil {
+		return
+	}
+	out, err := json.Marshal(models.WebSocketMessage{
+		Type:      typ,
+		Data:      data,
+		Timestamp: time.Now(),
+	})
+	if err != nil {
+		return
+	}
+	hub.BroadcastToUserExcept(from.UserID, from.ID, out)
 }
 
 // handleGroupCallSignal fans a group-session event to other members of the
 // chat (or an explicit participant_ids list). Pairwise SDP/ICE still uses
 // call:invite etc. under a shared group_call_id on the clients.
-func handleGroupCallSignal(hub *Hub, fromUserID uuid.UUID, wsMsg models.WebSocketMessage, data map[string]interface{}) {
+func handleGroupCallSignal(hub *Hub, from *Client, wsMsg models.WebSocketMessage, data map[string]interface{}) {
+	if from == nil {
+		return
+	}
+	fromUserID := from.UserID
 	chatID, _ := data["chat_id"].(string)
 	if chatID == "" || !isChatMember(fromUserID, chatID) {
 		log.Printf("%s rejected: %s is not a member of chat %s", wsMsg.Type, fromUserID, chatID)
@@ -200,6 +245,22 @@ func handleGroupCallSignal(hub *Hub, fromUserID uuid.UUID, wsMsg models.WebSocke
 		if err := hub.BroadcastToUser(to, out); err != nil {
 			log.Printf("%s fanout to %s failed: %v", wsMsg.Type, to, err)
 		}
+	}
+
+	if wsMsg.Type == "call:group_join" || wsMsg.Type == "call:group_leave" {
+		reason := "answered_elsewhere"
+		if wsMsg.Type == "call:group_leave" {
+			reason, _ = data["reason"].(string)
+			if reason == "" {
+				reason = "ended_elsewhere"
+			}
+		}
+		notifySiblings(hub, from, "call:group_leave", map[string]interface{}{
+			"call_id":      callIDStr,
+			"chat_id":      chatID,
+			"from_user_id": fromUserID.String(),
+			"reason":       reason,
+		})
 	}
 }
 

@@ -51,6 +51,15 @@ class MessengerApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+
+        // Phase 0 of the shared Rust core: proves library loading, the JNI
+        // marshalling contract, panic containment and the log channel before
+        // any MLS exists. Non-fatal - group chats stay on the existing path
+        // until cutover. See docs/mls-v2-architecture.md.
+        com.messenger.app.data.encryption.MlsCore.selfTest()
+        // Phase 5: exercise the real handle API on-device, so a JNI marshalling
+        // or .so packaging problem is distinguishable from a protocol problem.
+        com.messenger.app.data.encryption.runSelfTest()
         createNotificationChannels()
         observeIncomingMessagesForNotifications()
     }

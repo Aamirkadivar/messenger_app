@@ -153,6 +153,15 @@ class WebSocketManager private constructor(
     val incomingMessages: SharedFlow<IncomingChatMessage> = _incomingMessages.asSharedFlow()
 
     /** A message retracted for everyone; open chats drop it on the spot. */
+    /**
+     * chatIds whose MLS group just advanced an epoch. The server pushes this
+     * after any accepted commit; without acting on it a Welcome created while
+     * we were already running is never fetched, so the invite sits unconsumed
+     * and this device never becomes a member.
+     */
+    private val _mlsCommits = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    val mlsCommits = _mlsCommits.asSharedFlow()
+
     private val _deletedMessages = MutableSharedFlow<DeletedMessage>(extraBufferCapacity = 16)
     val deletedMessages = _deletedMessages.asSharedFlow()
 
@@ -382,26 +391,38 @@ class WebSocketManager private constructor(
                     // message.ContentType rather than a real MIME/file type.
                     val message = IncomingChatMessage(
                         chatId = data.optString("chat_id"),
-                        messageId = data.optString("message_id"),
-                        senderId = data.optString("sender_id"),
-                        content = data.optString("content"),
+                        messageId = data.str("message_id"),
+                        senderId = data.str("sender_id"),
+                        content = data.str("content"),
                         encrypted = data.optBoolean("encrypted", false),
-                        timestamp = data.optString("timestamp"),
-                        contentType = data.optString("file_type", "text").ifBlank { "text" },
-                        fileUrl = data.optString("file_url").takeIf { it.isNotBlank() },
-                        fileType = data.optString("file_type").takeIf { it.isNotBlank() },
-                        fileName = data.optString("file_name").takeIf { it.isNotBlank() },
+                        timestamp = data.str("timestamp"),
+                        contentType = data.str("file_type").ifBlank { "text" },
+                        fileUrl = data.str("file_url").takeIf { it.isNotBlank() },
+                        fileType = data.str("file_type").takeIf { it.isNotBlank() },
+                        fileName = data.str("file_name").takeIf { it.isNotBlank() },
                         fileSize = data.optLong("file_size", 0),
                         durationMs = data.optLong("duration_ms", 0),
                         keyVersion = data.optInt("key_version", 0),
                         encryptionVersion = data.optInt("encryption_version", 1).let { if (it == 0) 1 else it },
-                        senderDeviceId = data.optString("sender_device_id"),
-                        replyToId = data.optString("reply_to_id"),
+                        senderDeviceId = data.str("sender_device_id"),
+                        replyToId = data.str("reply_to_id"),
                         isForwarded = data.optBoolean("is_forwarded", false),
-                        forwardedFromName = data.optString("forwarded_from_name"),
-                        forwardedFromMessageId = data.optString("forwarded_from_message_id")
+                        forwardedFromName = data.str("forwarded_from_name"),
+                        forwardedFromMessageId = data.str("forwarded_from_message_id")
                     )
                     CoroutineScope(Dispatchers.Main).launch { _incomingMessages.emit(message) }
+                }
+                "mls:commit" -> {
+                    // chat_id is at the TOP level for this notice (see
+                    // handlers/mls.go); there is no "data" object at all, so
+                    // the old `?: return` bailed out every time and a Welcome
+                    // issued while we were running was never fetched.
+                    val chatId = obj.str("chat_id").ifBlank {
+                        obj.optJSONObject("data")?.str("chat_id").orEmpty()
+                    }
+                    if (chatId.isNotBlank()) {
+                        CoroutineScope(Dispatchers.Main).launch { _mlsCommits.emit(chatId) }
+                    }
                 }
                 "message:deleted" -> {
                     val data = obj.optJSONObject("data") ?: return
@@ -538,3 +559,16 @@ class WebSocketManager private constructor(
         }
     }
 }
+
+/**
+ * Null-safe string read.
+ *
+ * [org.json.JSONObject.optString] returns the four-character string `"null"`
+ * when the value is JSON null — not an empty string. That made every message
+ * with `"reply_to_id": null` look like a reply to a message whose id is
+ * literally "null", which the UI then rendered as a quote reading "original
+ * message unavailable". The same trap applies to `sender_device_id` and every
+ * other optional string on the wire, so read them all through this.
+ */
+private fun org.json.JSONObject.str(key: String): String =
+    if (isNull(key)) "" else optString(key)

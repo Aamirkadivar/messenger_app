@@ -5,16 +5,25 @@
 #include <QList>
 #include <QHash>
 #include <QVariantList>
+#include <QVariantMap>
 #include <QNetworkReply>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QPair>
+#include <QSet>
 #include <functional>
 #include "../utils/config.h"
 #include "../utils/messagecache.h"
 #include "../crypto/doubleratchet.h"
+#include "../crypto/doubleratchetv4.h"
+#ifdef HAVE_MLSPP
+#include "../crypto/mlsgroupcrypto.h"
+#endif
 #include "../crypto/encryption.h"
 #include "authservice.h"
 #include "groupservice.h"
+
+class MlsV2Engine;
 
 class ChatService : public QObject {
     Q_OBJECT
@@ -105,6 +114,10 @@ public:
                                        const QString& senderId = QString(), int keyVersion = 0,
                                        int encryptionVersion = 1,
                                        const QString& senderDeviceId = QString()) const;
+    Q_INVOKABLE QVariantMap peekEnvelope(const QString& chatId, const QString& content, bool encrypted,
+                                         const QString& senderId = QString(), int keyVersion = 0,
+                                         int encryptionVersion = 1,
+                                         const QString& senderDeviceId = QString()) const;
 
     // Whether we currently hold a pairwise key for this chat (direct only).
     // Groups use Sender Keys - see hasGroupSenderKey / encryptBytesForChat.
@@ -125,7 +138,9 @@ public:
                                    const QString& fileName = QString(),
                                    const QString& forwardedFrom = QString(),
                                    qint64 durationMs = 0,
-                                   qint64 fileSize = 0) const;
+                                   qint64 fileSize = 0,
+                                   const QString& thumbnailUrl = QString(),
+                                   const QString& mediaFileUrl = QString()) const;
     Q_INVOKABLE QByteArray decryptBytesForChat(const QString& chatId, const QByteArray& payload,
                                                const QString& senderId = QString(), int keyVersion = 0,
                                                int encryptionVersion = 1) const;
@@ -409,9 +424,118 @@ private:
     // shared-secret sense), so one key per chat is all we need.
     QHash<QString, QString> m_chatOtherPub;
     mutable QHash<QString, DoubleRatchet::State> m_dr;
+    mutable QHash<QString, DoubleRatchetV4::Session> m_drV4;
+#ifdef HAVE_MLSPP
+    // MLS (RFC 9420) group state per chat, plus the identity/KeyPackage that
+    // rebuilds it after a restart (neither BC nor mlspp can serialize a group).
+    // A chat absent from this map keeps using Sender Keys: the cutover is
+    // per-group, not a flag day.
+    mutable QHash<QString, MlsGroupCrypto::Group*> m_mlsGroups;
+    mutable QHash<QString, MlsGroupCrypto::Identity*> m_mlsIdentities;
+    mutable QHash<QString, MlsGroupCrypto::PublishedKeyPackage*> m_mlsKeyPackages;
 
+    struct MlsCoverage {
+        bool exists = false;
+        qint64 epoch = 0;
+        QList<QPair<QString, QString>> live; // userId, deviceId
+        QSet<QString> claimable;             // "userId|deviceId"
+        QSet<QString> acked;                 // deviceId
+        QSet<QString> pending;               // deviceId
+    };
+    mutable QHash<QString, MlsCoverage> m_mlsCoverage;
+
+    bool mlsHasGroup(const QString& chatId) const;
+
+    // ---- MLS Delivery Service client ----
+    // The server is an untrusted relay: it stores KeyPackages, orders commits
+    // by epoch, and forwards Welcome/commit blobs. All crypto stays here.
+public:
+    // Publishes single-use KeyPackages so other members can add this device.
+    Q_INVOKABLE void mlsPublishKeyPackages(int count = 10);
+    // Tops up when the server reports few remaining.
+    Q_INVOKABLE void mlsEnsureKeyPackages();
+    // Creates the MLS group for a chat and registers it with the DS.
+    Q_INVOKABLE void mlsCreateGroup(const QString& chatId);
+    // Claims a member's KeyPackage, commits the add, uploads commit + welcome.
+    Q_INVOKABLE void mlsAddMember(const QString& chatId, const QString& userId);
+    // Joins any groups this device has been invited to.
+    Q_INVOKABLE void mlsProcessWelcomes();
+    // Applies commits made since our epoch.
+    Q_INVOKABLE void mlsSyncHandshakes(const QString& chatId);
+    // Rebuilds persisted groups after a restart.
+    Q_INVOKABLE void mlsRestoreGroups();
+    // Switches a group chat to MLS: joins via pending Welcome, or establishes
+    // the group and invites every member with published KeyPackages. Safe to
+    // call on every open; Sender Keys remain the fallback until it succeeds.
+    Q_INVOKABLE void mlsEnsureGroup(const QString& chatId);
+    // MLS-invites newly added members (no-op unless this client has the group).
+    Q_INVOKABLE void mlsAddMembers(const QString& chatId, const QVariantList& userIds);
+
+private:
+    void mlsCreateGroupThen(const QString& chatId, std::function<void()> done);
+    void mlsPublishGroupInfo(const QString& chatId);
+    // Retires Welcomes that actually opened; unacked ones stay pending so a
+    // failed join can be retried instead of locking this device out.
+    static QString mlsCredential(const QString& userId, const QString& deviceId);
+    void mlsAckWelcomes(const QJsonArray& ids);
+    // Drops this device's MLS state for a chat so it can re-establish.
+    void mlsForgetGroup(const QString& chatId);
+    // Asks the Delivery Service whether the group still exists; on 404 the
+    // local bundle describes a group of one that nobody can join, so forget it.
+    void mlsReconcileGroup(const QString& chatId);
+    void mlsAddMember(const QString& chatId, const QString& userId, const QString& deviceId,
+                      std::function<void(bool ok, bool stopQueue)> done);
+    void mlsInviteOwnOtherDevices(const QString& chatId);
+    void mlsInviteOtherMembersThen(const QString& chatId, std::function<void()> done);
+    void mlsInviteMissingDevicesThen(const QString& chatId, std::function<void()> done);
+    bool mlsIsElectedCreator(const QString& chatId) const;
+    bool mlsIsElectedAdder(const QString& chatId) const;
+    bool mlsBundleHasWelcome(const QString& chatId) const;
+    bool mlsReadyToSend(const QString& chatId) const;
+    bool mlsRebuildFromBundle(const QString& chatId);
+    void mlsFetchCoverageThen(const QString& chatId, std::function<void()> done);
+    void mlsLogState(const QString& chatId, const char* where) const;
+    void mlsInviteNext(const QString& chatId, const QList<QPair<QString, QString>>& pending, int index,
+                       std::function<void()> done = {});
+    QSet<QString> mlsLoadInvitedDevices(const QString& chatId) const;
+    void mlsMarkInvitedDevice(const QString& chatId, const QString& deviceId);
+    void mlsProcessWelcomesThen(std::function<void()> done);
+    void mlsPersistKeyPackage(const QString& refHash,
+                              MlsGroupCrypto::PublishedKeyPackage* kp,
+                              MlsGroupCrypto::Identity* id) const;
+    void mlsPersistGroupBundle(const QString& chatId,
+                               MlsGroupCrypto::Identity* id,
+                               const QByteArray& welcome,
+                               MlsGroupCrypto::PublishedKeyPackage* kp) const;
+    QByteArray mlsProtect(const QString& chatId, const QByteArray& plain) const;
+    QByteArray mlsUnprotect(const QString& chatId, const QByteArray& payload) const;
+#endif
+
+public:
+    // OpenMLS v2 (encryption_version 6). Independent of mlspp.
+    void mlsV2EnsureGroup(const QString& chatId);
+    void mlsV2OnCommit(const QString& chatId);
+    void mlsV2Bootstrap();
+    bool mlsV2Ready() const;
+private:
+    MlsV2Engine* m_mls2 = nullptr;
+    // chatId -> (userId, deviceId) from GET /e2ee/chats/:id/devices
+    mutable QHash<QString, QList<QPair<QString, QString>>> m_chatDevices;
+
+    void refreshChatDevices(const QString& chatId, std::function<void()> done);
+    QString alicePeerPubForSession(const QString& sessionKey) const;
+    QByteArray sealDirectV3(const QString& chatId, const QByteArray& inner) const;
     QByteArray encryptDirectV3(const QString& chatId, const QByteArray& plain) const;
     QByteArray decryptDirectV3(const QString& chatId, const QByteArray& payload) const;
+    // v4 X3DH-lite (glare-safe) — default for new sends; see doubleratchetv4.h.
+    QByteArray sealSelfV4(const QByteArray& inner) const;
+    QByteArray sealDirectV4(const QString& chatId, const QByteArray& inner) const;
+    QByteArray encryptDirectV4(const QString& sessionKey, const QByteArray& plain) const;
+    QByteArray decryptDirectV4(const QString& sessionKey, const QByteArray& payload,
+                               const QString& peerPubHint = QString()) const;
+    bool loadDrV4(const QString& sessionKey, DoubleRatchetV4::Session& st,
+                  const QString& peerPubHint = QString()) const;
+    void saveDrV4(const QString& sessionKey, DoubleRatchetV4::Session& st) const;
     QByteArray decryptToBytes(const QString& chatId, const QByteArray& payload,
                               const QString& senderId, int keyVersion, int encryptionVersion,
                               const QString& senderDeviceId = QString()) const;

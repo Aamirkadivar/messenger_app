@@ -37,13 +37,17 @@ Item {
     Dialog {
         id: recoveryKeyDialog
         modal: true
-        anchors.centerIn: parent
+        parent: Overlay.overlay
+        x: Overlay.overlay ? Math.round((Overlay.overlay.width - width) / 2) : 0
+        y: Overlay.overlay ? Math.round((Overlay.overlay.height - height) / 2) : 0
+        width: 400
         title: "Save your recovery key"
         standardButtons: Dialog.Ok
         visible: loginPage.recoveryKeyToShow.length > 0
         onAccepted: loginPage.recoveryKeyToShow = ""
         contentItem: ColumnLayout {
             spacing: 12
+            width: 360
             Label {
                 text: "Store this key somewhere safe. It unlocks your encrypted messages if you forget your password."
                 wrapMode: Text.WordWrap
@@ -698,6 +702,150 @@ Item {
                 }
             }
 
+            // ---- Sign in with QR (WhatsApp-style) ----
+            // Shows a code an already-signed-in phone scans to authorise this
+            // PC. Hidden while a 2FA / reset / recovery sub-flow is in progress
+            // so it never competes with those for attention.
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 10
+                visible: !loginPage.awaiting2FA && !loginPage.awaitingPasswordReset
+                         && !loginPage.awaitingRecoveryKey && !loginPage.awaitingDevicePairing
+                spacing: 10
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 1
+                    color: darkMode ? "#2A2418" : "#E5E5EA"
+                }
+                Text {
+                    text: "or"
+                    color: darkMode ? "#8A8175" : "#8E8E93"
+                    font.pixelSize: 12
+                }
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 1
+                    color: darkMode ? "#2A2418" : "#E5E5EA"
+                }
+            }
+
+            Button {
+                id: qrLoginButton
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                height: 44
+                visible: !loginPage.awaiting2FA && !loginPage.awaitingPasswordReset
+                         && !loginPage.awaitingRecoveryKey && !loginPage.awaitingDevicePairing
+                         && authService.qrLoginPath === ""
+                text: "Sign in with QR code"
+                font.pixelSize: 14
+                contentItem: Text {
+                    text: qrLoginButton.text
+                    font: qrLoginButton.font
+                    color: loginPage.accentColor
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    radius: 13
+                    color: "transparent"
+                    border.width: 1
+                    border.color: qrMouse.containsMouse ? loginPage.accentColor
+                                                        : (darkMode ? "#3A3428" : "#D8D8DC")
+                    // Forward to the Button rather than acting directly: the
+                    // control consumes the press itself, so a handler that only
+                    // lived in here never fired (same pattern as loginButton).
+                    MouseArea {
+                        id: qrMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: qrLoginButton.clicked()
+                    }
+                }
+                onClicked: authService.startQrLogin()
+            }
+
+            // The code itself, plus live status from the poller.
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 6
+                spacing: 8
+                visible: authService.qrLoginPath !== ""
+
+                Image {
+                    Layout.alignment: Qt.AlignHCenter
+                    Layout.preferredWidth: 200
+                    Layout.preferredHeight: 200
+                    fillMode: Image.PreserveAspectFit
+                    smooth: false
+                    // cache:false + the session id in the filename keeps a new
+                    // code from showing a stale image.
+                    cache: false
+                    source: authService.qrLoginPath !== ""
+                            ? "file:///" + authService.qrLoginPath
+                            : ""
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: 13
+                    color: darkMode ? "#C9C2B4" : "#3C3C43"
+                    text: authService.qrLoginStatus === "approved"
+                          ? "Approved - signing in…"
+                          : authService.qrLoginStatus === "expired"
+                            ? "Code expired. Show a new one."
+                            : "Open Messenger on your phone → Settings → Link a device, then scan this code."
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: 11
+                    color: darkMode ? "#8A8175" : "#8E8E93"
+                    // Set expectations: signing in is not the same as gaining
+                    // access to history on this device.
+                    text: "The code expires in about 2 minutes. You may still need your password or recovery key to unlock earlier messages here."
+                }
+
+                RowLayout {
+                    Layout.alignment: Qt.AlignHCenter
+                    spacing: 12
+
+                    Button {
+                        id: qrRefreshButton
+                        text: "New code"
+                        font.pixelSize: 13
+                        flat: true
+                        contentItem: Text {
+                            text: qrRefreshButton.text
+                            font: qrRefreshButton.font
+                            color: loginPage.accentColor
+                        }
+                        background: Item {}
+                        onClicked: authService.startQrLogin()
+                    }
+                    Button {
+                        id: qrCancelButton
+                        text: "Cancel"
+                        font.pixelSize: 13
+                        flat: true
+                        contentItem: Text {
+                            text: qrCancelButton.text
+                            font: qrCancelButton.font
+                            color: darkMode ? "#8A8175" : "#8E8E93"
+                        }
+                        background: Item {}
+                        onClicked: authService.cancelQrLogin()
+                    }
+                }
+            }
+
+
             Text {
                 visible: loginPage.awaiting2FA || loginPage.awaitingRecoveryKey || loginPage.awaitingPasswordReset
                 Layout.alignment: Qt.AlignHCenter
@@ -816,6 +964,11 @@ Item {
     Component.onCompleted: {
         authService.loginFailed.connect(function(message) {
             isLoading = false
+            passwordErrorShared.text = message
+        })
+        // QR sign-in problems surface in the same place as password errors, so
+        // the user is not left staring at a code that will never work.
+        authService.qrLoginFailed.connect(function(message) {
             passwordErrorShared.text = message
         })
         authService.loginSuccess.connect(function(userId, username) {

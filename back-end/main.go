@@ -106,6 +106,11 @@ func main() {
 	auth.Post("/refresh", authService.RefreshToken)
 	auth.Post("/password-reset/start", authService.StartPasswordReset)
 	auth.Post("/password-reset/complete", authService.CompletePasswordReset)
+	// WhatsApp-style scan-to-sign-in. start/status/claim are unauthenticated
+	// (the client has no session yet); approve requires a signed-in device.
+	auth.Post("/qr/start", authService.StartQRLogin)
+	auth.Get("/qr/:session_id", authService.GetQRLoginStatus)
+	auth.Post("/qr/claim", authService.ClaimQRLogin)
 
 	// Protected routes
 	protected := api.Group("")
@@ -113,6 +118,8 @@ func main() {
 	protected.Use(middleware.DeviceRevocationGuard())
 
 	authProtected := protected.Group("/auth")
+	// Approving a QR sign-in requires an already-authenticated device.
+	authProtected.Post("/qr/approve", authService.ApproveQRLogin)
 	authProtected.Get("/2fa/status", authService.TotpStatus)
 	authProtected.Post("/2fa/totp/setup", authService.TotpSetup)
 	authProtected.Post("/2fa/totp/confirm", authService.TotpConfirm)
@@ -208,6 +215,26 @@ func main() {
 	e2eeRoutes.Get("/pairing/:session_id", e2eeHandler.GetPairing)
 	e2eeRoutes.Post("/pairing/:session_id/complete", e2eeHandler.CompletePairing)
 	e2eeRoutes.Get("/pairing/:session_id/payload", e2eeHandler.TakePairingPayload)
+
+	// MLS (RFC 9420) Delivery Service. The server relays opaque bytes and
+	// enforces commit ordering; it never parses protocol material.
+	mlsHandler := handlers.NewMLSHandler(hub)
+	mlsRoutes := protected.Group("/e2ee/mls")
+	mlsRoutes.Post("/keypackages", mlsHandler.PublishKeyPackages)
+	mlsRoutes.Get("/keypackages/count", mlsHandler.CountKeyPackages)
+	mlsRoutes.Post("/keypackages/claim", mlsHandler.ClaimKeyPackage)
+	mlsRoutes.Post("/groups", mlsHandler.CreateGroup)
+	mlsRoutes.Get("/groups/:chat_id", mlsHandler.GetGroup)
+	// Abandons a chat's MLS group and starts a fresh incarnation under the same
+	// chat_id - the recovery path for a device whose local MLS state is gone.
+	mlsRoutes.Post("/groups/:chat_id/recreate", mlsHandler.RecreateGroup)
+	mlsRoutes.Get("/groups/:chat_id/coverage", mlsHandler.GetCoverage)
+	mlsRoutes.Post("/groups/:chat_id/commit", mlsHandler.SubmitCommit)
+	mlsRoutes.Post("/groups/:chat_id/group-info", mlsHandler.PutGroupInfo)
+	mlsRoutes.Get("/groups/:chat_id/group-info", mlsHandler.GetGroupInfo)
+	mlsRoutes.Get("/groups/:chat_id/handshakes", mlsHandler.GetHandshakes)
+	mlsRoutes.Get("/welcomes", mlsHandler.GetWelcomes)
+	mlsRoutes.Post("/welcomes/ack", mlsHandler.AckWelcome)
 
 	// WebSocket route
 	app.Get("/ws", middleware.WebSocketAuth(cfg), middleware.WebSocketDeviceGuard(), websocket.WSHandler(hub))

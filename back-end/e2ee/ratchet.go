@@ -23,6 +23,8 @@ const (
 )
 
 // RatchetState is a pairwise Double Ratchet using X25519 + HKDF-SHA256 + secretbox.
+// This is the legacy v3 handshake; the glare-safe replacement is SessionV4 in
+// ratchet_x3dh.go.
 type RatchetState struct {
 	DHsSk   []byte
 	DHsPk   []byte

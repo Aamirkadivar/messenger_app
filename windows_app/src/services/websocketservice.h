@@ -46,6 +46,9 @@ signals:
     void connected();
     void disconnected();
     // message: {id, senderId, content, createdAt}
+    // MLS group epoch advanced for this chat (fetch Welcome / handshakes).
+    void mlsCommitReceived(const QString& chatId);
+
     void messageReceived(const QString& chatId, const QVariantMap& message);
     void typingIndicator(const QString& chatId, const QString& userId, bool typing);
     // Fired when the other participant marks messages in a chat as read.

@@ -8,12 +8,12 @@ import (
 
 func TestEM1RoundTrip(t *testing.T) {
 	payload := []byte("hello")
-	wrapped := WrapEM1(payload, EnvelopeMeta{FileName: "a.bin", DurationMs: 1200, FileSize: 9, ForwardedFrom: "Ada"})
+	wrapped := WrapEM1(payload, EnvelopeMeta{FileName: "a.bin", DurationMs: 1200, FileSize: 9, ForwardedFrom: "Ada", ThumbnailURL: "/u/t.bin", FileURL: "/u/f.bin"})
 	got, meta := UnwrapEM1(wrapped)
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("payload %q", got)
 	}
-	if meta.FileName != "a.bin" || meta.DurationMs != 1200 || meta.FileSize != 9 || meta.ForwardedFrom != "Ada" {
+	if meta.FileName != "a.bin" || meta.DurationMs != 1200 || meta.FileSize != 9 || meta.ForwardedFrom != "Ada" || meta.ThumbnailURL != "/u/t.bin" || meta.FileURL != "/u/f.bin" {
 		t.Fatalf("meta %+v", meta)
 	}
 	legacy := []byte("raw-old")

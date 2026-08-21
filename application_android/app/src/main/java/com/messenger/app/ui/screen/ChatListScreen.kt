@@ -84,6 +84,7 @@ fun ChatListScreen(
     val listState by chatViewModel.chatListState.collectAsStateWithLifecycle()
     val sessionExpired by chatViewModel.sessionExpired.collectAsStateWithLifecycle()
     val keyTakeover by chatViewModel.keyTakeover.collectAsStateWithLifecycle()
+    val needsVaultUnlock by chatViewModel.needsVaultUnlock.collectAsStateWithLifecycle()
     val connectionState by chatViewModel.connectionState.collectAsStateWithLifecycle()
 
     // The server no longer accepts our token - hand off to login instead of
@@ -158,6 +159,9 @@ fun ChatListScreen(
         Column(modifier = Modifier.fillMaxSize()) {
             if (keyTakeover) {
                 KeyTakeoverBanner(onDismiss = chatViewModel::dismissKeyTakeover)
+            }
+            if (needsVaultUnlock) {
+                VaultUnlockBanner(onDismiss = chatViewModel::dismissVaultUnlockNotice)
             }
             Box(
                 modifier = Modifier
@@ -338,6 +342,46 @@ fun ChatListScreen(
                 onChatClick(chatId, name, false)
             }
         )
+    }
+}
+
+/**
+ * Shown on a second device whose E2EE identity lives on another device. Until
+ * the vault is unlocked here, history cannot be decrypted — this explains why
+ * rather than leaving a wall of "Encrypted message".
+ */
+@Composable
+private fun VaultUnlockBanner(onDismiss: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .semantics(mergeDescendants = true) { },
+        verticalAlignment = Alignment.Top
+    ) {
+        Icon(
+            Icons.Outlined.Info,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                "Unlock encryption on this device",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            Text(
+                "This account's encryption keys are on another device. Sign in " +
+                    "again with your password, or use your recovery key, to read " +
+                    "your messages here.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        TextButton(onClick = onDismiss) { Text("Dismiss") }
     }
 }
 

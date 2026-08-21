@@ -544,12 +544,16 @@ QByteArray Encryption::wrapEnvelope(const QByteArray& payload,
                                     const QString& fileName,
                                     const QString& forwardedFrom,
                                     qint64 durationMs,
-                                    qint64 fileSize) {
+                                    qint64 fileSize,
+                                    const QString& thumbnailUrl,
+                                    const QString& fileUrl) {
     QJsonObject o;
     if (!fileName.isEmpty()) o.insert(QStringLiteral("fn"), fileName);
     if (!forwardedFrom.isEmpty()) o.insert(QStringLiteral("fwd"), forwardedFrom);
     if (durationMs > 0) o.insert(QStringLiteral("dur"), durationMs);
     if (fileSize > 0) o.insert(QStringLiteral("sz"), fileSize);
+    if (!thumbnailUrl.isEmpty()) o.insert(QStringLiteral("th"), thumbnailUrl);
+    if (!fileUrl.isEmpty()) o.insert(QStringLiteral("fu"), fileUrl);
     const QByteArray meta = QJsonDocument(o).toJson(QJsonDocument::Compact);
     if (meta.size() > 0xffff) return payload;
     QByteArray out;
@@ -575,6 +579,8 @@ Encryption::MessageEnvelope Encryption::unwrapEnvelope(const QByteArray& data) {
     env.forwardedFrom = o.value(QStringLiteral("fwd")).toString();
     env.durationMs = static_cast<qint64>(o.value(QStringLiteral("dur")).toDouble(0));
     env.fileSize = static_cast<qint64>(o.value(QStringLiteral("sz")).toDouble(0));
+    env.thumbnailUrl = o.value(QStringLiteral("th")).toString();
+    env.fileUrl = o.value(QStringLiteral("fu")).toString();
     env.payload = data.mid(6 + n);
     return env;
 }
@@ -602,6 +608,31 @@ QByteArray Encryption::wrapFanout(const QList<QPair<QString, QByteArray>>& parts
 
 bool Encryption::isFanout(const QByteArray& data) {
     return data.size() >= 4 && data[0] == 'F' && data[1] == 'N' && data[2] == '1' && data[3] == '\n';
+}
+
+QList<QPair<QString, QByteArray>> Encryption::listFanout(const QByteArray& data) {
+    QList<QPair<QString, QByteArray>> parts;
+    if (!isFanout(data) || data.size() < 6) return parts;
+    const int n = (static_cast<unsigned char>(data[4]) << 8) | static_cast<unsigned char>(data[5]);
+    int off = 6;
+    for (int i = 0; i < n; ++i) {
+        if (off >= data.size()) return parts;
+        const int idLen = static_cast<unsigned char>(data[off]);
+        off++;
+        if (off + idLen + 4 > data.size()) return parts;
+        const QString id = QString::fromUtf8(data.mid(off, idLen));
+        off += idLen;
+        const quint32 blobLen =
+            (static_cast<quint32>(static_cast<unsigned char>(data[off])) << 24) |
+            (static_cast<quint32>(static_cast<unsigned char>(data[off + 1])) << 16) |
+            (static_cast<quint32>(static_cast<unsigned char>(data[off + 2])) << 8) |
+            static_cast<quint32>(static_cast<unsigned char>(data[off + 3]));
+        off += 4;
+        if (off + static_cast<int>(blobLen) > data.size()) return parts;
+        parts.append(qMakePair(id, data.mid(off, static_cast<int>(blobLen))));
+        off += static_cast<int>(blobLen);
+    }
+    return parts;
 }
 
 QByteArray Encryption::pickFanout(const QByteArray& data, const QString& deviceId) {

@@ -500,15 +500,24 @@ fun SettingsScreen(
             onDismiss = { activeDialog = null },
             onScan = { activeDialog = ActiveDialog.ScanPairingQr },
             onConfirm = { code ->
-                viewModel.approveDevicePairing(code)
+                // Same prefix dispatch as the scanner, so a pasted sign-in code
+                // works too.
+                if (code.trim().startsWith("qr1.")) viewModel.approveQrLogin(code)
+                else viewModel.approveDevicePairing(code)
                 activeDialog = null
             }
         )
 
         ActiveDialog.ScanPairingQr -> PairingQrScanDialog(
             onDismiss = { activeDialog = ActiveDialog.LinkDevice },
+            title = "Scan code",
             onCode = { code ->
-                viewModel.approveDevicePairing(code)
+                // Two different codes reach this scanner and the user should not
+                // have to know which is which:
+                //   qr1. = sign in on another device (grants a session)
+                //   mp1. = link a device to this account's E2EE vault
+                if (code.trim().startsWith("qr1.")) viewModel.approveQrLogin(code)
+                else viewModel.approveDevicePairing(code)
                 activeDialog = null
             }
         )
@@ -551,7 +560,9 @@ private fun LinkDeviceDialog(
     ) {
         Column(Modifier.padding(horizontal = Tokens.Space.lg)) {
             Text(
-                text = "Scan the QR on the new device, or paste the pairing code.",
+                text = "Scan the code shown on the other device - either to sign " +
+                    "in on a computer, or to link it to your encrypted messages. " +
+                    "You can also paste the code.",
                 style = Tokens.Type.rowSubtitle,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

@@ -150,17 +150,23 @@ public:
         QString forwardedFrom;
         qint64 durationMs = 0;
         qint64 fileSize = 0;
+        QString thumbnailUrl;
+        QString fileUrl;
     };
     static QByteArray wrapEnvelope(const QByteArray& payload,
                                    const QString& fileName = QString(),
                                    const QString& forwardedFrom = QString(),
                                    qint64 durationMs = 0,
-                                   qint64 fileSize = 0);
+                                   qint64 fileSize = 0,
+                                   const QString& thumbnailUrl = QString(),
+                                   const QString& fileUrl = QString());
     static MessageEnvelope unwrapEnvelope(const QByteArray& data);
 
     static QByteArray wrapFanout(const QList<QPair<QString, QByteArray>>& parts);
     static QByteArray pickFanout(const QByteArray& data, const QString& deviceId);
     static bool isFanout(const QByteArray& data);
+    // All (deviceId, blob) parts of an FN1 payload; empty when not a fan-out.
+    static QList<QPair<QString, QByteArray>> listFanout(const QByteArray& data);
 
 private:
     static bool m_initialized;

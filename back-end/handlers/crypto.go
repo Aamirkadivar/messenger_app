@@ -16,13 +16,28 @@ func publicKeysEqual(a, b string) bool {
 	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }
 
-// identityChangeBlocked is true when a client tries to replace an already
-// published identity and the account already has a vault or a live device.
-func identityChangeBlocked(existing, incoming string, hasVault, hasLiveDevice bool) bool {
+// identityChangeBlocked is true when a client tries to silently replace an
+// already-published identity.
+//
+// Once an account has published an identity public key, a *different* key
+// orphans every message ever sealed to the old one (static v1 boxes, v3 ratchet
+// setup, sender-key wraps). The only safe response to a new device that lacks
+// the private half is to restore the existing key from the E2EE vault — never to
+// overwrite. So any change of an established key is blocked here.
+//
+// The earlier version gated this on `hasVault || hasLiveDevice`; with both
+// tables empty (the system was never activated) the guard never engaged and
+// every fresh login silently replaced the identity. See docs/e2ee-architecture.md
+// §1.5. The precondition is now simply "an identity already exists".
+//
+// Deliberate rotation (user explicitly resets E2EE, accepting history loss) is
+// the only legitimate way to change an established key and must come through an
+// acknowledged reset (reset=true), never as a side effect of login.
+func identityChangeBlocked(existing, incoming string, reset bool) bool {
 	if existing == "" || publicKeysEqual(existing, incoming) {
 		return false
 	}
-	return hasVault || hasLiveDevice
+	return !reset
 }
 
 // CryptoHandler handles cryptographic operations
@@ -33,9 +48,16 @@ func NewCryptoHandler() *CryptoHandler {
 	return &CryptoHandler{}
 }
 
-// SavePublicKeyInput represents the input for saving a public key
+// SavePublicKeyInput represents the input for saving a public key.
+//
+// Reset must be sent ONLY from a deliberate, user-acknowledged "reset my E2EE
+// identity" action in the client UI. It authorizes replacing an already-published
+// identity key, which permanently orphans all history sealed to the old key.
+// Normal login/key-restore paths must never set it — a new device restores the
+// existing key from the vault instead.
 type SavePublicKeyInput struct {
 	PublicKey string `json:"public_key" validate:"required"`
+	Reset     bool   `json:"reset"`
 }
 
 // SavePublicKey handles saving a user's public key
@@ -66,15 +88,16 @@ func (h *CryptoHandler) SavePublicKey(c *fiber.Ctx) error {
 	}
 
 	if user.PublicKey != "" && !publicKeysEqual(user.PublicKey, input.PublicKey) {
-		var vaultCount, deviceCount int64
-		database.DB.Model(&models.E2EEVault{}).Where("user_id = ?", userID).Count(&vaultCount)
-		database.DB.Model(&models.E2EEDevice{}).Where("user_id = ? AND revoked_at IS NULL", userID).Count(&deviceCount)
-		if identityChangeBlocked(user.PublicKey, input.PublicKey, vaultCount > 0, deviceCount > 0) {
+		if identityChangeBlocked(user.PublicKey, input.PublicKey, input.Reset) {
 			return c.Status(http.StatusConflict).JSON(fiber.Map{
 				"error":   "identity_locked",
-				"message": "This account already has an E2EE identity. Unlock the vault on this device instead of publishing a new key.",
+				"message": "This account already has an E2EE identity. Restore it from the vault on this device (or pair from an existing device) instead of publishing a new key. To start over and lose history, use the explicit E2EE reset.",
 			})
 		}
+		// Reached only with reset=true: a deliberate, acknowledged identity
+		// rotation that orphans prior history. Audit the fact (never the key
+		// bytes) so the event is traceable.
+		log.Printf("[e2ee_identity_reset] user=%s replaced identity key (deliberate reset; prior history orphaned)", userID)
 	}
 
 	if err := database.DB.Model(&models.User{}).Where("id = ?", userID).

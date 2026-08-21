@@ -55,6 +55,13 @@ class E2EEVaultRepository @Inject constructor(
                 if (state != WebSocketManager.ConnectionState.CONNECTED) return@collect
                 val token = tokenManager.getAccessToken().getOrNull() ?: return@collect
                 pullAndMergeVault(token, force = true)
+                // Re-assert this install in the device registry on every
+                // connect. Registration used to happen only on vault
+                // unlock/create/pairing, so a restored session with a fresh
+                // device id stayed unregistered — and the FN1 fan-out never
+                // included it, making every message (own sends included)
+                // undecryptable on this device.
+                registerDevice(token)
             }
         }
     }

@@ -68,6 +68,16 @@ set(PROJECT_SOURCES
     src/crypto/encryption.cpp
     src/crypto/doubleratchet.cpp
     src/crypto/doubleratchet.h
+    src/crypto/doubleratchetv4.cpp
+    # Thin runtime bridge to mls-core (Rust). No link-time dependency: the DLL
+    # is resolved with QLibrary at startup, so the MSVC-built core and this
+    # MinGW build need no shared import library.
+    src/crypto/mlscore.cpp
+    src/crypto/mlsv2.cpp
+    src/crypto/mlsv2.h
+    src/crypto/doubleratchetv4.h
+    src/crypto/mlsgroupcrypto.cpp
+    src/crypto/mlsgroupcrypto.h
     src/crypto/vaultcrypto.cpp
     src/crypto/vaultcrypto.h
     src/models/user.cpp
@@ -121,6 +131,7 @@ set(PROJECT_SOURCES
 # ---- QML Resources ----
 set(PROJECT_QML
     qml/main.qml
+    qml/TitleBar.qml
     qml/Login.qml
     qml/Register.qml
     qml/ChatList.qml
@@ -185,6 +196,30 @@ if(QT6_WEBSOCKETS_FOUND)
     add_definitions(-DHAVE_WEBSOCKETS)
 endif()
 
+# ---- MLS (RFC 9420) group messaging via cisco/mlspp ----
+# Built from third_party/mlspp against the OpenSSL 3 + nlohmann_json already in
+# vcpkg_installed. mlspp provides TreeKEM/HPKE/key schedule; we never hand-roll
+# group crypto. See docs/e2ee-protocol-v4.md for why that rule exists.
+set(MLSPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mlspp")
+if(EXISTS "${MLSPP_DIR}/CMakeLists.txt")
+    set(TESTING OFF CACHE BOOL "" FORCE)
+    list(APPEND CMAKE_PREFIX_PATH "${VCPKG_INSTALLED_DIR}/x64-mingw-static")
+    set(OPENSSL_ROOT_DIR "${VCPKG_INSTALLED_DIR}/x64-mingw-static" CACHE PATH "" FORCE)
+    add_subdirectory("${MLSPP_DIR}" mlspp_build EXCLUDE_FROM_ALL)
+    target_link_libraries(${PROJECT_NAME} PRIVATE mlspp)
+    target_include_directories(${PROJECT_NAME} PRIVATE "${MLSPP_DIR}/include")
+    add_definitions(-DHAVE_MLSPP)
+    message(STATUS "MLS (mlspp) enabled")
+else()
+    # Fail the configure, do not warn and continue. A WARNING here produced a
+    # client that built and ran with HAVE_MLSPP undefined and no MLS group
+    # messaging at all - the failure only showed up later as messages that
+    # could not be decrypted. A missing dependency must stop the build.
+    message(FATAL_ERROR
+        "mlspp not found at ${MLSPP_DIR}. MLS group messaging cannot be built. "
+        "Fetch it with: git clone --recursive https://github.com/cisco/mlspp.git ${MLSPP_DIR}")
+endif()
+
 # Link libsodium
 set(SODIUM_FOUND OFF)
 set(SODIUM_INCLUDE_DIR "")
@@ -242,7 +277,7 @@ if(SODIUM_FOUND)
                 "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
         )
         message(STATUS "libsodium DLL will be copied: ${SODIUM_DLL}")
-    else()
+    elseif(SODIUM_DLL)
         message(WARNING "libsodium DLL not found - you may need libsodium.dll at runtime")
     endif()
 else()
