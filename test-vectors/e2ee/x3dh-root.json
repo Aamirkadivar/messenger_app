@@ -1,0 +1,8 @@
+{
+  "suite": "suite:dr-x25519-x3dhlite-v4",
+  "a_id_pk": "a19126c482d962e1bd6250037cbb70db92cc906ecdbc1018fc37fb8c6061522e",
+  "a_id_sk": "a0a9aeb7bc858a9398e1e6eff4fdc2cbd0d9de272c353a030811161f646d727b",
+  "b_id_pk": "a825f4f280990025a16e35322c14affe12bf4fbebd85704d0064b6357b2f573c",
+  "b_id_sk": "b3babda4af9699808bf2f5fce7eed1d8c3cacd343f2629101b02050c777e6168",
+  "rk0": "4a635dfcf3f667ad0ec5421ff2face9f1b3192b7489647a6a5e05af45b1af57f"
+}

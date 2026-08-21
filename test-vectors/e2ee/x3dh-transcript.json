@@ -1,0 +1,35 @@
+{
+  "suite": "suite:dr-x25519-x3dhlite-v4",
+  "note": "One-directional v4 transcript (A-\u003eB), delivered out of order (m0,m2,m4,m1,m3). Rebuild B's session from the fixed identities and DecryptMsg each ciphertext in listed order; each must yield the plaintext. Turn/glare continuation is covered by the ported TestX3DHLite* stress tests.",
+  "a_id_pk": "a19126c482d962e1bd6250037cbb70db92cc906ecdbc1018fc37fb8c6061522e",
+  "a_id_sk": "a0a9aeb7bc858a9398e1e6eff4fdc2cbd0d9de272c353a030811161f646d727b",
+  "b_id_pk": "a825f4f280990025a16e35322c14affe12bf4fbebd85704d0064b6357b2f573c",
+  "b_id_sk": "b3babda4af9699808bf2f5fce7eed1d8c3cacd343f2629101b02050c777e6168",
+  "transcript": [
+    {
+      "from": "A",
+      "ciphertext_hex": "010214df1e3076858b1ac0a78436041b7a04c067fc7954740f82263d5fc7abbc390000000000000000a11859ccb6674f7c6c3965a7b14688388238e6d6fb8a0565b03b0b0c282216236e080d342788b40666f9",
+      "plaintext": "m0"
+    },
+    {
+      "from": "A",
+      "ciphertext_hex": "010214df1e3076858b1ac0a78436041b7a04c067fc7954740f82263d5fc7abbc390000000200000000eba77f90d77589b14dea2cd098c582b7c18dce2282c2564ee3f695f3b76a3704802dda4939779af53419",
+      "plaintext": "m2"
+    },
+    {
+      "from": "A",
+      "ciphertext_hex": "010214df1e3076858b1ac0a78436041b7a04c067fc7954740f82263d5fc7abbc39000000040000000041412aed12416d14e2cf57ddd08d4b37f13da123e108252383d0d8fe8bf05c0cd7f2ac0b7cfe67c9a6da",
+      "plaintext": "m4"
+    },
+    {
+      "from": "A",
+      "ciphertext_hex": "010214df1e3076858b1ac0a78436041b7a04c067fc7954740f82263d5fc7abbc3900000001000000007b2d134ac20055192f56a0843ec7c93c99e6a12d926cdf2b1d41b14aa49dc8f8d0897e18288cffb18dd5",
+      "plaintext": "m1"
+    },
+    {
+      "from": "A",
+      "ciphertext_hex": "010214df1e3076858b1ac0a78436041b7a04c067fc7954740f82263d5fc7abbc39000000030000000082972a77ddecd52dfb2b715fab9bda2cd758fcc16901e144735dcb7f33bcafbb76eb1480f7df3dc88838",
+      "plaintext": "m3"
+    }
+  ]
+}

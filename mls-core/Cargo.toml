@@ -1,0 +1,45 @@
+[package]
+name = "mls_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+publish = false
+
+[lib]
+name = "mls_core"
+# cdylib: loaded by Android (System.loadLibrary) and Qt (runtime link).
+# staticlib: available if we later prefer static linking on Windows.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# Phase 0 keeps the dependency surface deliberately empty apart from these two.
+# OpenMLS lands in Phase 1, pinned to an exact version - its API moves between
+# minor releases (StorageProvider replaced KeyStore in 0.6), so the version is a
+# deliberate decision, not a caret range.
+zeroize = { version = "1", features = ["zeroize_derive"] }
+log = "0.4"
+# Pinned exactly, not a caret range: the OpenMLS API moves between minor
+# releases (StorageProvider replaced KeyStore in 0.6), and an unplanned bump
+# would change wire/state behaviour under us. Upgrades are deliberate.
+openmls = "=0.8.1"
+openmls_rust_crypto = "=0.5.1"
+openmls_basic_credential = "=0.5.0"
+openmls_traits = "0.5.0"
+serde_json = "1.0.151"
+
+# Android-only: JNI bridge + logcat sink. Absent from the Windows build.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.14"
+
+[build-dependencies]
+cbindgen = "0.27"
+
+[profile.release]
+# Keep panics unwinding: the FFI layer relies on catch_unwind to stop a Rust
+# panic crossing into Kotlin/C++ as undefined behaviour. panic=abort would turn
+# any internal bug into a process kill on the user's phone.
+panic = "unwind"
+lto = true
+codegen-units = 1
+strip = "debuginfo"

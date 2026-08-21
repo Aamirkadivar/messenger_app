@@ -1,0 +1,18 @@
+# Android cross-compilation.
+#
+# Deliberately carries NO linker paths. They used to be hardcoded here as
+# absolute D:/sdk/... paths, which pinned the build to one machine, one NDK
+# version and one host OS. build-android.sh now derives them from
+# ANDROID_NDK_HOME and exports CARGO_TARGET_<TRIPLE>_LINKER, which takes
+# precedence over this file.
+#
+# Build with:
+#   ANDROID_NDK_HOME=/path/to/ndk ./build-android.sh
+#
+# Running `cargo build --target aarch64-linux-android` directly will fail at the
+# link step with "linker `cc` not found" - that is intended. Use the script, or
+# export the linker yourself. A stale absolute path here would be worse: it
+# would point at an NDK that may not exist or may be the wrong version.
+#
+# If you need a personal override, add [target.*] linker entries below - but do
+# not commit them.

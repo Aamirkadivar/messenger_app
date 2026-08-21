@@ -1,0 +1,3 @@
+[submodule "windows_app/third_party/mlspp"]
+	path = windows_app/third_party/mlspp
+	url = https://github.com/cisco/mlspp.git
