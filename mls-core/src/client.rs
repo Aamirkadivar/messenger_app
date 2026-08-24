@@ -236,6 +236,35 @@ impl ClientHandle {
         Ok((ser(commit)?, ser(welcome)?))
     }
 
+    /// Stages a Remove for the members named by `credentials`. Returns the
+    /// commit; like [`Self::add_members`] it is NOT applied until
+    /// [`Self::merge_pending`].
+    ///
+    /// This exists for one situation: a device whose leaf is in the tree but
+    /// which never consumed its Welcome. It looks like a member to everyone
+    /// else, so it is never re-invited, and it cannot read anything - a phantom
+    /// that blocks its own recovery. Removing the dead leaf lets the normal
+    /// KeyPackage/Welcome flow add the device back for real.
+    ///
+    /// Removing nothing is an error rather than an empty commit: an empty Remove
+    /// would still advance the epoch for every other member.
+    pub fn remove_members(&self, gid: &[u8], credentials: &[String]) -> Result<Vec<u8>> {
+        let mut g = self.lock()?;
+        let Inner { client, groups, .. } = &mut *g;
+        let group = groups
+            .get_mut(gid)
+            .ok_or_else(|| MlsError::NotFound("group not loaded".into()))?;
+
+        let leaves = client.member_indices(group, credentials);
+        if leaves.is_empty() {
+            return Err(MlsError::NotFound(
+                "no member matched the credentials to remove".into(),
+            ));
+        }
+        let commit = client.remove_members(group, &leaves)?;
+        ser(commit)
+    }
+
     pub fn merge_pending(&self, gid: &[u8]) -> Result<u64> {
         let mut g = self.lock()?;
         let Inner { client, groups, .. } = &mut *g;
@@ -323,6 +352,46 @@ impl ClientHandle {
             .get(gid)
             .ok_or_else(|| MlsError::NotFound("group not loaded".into()))?;
         Ok(g.client.roster(group).join("\n").into_bytes())
+    }
+
+    /// Signed GroupInfo (with ratchet tree) for a stranded member to rejoin
+    /// from. Public material only - safe to hand to the Delivery Service.
+    pub fn export_group_info(&self, gid: &[u8]) -> Result<Vec<u8>> {
+        let g = self.lock()?;
+        let Inner { client, groups, .. } = &*g;
+        let group = groups
+            .get(gid)
+            .ok_or_else(|| MlsError::NotFound("group not loaded".into()))?;
+        ser(client.export_group_info(group)?)
+    }
+
+    /// Rejoins by external commit, returning `(group_id, commit)`.
+    ///
+    /// For a device that is still a member server-side but can no longer follow
+    /// the group. The commit replaces this device's existing leaf rather than
+    /// adding a second one, so the membership set is preserved.
+    ///
+    /// Caller contract, which differs from every other commit here:
+    ///   * on DS acceptance call [`Self::merge_pending`];
+    ///   * on DS rejection call [`Self::drop_group`] and start again from fresh
+    ///     GroupInfo - [`Self::clear_pending`] cannot rescue an external commit,
+    ///     because there is no pre-commit state to return to: this client was
+    ///     not in the tree before it.
+    ///
+    /// Unlike [`Self::join_from_welcome`], a stale local group for this id is
+    /// NOT an obstacle and need not be dropped first: an external commit builds
+    /// a fresh group rather than staging into the existing one, so there is no
+    /// "already exists" collision and no single-use KeyPackage to lose. Dropping
+    /// first is still the tidier call - it leaves no abandoned state behind if
+    /// the commit is later rejected - but it is a preference, not a requirement.
+    pub fn external_join(&self, group_info: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut g = self.lock()?;
+        let msg = MlsMessageIn::tls_deserialize(&mut &group_info[..])
+            .map_err(|e| MlsError::Group(format!("bad group info: {e}")))?;
+        let (group, commit) = g.client.join_by_external_commit(msg)?;
+        let gid = group.group_id().as_slice().to_vec();
+        g.groups.insert(gid.clone(), group);
+        Ok((gid, ser(commit)?))
     }
 
     /// Loads a group from restored storage into the live map.
@@ -459,6 +528,58 @@ mod tests {
         alice.merge_pending(&gid).unwrap();
         assert_eq!(alice.epoch(&gid).unwrap(), 1);
         assert!(bob.join_from_welcome(&w).is_ok());
+    }
+
+    /// OpenMLS takes a Welcome's single-use KeyPackage out of storage before it
+    /// notices that the group is already loaded. Retrying that same Welcome
+    /// then misleadingly reports a missing KeyPackage. The Android repository
+    /// must therefore remove a *proven stale* local group before it calls this
+    /// method; see the matching welcome-epoch predicate in MlsPolicy.
+    #[test]
+    fn stale_group_must_be_dropped_before_joining_a_fresh_welcome() {
+        let alice = ClientHandle::new("alice", "phone").unwrap();
+        let bob = ClientHandle::new("bob", "desktop").unwrap();
+        let gid = b"chat-stale-welcome".to_vec();
+        alice.create_group(&gid).unwrap();
+
+        // Bob's independently-created local tree is stale, but it has the
+        // same GroupId as the real tree. This is the exact precondition that
+        // caused Samsung's key packages to be burned.
+        bob.create_group(&gid).unwrap();
+        let stale_epoch = bob.epoch(&gid).unwrap();
+
+        let burned_kp = kp_of(&bob);
+        let (_commit, burned_welcome) = alice.add_members(&gid, &[burned_kp]).unwrap();
+        assert_eq!(alice.merge_pending(&gid).unwrap(), stale_epoch + 1);
+
+        let first = bob.join_from_welcome(&burned_welcome).unwrap_err().to_string();
+        assert!(
+            first.contains("already exists"),
+            "the existing group, rather than the KeyPackage, must explain the first failure: {first}"
+        );
+        let retry = bob.join_from_welcome(&burned_welcome).unwrap_err().to_string();
+        assert!(
+            retry.contains("No matching key package"),
+            "a failed join must reproduce the irreversible KeyPackage burn: {retry}"
+        );
+
+        // The server would first remove the phantom leaf before issuing a new
+        // invitation. Then the client-side epoch predicate proves this local
+        // group is stale (0 < 1) and drop_group makes the fresh Welcome safe.
+        let _remove = alice
+            .remove_members(&gid, &["bob|desktop".to_string()])
+            .unwrap();
+        alice.merge_pending(&gid).unwrap();
+        bob.drop_group(&gid).unwrap();
+
+        let fresh_kp = kp_of(&bob);
+        let (_commit, fresh_welcome) = alice.add_members(&gid, &[fresh_kp]).unwrap();
+        let fresh_epoch = alice.merge_pending(&gid).unwrap();
+
+        // A successful first attempt proves that the fresh KeyPackage was not
+        // pre-consumed by an "already exists" failure.
+        assert_eq!(bob.join_from_welcome(&fresh_welcome).unwrap(), gid);
+        assert_eq!(bob.epoch(b"chat-stale-welcome").unwrap(), fresh_epoch);
     }
 
     #[test]

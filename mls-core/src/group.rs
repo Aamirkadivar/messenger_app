@@ -249,6 +249,21 @@ impl MlsClient {
     /// Credentials of every current leaf. The tree is the only trustworthy
     /// answer to "is this device already a member?" — v1 trusted a locally
     /// persisted "invited" set that outlived server resets and deadlocked.
+    /// Leaf indices of the members whose credential is in `credentials`.
+    ///
+    /// Removing a member needs its index, and the host only knows credentials
+    /// ("user|device"). Resolving here keeps the host out of the tree.
+    pub fn member_indices(&self, group: &MlsGroup, credentials: &[String]) -> Vec<LeafNodeIndex> {
+        group
+            .members()
+            .filter(|m| {
+                let cred = String::from_utf8_lossy(m.credential.serialized_content()).into_owned();
+                credentials.iter().any(|c| *c == cred)
+            })
+            .map(|m| m.index)
+            .collect()
+    }
+
     /// Signature public keys of the current members.
     ///
     /// MLS forbids two members sharing a signature key, so an Add proposing one
@@ -263,6 +278,74 @@ impl MlsClient {
             .members()
             .map(|m| String::from_utf8_lossy(m.credential.serialized_content()).into_owned())
             .collect()
+    }
+
+    /// Signed GroupInfo for this group, carrying the ratchet tree.
+    ///
+    /// This is the public material a member that has lost its own state needs
+    /// in order to rejoin by external commit. It contains no private keys - it
+    /// is the same object OpenMLS emits alongside every commit, which this
+    /// crate has until now discarded.
+    pub fn export_group_info(&self, group: &MlsGroup) -> Result<MlsMessageOut> {
+        group
+            .export_group_info(self.provider.crypto(), &self.identity.signer, true)
+            .map_err(|e| MlsError::Group(format!("export group info: {e}")))
+    }
+
+    /// Rejoins a group this device still belongs to but can no longer follow,
+    /// without any other member acting.
+    ///
+    /// Why this exists: an author cannot replay its own commit - the handshake
+    /// is encrypted to the epoch it created, and the sender discards its copy
+    /// for forward secrecy. A device whose merge was lost after the DS accepted
+    /// its commit is therefore stranded permanently: `process` answers "Cannot
+    /// decrypt own messages" forever, and the only other way into a group is a
+    /// Welcome, which requires being removed and re-added first.
+    ///
+    /// External commit is the MLS-native escape. OpenMLS bundles a Remove for
+    /// any existing leaf carrying our identity into the SAME commit, so the
+    /// membership SET is unchanged: the stale leaf is replaced, never added
+    /// alongside. The group gains an epoch; it does not gain or lose a member.
+    ///
+    /// The returned commit is pending and, unlike every other commit here,
+    /// CANNOT be cleared - OpenMLS has no pre-commit state to fall back to,
+    /// because this client was not in the tree before it. If the DS rejects it,
+    /// drop the group and rebuild from fresh GroupInfo.
+    pub fn join_by_external_commit(
+        &self,
+        group_info: MlsMessageIn,
+    ) -> Result<(MlsGroup, MlsMessageOut)> {
+        // Matched rather than using `into_verifiable_group_info`, which OpenMLS
+        // gates behind `test-utils`: a test-only path has no business in a
+        // shipping build, the same reason storage.rs hand-encodes its snapshot.
+        let verifiable = match group_info.extract() {
+            MlsMessageBodyIn::GroupInfo(info) => info,
+            _ => return Err(MlsError::Group("not a GroupInfo message".into())),
+        };
+        let cfg = join_config();
+
+        // The builder form is the non-deprecated API, but it is a longer
+        // hand-rolled sequence (leaf node parameters, PSK loading, finalize)
+        // for an identical result. The wrapper keeps the surface this crate
+        // has to get right as small as possible.
+        #[allow(deprecated)]
+        let (group, commit, _group_info) = MlsGroup::join_by_external_commit(
+            &self.provider,
+            &self.identity.signer,
+            // Ratchet tree comes from the GroupInfo's own extension: exported
+            // with_ratchet_tree = true, and the group is configured with
+            // use_ratchet_tree_extension, so it is always carried inline.
+            None,
+            verifiable,
+            &cfg,
+            None,
+            None,
+            b"",
+            self.identity.credential.clone(),
+        )
+        .map_err(|e| MlsError::Group(format!("external commit: {e}")))?;
+
+        Ok((group, commit))
     }
 }
 

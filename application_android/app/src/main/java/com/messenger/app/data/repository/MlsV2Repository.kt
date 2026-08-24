@@ -3,6 +3,7 @@ package com.messenger.app.data.repository
 import android.util.Log
 import com.messenger.app.data.encryption.MlsClient
 import com.messenger.app.data.encryption.MlsCore
+import com.messenger.app.data.encryption.MlsPolicy
 import com.messenger.app.data.encryption.MlsProcessed
 import com.messenger.app.data.encryption.MlsStoreId
 import com.messenger.app.data.model.MlsClaimKeyPackageRequest
@@ -94,6 +95,22 @@ class MlsV2Repository(
      * only - see [serverHasGroup].
      */
     private val serverGroups = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    /**
+     * Chats whose active group id has been checked against the Delivery Service
+     * in this process.
+     *
+     * A local group that LOADS is not evidence that it is the current one. A
+     * device that missed a recreation still holds a perfectly valid group for the
+     * abandoned tree, and every path that could have noticed - send, chat open,
+     * handshake sync - short-circuited on that successful load. It then encrypted
+     * into a group nobody else was on, in both directions, indefinitely.
+     *
+     * So the DS is asked once per chat per run, and again whenever a message
+     * fails to apply (see [applyBytes]) - which is exactly the symptom of the id
+     * having moved underneath us.
+     */
+    private val gidVerified = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
     /**
      * Active MLS group id per chat, learned from the Delivery Service. Absent
@@ -379,25 +396,12 @@ class MlsV2Repository(
      * re-checkable, while a group that exists never stops existing.
      */
     suspend fun serverHasGroup(chatId: String): Boolean = withContext(Dispatchers.IO) {
-        if (serverGroups.contains(chatId)) return@withContext true
-        val t = token() ?: return@withContext false
-        val resp = runCatching { api.getMlsGroup(bearer(t), chatId) }.getOrNull()
-            ?: return@withContext false
-        if (!resp.isSuccessful) return@withContext false
-        serverGroups.add(chatId)
-        // Adopt the incarnation the DS considers active while we are here. A
-        // device that missed a recreation learns about it on its next send or
-        // sync, rather than continuing to address the abandoned tree.
-        resp.body()?.groupIdB64?.takeIf { it.isNotBlank() }?.let { b64Gid ->
-            runCatching { unb64(b64Gid) }.getOrNull()?.let { gid ->
-                if (!gid.contentEquals(gidOf(chatId))) {
-                    Log.i(TAG, "active MLS group id changed for $chatId; adopting the DS value")
-                    forgetLocal(chatId)
-                    setActiveGid(chatId, gid)
-                }
-            }
-        }
-        true
+        // Adoption lives in ensureCurrentGid so there is exactly one place that
+        // compares against the DS. The positive cache below used to be set
+        // BEFORE adoption ran, which latched this path shut for the rest of the
+        // process and was the second reason a stale group was never noticed.
+        if (!ensureCurrentGid(chatId)) return@withContext serverGroups.contains(chatId)
+        serverGroups.contains(chatId)
     }
 
     /**
@@ -415,6 +419,54 @@ class MlsV2Repository(
         // Persist the removal. This is a non-empty snapshot in every realistic
         // case (identity keys remain), so the empty-overwrite guard does not fire.
         persist(c).onFailure { Log.w(TAG, "could not persist group drop: ${it.message}") }
+    }
+
+    /**
+     * Removes a group only after a newer Welcome has proven it stale.
+     *
+     * Unlike [forgetLocal], this is a gate for a subsequent single-use
+     * Welcome-open. If either the core deletion or its durable snapshot fails,
+     * do not call joinFromWelcome: an existing group makes OpenMLS consume the
+     * KeyPackage and then fail with "already exists".
+     */
+    private suspend fun dropStaleLocalForWelcome(chatId: String): Boolean {
+        val c = client ?: return false
+        if (runCatching { c.dropGroup(gidOf(chatId)) }
+                .onFailure { Log.w(TAG, "drop stale group $chatId: ${it.message}") }
+                .isFailure) {
+            return false
+        }
+        liveGroups.remove(chatId)
+        return persist(c).onFailure {
+            Log.w(TAG, "could not persist stale group drop for $chatId: ${it.message}")
+        }.isSuccess
+    }
+
+    /**
+     * Makes it safe to present [welcomeEpoch]'s Welcome to OpenMLS.
+     *
+     * The DS GID check prevents a locally loadable abandoned incarnation from
+     * being treated as current. Once the active GID agrees, a local epoch below
+     * the Welcome's post-commit epoch is the narrow proof that this local group
+     * is stale. Equal or newer local state is healthy/redundant and must not be
+     * opened, dropped, or acknowledged here.
+     */
+    private suspend fun prepareForWelcome(chatId: String, welcomeEpoch: Long): Boolean {
+        if (chatId.isBlank() || !ensureCurrentGid(chatId)) return false
+        val c = ensureClient() ?: return false
+        val localEpoch = runCatching { c.loadGroup(gidOf(chatId)) }.getOrNull()
+        if (localEpoch == null) return true
+
+        if (!MlsPolicy.shouldReplaceLocalGroupForWelcome(localEpoch, welcomeEpoch)) {
+            liveGroups.add(chatId)
+            Log.i(TAG, "MLS v2 $chatId: skipping redundant Welcome at epoch $welcomeEpoch " +
+                "(local epoch $localEpoch)")
+            return false
+        }
+
+        Log.i(TAG, "MLS v2 $chatId: replacing stale local epoch $localEpoch " +
+            "for Welcome epoch $welcomeEpoch")
+        return dropStaleLocalForWelcome(chatId)
     }
 
     /**
@@ -560,12 +612,50 @@ class MlsV2Repository(
     }
 
     /** True when this device holds usable state for [chatId]. */
+    /**
+     * Makes the locally active group id agree with the Delivery Service.
+     *
+     * Returns false when the DS could not be reached, and the caller must then
+     * treat the chat as unusable rather than fall back to the chat-derived id:
+     * guessing is what let a device address an abandoned tree forever.
+     *
+     * Adoption reuses the existing [forgetLocal] + [setActiveGid] pair; this adds
+     * no second persistence mechanism.
+     */
+    private suspend fun ensureCurrentGid(chatId: String): Boolean {
+        if (gidVerified.contains(chatId)) return true
+        val t = token() ?: return false
+        val resp = runCatching { api.getMlsGroup(bearer(t), chatId) }.getOrNull() ?: return false
+        if (!resp.isSuccessful) {
+            // 404 means the DS holds no group: nothing to converge on, and the
+            // create path owns that case. Anything else is an unknown answer.
+            return if (resp.code() == 404) { gidVerified.add(chatId); true } else false
+        }
+        serverGroups.add(chatId)
+        val b64Gid = resp.body()?.groupIdB64
+        if (b64Gid.isNullOrBlank()) return false
+        val serverGid = runCatching { unb64(b64Gid) }.getOrNull() ?: return false
+
+        loadActiveGid(chatId)
+        if (!serverGid.contentEquals(gidOf(chatId))) {
+            Log.i(TAG, "active MLS group id changed for $chatId; adopting the DS value")
+            forgetLocal(chatId)
+            setActiveGid(chatId, serverGid)
+        }
+        gidVerified.add(chatId)
+        return true
+    }
+
     suspend fun hasGroup(chatId: String): Boolean = withContext(Dispatchers.IO) {
         val c = ensureClient() ?: return@withContext false
-        // Recover the active incarnation before deriving a group id. Without
-        // this, a restart starts with an empty cache and gidOf falls back to the
-        // chat-derived id - addressing a tree that recreation abandoned.
-        loadActiveGid(chatId)
+        // The DS owns group identity. Checking this BEFORE trusting a loadable
+        // local group is the whole point: a stale group loads just as cleanly as
+        // a current one, and accepting it is how a device went silent in both
+        // directions while believing it was fine.
+        if (!ensureCurrentGid(chatId)) {
+            Log.w(TAG, "hasGroup $chatId: cannot confirm the active group id; failing closed")
+            return@withContext false
+        }
         if (liveGroups.contains(chatId)) return@withContext true
         // Try loading from restored storage before concluding we are not a member.
         runCatching { c.loadGroup(gidOf(chatId)) }
@@ -733,7 +823,13 @@ class MlsV2Repository(
     /** Applies one MLS blob without retrying handshakes (avoids recursion). */
     private suspend fun applyBytes(c: MlsClient, chatId: String, message: ByteArray): MlsProcessed? {
         val out = runCatching { c.process(gidOf(chatId), message) }
-            .onFailure { Log.w(TAG, "apply $chatId: ${it.message}") }
+            .onFailure {
+                Log.w(TAG, "apply $chatId: ${it.message}")
+                // "Message group ID differs" is precisely what a recreation looks
+                // like from here. Re-check with the DS on the next pass rather
+                // than staying latched on this run's answer.
+                gidVerified.remove(chatId)
+            }
             .getOrNull()
         if (out != null) persist(c)
         return out
@@ -889,6 +985,14 @@ class MlsV2Repository(
         val t = token() ?: return@withContext
         if (!hasGroup(chatId)) return@withContext
         val meDev = myDevice()
+
+        // A leaf in the tree is not proof the device joined. One that never
+        // consumed its Welcome looks like a member from here, so it is never
+        // re-invited, while being unable to read anything - stranded, and
+        // blocking its own recovery. Evict those first so the ordinary
+        // KeyPackage/Welcome flow below can add them back for real.
+        evictPhantomMembers(chatId, t, meDev)
+
         val current = roster(chatId).toSet()
 
         val devices = runCatching {
@@ -977,6 +1081,58 @@ class MlsV2Repository(
         }
     }
 
+    /**
+     * Removes leaves the Delivery Service reports as having an OUTSTANDING
+     * invitation: the device's newest Welcome is unconsumed and the group has
+     * already moved past it.
+     *
+     * "Outstanding" is the server's judgement and deliberately narrower than
+     * "has some unconsumed Welcome". A device carrying an ancient Welcome it can
+     * never open - the KeyPackage private key died with an old store
+     * incarnation - is not a phantom if it later joined through a newer one, and
+     * a device invited by the commit that just landed has simply not polled yet.
+     * Reading either as proof evicts a genuine member, and since eviction is
+     * followed by a re-invite it does not misfire once: it loops, burning two
+     * epochs a pass. See GetCoverage in back-end/handlers/mls.go.
+     *
+     * Gated on POSITIVE evidence only. Coverage that cannot be fetched, or that
+     * lists nothing pending, removes nobody: absence of information must never
+     * justify evicting a member.
+     *
+     * The removal is one commit; the re-invite is the caller's normal path.
+     */
+    private suspend fun evictPhantomMembers(chatId: String, t: String, meDev: String) {
+        val coverage = runCatching { api.getMlsCoverage(bearer(t), chatId).body() }.getOrNull()
+            ?: return
+        val phantoms = MlsPolicy.phantomMembers(
+            roster(chatId), meDev, coverage.pendingDeviceIds.toSet()
+        )
+        if (phantoms.isEmpty()) return
+
+        val c = ensureClient() ?: return
+
+        Log.i(TAG, "MLS v2 $chatId: evicting ${phantoms.size} phantom member(s) " +
+            "whose invitation the DS reports outstanding")
+        val commit = runCatching { c.removeMembers(gidOf(chatId), phantoms) }.getOrElse {
+            Log.w(TAG, "MLS v2 $chatId: phantom removal could not be staged: ${it.message}")
+            return
+        }
+        val expected = epoch(chatId)
+        val resp = runCatching {
+            api.submitMlsCommit(bearer(t), chatId, MlsCommitRequest(expected, b64(commit), meDev, emptyList()))
+        }.getOrNull()
+        if (resp != null && resp.isSuccessful) {
+            val e = onCommitAccepted(chatId)
+            Log.i(TAG, "MLS v2 $chatId: phantom(s) removed, epoch=$e")
+        } else {
+            // Someone else moved first, or the DS refused. Discard and let the
+            // next pass retry; never leave a staged commit behind.
+            Log.w(TAG, "MLS v2 $chatId: phantom removal rejected (${resp?.code() ?: -1})")
+            onCommitRejected(chatId)
+            syncHandshakes(chatId)
+        }
+    }
+
     /** Applies commits we have not seen. Without this we fall an epoch behind. */
     suspend fun syncHandshakes(chatId: String): Unit = withContext(Dispatchers.IO) {
         val t = token() ?: return@withContext
@@ -1007,10 +1163,16 @@ class MlsV2Repository(
             api.getMlsWelcomes(bearer(t), myDevice()).body()?.welcomes.orEmpty()
         }.getOrDefault(emptyList())
 
+        // GetWelcomes is ordered oldest first. A device can carry an ancient
+        // dead-store Welcome beside a newer recovery Welcome; processing the
+        // old one first can only waste its single-use KeyPackage. The newest
+        // row per chat is the only invitation that describes the current state.
+        val newestPerChat = pending.asReversed().distinctBy { it.chatId }.asReversed()
         val joined = mutableListOf<String>()
         val acked = mutableListOf<String>()
-        for (w in pending) {
+        for (w in newestPerChat) {
             if (w.welcomeB64.isBlank()) continue
+            if (!prepareForWelcome(w.chatId, w.epoch)) continue
             val chatId = joinFromWelcome(unb64(w.welcomeB64))
             if (chatId != null) {
                 joined.add(chatId)
@@ -1041,6 +1203,7 @@ class MlsV2Repository(
         storeId = null
         activeGid.clear()
         serverGroups.clear()
+        gidVerified.clear()
         recreateAttempted.clear()
     }
 }

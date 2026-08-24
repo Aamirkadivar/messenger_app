@@ -471,6 +471,12 @@ func (h *MLSHandler) GetGroup(c *fiber.Ctx) error {
 // that to (a) elect a creator only among devices that can actually join, and
 // (b) refuse to send MLS until every other live device has joined. Local
 // "I have a group" is not the same as "everyone can decrypt".
+//
+// acked_device_ids means "has joined through some Welcome, ever".
+// pending_device_ids means "the device's NEWEST Welcome is unconsumed AND the
+// group has already moved past it" - an invitation that is outstanding rather
+// than merely in flight. The two are computed independently and a device may
+// appear in both: joined once, removed, re-invited, and not back yet.
 func (h *MLSHandler) GetCoverage(c *fiber.Ctx) error {
 	userID := middleware.GetCurrentUserID(c)
 	chatID := c.Params("chat_id")
@@ -531,23 +537,62 @@ func (h *MLSHandler) GetCoverage(c *fiber.Ctx) error {
 		epoch = g.Epoch
 		instanceID = g.ID.String()
 		var welcomes []models.MLSWelcome
-		database.DB.Where("chat_id = ?", chatID).Find(&welcomes)
+		database.DB.Where("chat_id = ?", chatID).
+			Order("created_at asc, epoch asc").Find(&welcomes)
+
+		// A device's Welcomes are a chronological invitation ledger, and only
+		// the NEWEST row describes where that device stands now. Aggregating
+		// with "any unconsumed row wins" made a device whose ancient Welcome
+		// could never be opened - its KeyPackage private key died with an old
+		// store incarnation - pending forever, even after it had genuinely
+		// joined through a later one. The client's phantom eviction reads this
+		// field, so "pending forever" meant "evicted on every pass": a joined
+		// phone was removed and re-added in a loop that walked a live group
+		// from epoch 4 to epoch 8.
+		//
+		// Recency is created_at, never epoch: RecreateGroup zeroes the group
+		// epoch while keeping consumed rows, so an epoch-4 row from a dead
+		// incarnation would otherwise outrank an epoch-1 row from the live one.
+		// Epoch is only a tiebreaker here - Welcomes for one commit are written
+		// in a single transaction and share a timestamp.
 		seenAcked := make(map[string]bool)
-		seenPending := make(map[string]bool)
+		newest := make(map[string]models.MLSWelcome)
+		devices := make([]string, 0, len(welcomes))
 		for _, w := range welcomes {
 			id := w.RecipientDeviceID
 			if id == "" {
 				continue
 			}
-			if w.ConsumedAt != nil {
-				if !seenAcked[id] {
-					acked = append(acked, id)
-					seenAcked[id] = true
-				}
-			} else if !seenPending[id] {
-				pending = append(pending, id)
-				seenPending[id] = true
+			// Unchanged: acked means "has ever joined through a Welcome".
+			if w.ConsumedAt != nil && !seenAcked[id] {
+				acked = append(acked, id)
+				seenAcked[id] = true
 			}
+			prev, seen := newest[id]
+			if !seen {
+				devices = append(devices, id)
+				newest[id] = w
+				continue
+			}
+			if w.CreatedAt.After(prev.CreatedAt) ||
+				(w.CreatedAt.Equal(prev.CreatedAt) && w.Epoch > prev.Epoch) {
+				newest[id] = w
+			}
+		}
+		for _, id := range devices {
+			w := newest[id]
+			// Consumed newest: joined, nothing outstanding.
+			if w.ConsumedAt != nil {
+				continue
+			}
+			// Unconsumed but at the current epoch: the invitation was issued by
+			// the commit that just landed and the invitee has not had a chance
+			// to poll for it. In flight is not the same as abandoned, and
+			// treating it as abandoned is what closed the eviction loop.
+			if w.Epoch >= g.Epoch {
+				continue
+			}
+			pending = append(pending, id)
 		}
 	}
 

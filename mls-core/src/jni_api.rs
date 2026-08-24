@@ -536,6 +536,45 @@ pub extern "system" fn Java_com_messenger_app_data_encryption_MlsNative_groupSig
     out_bytes(&mut env, &data)
 }
 
+/// Stages a Remove for the newline-separated credentials in `credentials`.
+/// Returns the commit; the host merges only after the DS accepts it.
+///
+/// Used to evict a leaf whose device never consumed its Welcome - a phantom
+/// member that is unreachable yet blocks its own re-invitation.
+#[no_mangle]
+pub extern "system" fn Java_com_messenger_app_data_encryption_MlsNative_groupRemove<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    handle: jlong,
+    gid: JByteArray<'a>,
+    credentials: JByteArray<'a>,
+) -> jbyteArray {
+    let g = match bytes_of(&mut env, &gid) {
+        Ok(b) => b,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let raw = match bytes_of(&mut env, &credentials) {
+        Ok(b) => b,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let data = with_client(&mut env, handle, Vec::new(), |c| {
+        let text = String::from_utf8(raw.clone()).map_err(|e| e.to_string())?;
+        let creds: Vec<String> = text
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if creds.is_empty() {
+            return Err("no credentials supplied".into());
+        }
+        c.remove_members(&g, &creds).map_err(|e| e.to_string())
+    });
+    if data.is_empty() {
+        return std::ptr::null_mut();
+    }
+    out_bytes(&mut env, &data)
+}
+
 /// Joins from a Welcome. Returns the group id, which the host acks against.
 #[no_mangle]
 pub extern "system" fn Java_com_messenger_app_data_encryption_MlsNative_joinWelcome<'a>(
@@ -666,5 +705,68 @@ pub extern "system" fn Java_com_messenger_app_data_encryption_MlsNative_roster<'
     let data = with_client(&mut env, handle, Vec::new(), |c| {
         c.roster(&g).map_err(|e| e.to_string())
     });
+    out_bytes(&mut env, &data)
+}
+
+/// Signed GroupInfo (with ratchet tree) for a stranded member to rejoin from.
+///
+/// Public material only: it carries no private keys, so it may be handed to the
+/// Delivery Service or moved device-to-device without exposing group secrets.
+#[no_mangle]
+pub extern "system" fn Java_com_messenger_app_data_encryption_MlsNative_exportGroupInfo<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    handle: jlong,
+    gid: JByteArray<'a>,
+) -> jbyteArray {
+    let g = match bytes_of(&mut env, &gid) {
+        Ok(b) => b,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let data = with_client(&mut env, handle, Vec::new(), |c| {
+        c.export_group_info(&g).map_err(|e| e.to_string())
+    });
+    if data.is_empty() {
+        return std::ptr::null_mut();
+    }
+    out_bytes(&mut env, &data)
+}
+
+/// Rejoins by external commit. Returns `len(gid) || gid || commit`, the same
+/// length-prefixed pairing [`Java_..._groupAdd`] uses.
+///
+/// For a device still in the tree that can no longer follow the group - the one
+/// case a Welcome cannot fix, because MLS refuses to add an existing member.
+/// OpenMLS folds a Remove for the matching identity into the same commit, so
+/// the membership set is preserved rather than changed.
+///
+/// The commit is pending. On DS acceptance call `mergePending`; on rejection
+/// call `dropGroup` and rebuild from fresh GroupInfo - `clearPending` cannot
+/// rescue an external commit, because there is no pre-commit state to hold.
+#[no_mangle]
+pub extern "system" fn Java_com_messenger_app_data_encryption_MlsNative_externalJoin<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    handle: jlong,
+    group_info: JByteArray<'a>,
+) -> jbyteArray {
+    let gi = match bytes_of(&mut env, &group_info) {
+        Ok(b) => b,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let data = with_client(&mut env, handle, Vec::new(), |c| {
+        if gi.is_empty() {
+            return Err("empty group info".into());
+        }
+        let (gid, commit) = c.external_join(&gi).map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(4 + gid.len() + commit.len());
+        out.extend_from_slice(&(gid.len() as u32).to_be_bytes());
+        out.extend_from_slice(&gid);
+        out.extend_from_slice(&commit);
+        Ok(out)
+    });
+    if data.is_empty() {
+        return std::ptr::null_mut();
+    }
     out_bytes(&mut env, &data)
 }

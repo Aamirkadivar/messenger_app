@@ -13,6 +13,7 @@
 //!   * `GetWelcomes`   — hands out, does NOT consume
 //!   * `AckWelcome`    — consumes, only after the client joined
 //!   * `GetHandshakes` — ordered, `since_epoch`
+//!   * `GetCoverage`   — newest Welcome per device wins, ordered by created_at
 //!
 //! If those rules change on the server, these tests must change with them.
 
@@ -34,6 +35,25 @@ struct Welcome {
     device: String,
     blob: Vec<u8>,
     consumed: bool,
+    /// Group epoch the adding commit produced — mirrors `MLSWelcome.Epoch`,
+    /// which the Go handler writes inside the same transaction that advances
+    /// the group.
+    epoch: u64,
+    /// Monotonic stand-in for `MLSWelcome.CreatedAt`. Deliberately separate
+    /// from both `id` and `epoch`: RecreateGroup zeroes the group epoch while
+    /// keeping consumed rows, so only wall-clock order survives a recreation.
+    created_at: u64,
+}
+
+/// What the DS can say about join progress without reading the ratchet tree.
+///
+/// `acked` is "joined through some Welcome, ever". `pending` is "this device's
+/// NEWEST Welcome is unconsumed AND the group has already moved past it" — an
+/// invitation that is outstanding rather than merely in flight. A device can be
+/// in both: joined once, removed, re-invited, and not back yet.
+struct Coverage {
+    acked: Vec<String>,
+    pending: Vec<String>,
 }
 
 /// Models the Go DS. Holds only opaque bytes plus integers — mirroring the
@@ -46,6 +66,8 @@ struct FakeDs {
     key_packages: HashMap<String, Vec<Vec<u8>>>,
     welcomes: Vec<Welcome>,
     next_welcome_id: u64,
+    /// Ticks once per queued Welcome, standing in for the server clock.
+    clock: u64,
     /// Application messages, in submission order.
     messages: Vec<Vec<u8>>,
 }
@@ -58,6 +80,7 @@ impl FakeDs {
             key_packages: HashMap::new(),
             welcomes: Vec::new(),
             next_welcome_id: 1,
+            clock: 1,
             messages: Vec::new(),
         }
     }
@@ -86,15 +109,81 @@ impl FakeDs {
         SubmitResult::Accepted { new_epoch: self.epoch }
     }
 
+    /// Stamps the Welcome with the epoch the adding commit just produced, the
+    /// way SubmitCommit does: the row is written in the same transaction that
+    /// advanced the group, so `epoch` is always the post-commit value.
     fn queue_welcome(&mut self, device: &str, blob: Vec<u8>) {
+        let epoch = self.epoch;
+        self.queue_welcome_at(device, blob, epoch, None);
+    }
+
+    /// Injects a row at a chosen point in the ledger, for modelling history a
+    /// test cannot reach by committing — an invitation from a dead store
+    /// incarnation, or one that predates a recreation.
+    fn queue_welcome_at(&mut self, device: &str, blob: Vec<u8>, epoch: u64, created_at: Option<u64>) {
         let id = self.next_welcome_id;
         self.next_welcome_id += 1;
+        let created_at = created_at.unwrap_or_else(|| {
+            let t = self.clock;
+            self.clock += 1;
+            t
+        });
         self.welcomes.push(Welcome {
             id,
             device: device.to_string(),
             blob,
             consumed: false,
+            epoch,
+            created_at,
         });
+    }
+
+    /// Mirrors `GetCoverage` in back-end/handlers/mls.go.
+    ///
+    /// A device's Welcomes are a chronological invitation ledger and only the
+    /// NEWEST row describes where that device stands. Folding with "any
+    /// unconsumed row wins" made a device whose ancient Welcome could never be
+    /// opened pending forever, and the client's phantom eviction reads this —
+    /// so "pending forever" meant "evicted every pass".
+    ///
+    /// Recency is `created_at`, never `epoch`: a recreation zeroes the group
+    /// epoch while keeping consumed rows.
+    fn coverage(&self) -> Coverage {
+        let mut ordered: Vec<&Welcome> = self.welcomes.iter().collect();
+        ordered.sort_by_key(|w| (w.created_at, w.epoch));
+
+        let mut acked: Vec<String> = Vec::new();
+        let mut newest: HashMap<&str, &Welcome> = HashMap::new();
+        let mut devices: Vec<&str> = Vec::new();
+
+        for w in ordered {
+            if w.consumed && !acked.iter().any(|d| d == &w.device) {
+                acked.push(w.device.clone());
+            }
+            match newest.get(w.device.as_str()) {
+                None => {
+                    devices.push(w.device.as_str());
+                    newest.insert(w.device.as_str(), w);
+                }
+                Some(prev) => {
+                    if (w.created_at, w.epoch) > (prev.created_at, prev.epoch) {
+                        newest.insert(w.device.as_str(), w);
+                    }
+                }
+            }
+        }
+
+        let mut pending = Vec::new();
+        for d in devices {
+            let w = newest[d];
+            // Consumed newest: joined, nothing outstanding. Unconsumed but at
+            // the current epoch: issued by the commit that just landed, and the
+            // invitee has not had a chance to poll for it yet.
+            if !w.consumed && w.epoch < self.epoch {
+                pending.push(d.to_string());
+            }
+        }
+        Coverage { acked, pending }
     }
 
     /// Hands out pending Welcomes WITHOUT consuming them. v1 consumed on
@@ -212,6 +301,68 @@ fn join_pending(ds: &mut FakeDs, dev: &Device) -> Vec<Vec<u8>> {
         }
     }
     joined
+}
+
+/// The client half of phantom detection: DS evidence INTERSECTED with the local
+/// ratchet tree.
+///
+/// Neither half is sufficient alone. The DS never parses a commit, so it cannot
+/// see removals and cannot tell "joined and still a member" from "joined and
+/// later removed" — only the tree knows that. The DS holds the invitation
+/// ledger, which the tree knows nothing about. A phantom is precisely the
+/// disagreement: a leaf that is present, for a device that has not joined.
+fn phantoms(ds: &FakeDs, adder: &Device, gid: &[u8]) -> Vec<String> {
+    let pending = ds.coverage().pending;
+    let roster = adder
+        .handle
+        .roster(gid)
+        .ok()
+        .and_then(|r| String::from_utf8(r).ok())
+        .unwrap_or_default();
+    roster
+        .lines()
+        .filter(|cred| !cred.is_empty() && *cred != adder.id)
+        .filter(|cred| pending.iter().any(|p| p == cred))
+        .map(|c| c.to_string())
+        .collect()
+}
+
+/// One pass of the client's `inviteMissingDevices`: evict proven phantoms, then
+/// add every chat device that is not already a leaf.
+fn invite_pass(ds: &mut FakeDs, adder: &Device, gid: &[u8], chat_devices: &[&Device]) {
+    for cred in phantoms(ds, adder, gid) {
+        let expected = match adder.handle.epoch(gid) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let commit = match adder.handle.remove_members(gid, &[cred.clone()]) {
+            Ok(c) => c,
+            // Removing nobody is an error, never an empty commit.
+            Err(_) => continue,
+        };
+        match ds.submit_commit(expected, commit) {
+            SubmitResult::Accepted { .. } => {
+                adder.handle.merge_pending(gid).expect("merge removal");
+            }
+            SubmitResult::Conflict { .. } => {
+                adder.handle.clear_pending(gid).expect("discard removal");
+            }
+        }
+    }
+
+    let roster = adder
+        .handle
+        .roster(gid)
+        .ok()
+        .and_then(|r| String::from_utf8(r).ok())
+        .unwrap_or_default();
+    let current: Vec<&str> = roster.lines().collect();
+    for d in chat_devices {
+        if d.id == adder.id || current.contains(&d.id.as_str()) {
+            continue;
+        }
+        let _ = add_member(ds, adder, d, gid);
+    }
 }
 
 // -------------------------------------------------------------------- tests
@@ -928,4 +1079,474 @@ fn a_windows_v6_identity_coexists_with_android_devices() {
     }
     let roster = String::from_utf8(android_a.handle.roster(&gid).unwrap()).unwrap();
     assert_eq!(3, roster.lines().count(), "three devices in one group: {roster}");
+}
+
+
+// ------------------------------------------------- phantom members
+//
+// A device that is added to the tree but never consumes its Welcome looks like
+// a member to everyone else and is therefore never re-invited, while being
+// unable to read anything. It is stranded, and only the DS can tell: it holds
+// the Welcome with consumed_at still NULL.
+
+#[test]
+fn a_phantom_leaf_can_be_removed_and_the_device_re_invited() {
+    let mut ds = FakeDs::new();
+    let alice = Device::new("alice", "a1");
+    let ghost = Device::new("ghost", "g1");
+    let gid = b"g-phantom".to_vec();
+    alice.handle.create_group(&gid).expect("create");
+
+    // Ghost is added but never joins: the Welcome is queued and left unacked,
+    // exactly the state the DS reports as pending.
+    ghost.publish(&mut ds, 2);
+    add_member(&mut ds, &alice, &ghost, &gid).expect("ghost is added to the tree");
+    let roster = String::from_utf8(alice.handle.roster(&gid).unwrap()).unwrap();
+    assert!(roster.contains(&ghost.id), "ghost must be in the tree: {roster}");
+    assert!(
+        ds.welcomes.iter().any(|w| w.device == ghost.id && !w.consumed),
+        "the DS must still show the Welcome as pending"
+    );
+
+    // Evicting the dead leaf is what unblocks recovery.
+    let expected = alice.handle.epoch(&gid).unwrap();
+    let commit = alice
+        .handle
+        .remove_members(&gid, &[ghost.id.clone()])
+        .expect("the phantom leaf must be removable");
+    assert_eq!(
+        SubmitResult::Accepted { new_epoch: expected + 1 },
+        ds.submit_commit(expected, commit)
+    );
+    alice.handle.merge_pending(&gid).expect("merge");
+    let roster = String::from_utf8(alice.handle.roster(&gid).unwrap()).unwrap();
+    assert!(!roster.contains(&ghost.id), "ghost must be gone: {roster}");
+
+    // Now the ordinary invite path can add it back for real.
+    add_member(&mut ds, &alice, &ghost, &gid).expect("re-invite");
+    assert_eq!(vec![gid.clone()], join_pending(&mut ds, &ghost), "ghost joins this time");
+    let roster = String::from_utf8(alice.handle.roster(&gid).unwrap()).unwrap();
+    assert!(roster.contains(&ghost.id), "ghost is a real member now: {roster}");
+}
+
+#[test]
+fn removing_nobody_is_an_error_not_an_empty_commit() {
+    let alice = Device::new("alice", "a1");
+    let gid = b"g-noremove".to_vec();
+    alice.handle.create_group(&gid).expect("create");
+    let before = alice.handle.epoch(&gid).unwrap();
+
+    assert!(
+        alice.handle.remove_members(&gid, &["nobody|nowhere".to_string()]).is_err(),
+        "a Remove that matches no member must fail rather than burn an epoch"
+    );
+    assert_eq!(before, alice.handle.epoch(&gid).unwrap(), "epoch must not move");
+}
+
+#[test]
+fn a_genuinely_joined_member_survives_removal_of_a_phantom() {
+    let mut ds = FakeDs::new();
+    let alice = Device::new("alice", "a1");
+    let real = Device::new("real", "r1");
+    let ghost = Device::new("ghost", "g1");
+    let gid = b"g-mixed-remove".to_vec();
+    alice.handle.create_group(&gid).expect("create");
+
+    real.publish(&mut ds, 1);
+    add_member(&mut ds, &alice, &real, &gid).expect("real added");
+    join_pending(&mut ds, &real);
+    ghost.publish(&mut ds, 1);
+    add_member(&mut ds, &alice, &ghost, &gid).expect("ghost added");
+
+    let expected = alice.handle.epoch(&gid).unwrap();
+    let commit = alice.handle.remove_members(&gid, &[ghost.id.clone()]).expect("remove");
+    assert_eq!(
+        SubmitResult::Accepted { new_epoch: expected + 1 },
+        ds.submit_commit(expected, commit)
+    );
+    alice.handle.merge_pending(&gid).expect("merge");
+    catch_up(&ds, &real, &gid);
+
+    let roster = String::from_utf8(alice.handle.roster(&gid).unwrap()).unwrap();
+    assert!(roster.contains(&real.id), "the joined member must survive: {roster}");
+    assert!(!roster.contains(&ghost.id), "only the phantom goes: {roster}");
+    assert_eq!(
+        alice.handle.epoch(&gid).unwrap(),
+        real.handle.epoch(&gid).unwrap(),
+        "the surviving member must stay in epoch step"
+    );
+}
+
+// ------------------------------------- phantom detection must not misfire
+//
+// Being listed as pending is not proof of anything on its own. A device's
+// Welcomes are a ledger: an ancient row that can never be opened says nothing
+// about a device that has since joined through a newer one, and a row created
+// by the commit that just landed says nothing about a device that has not had
+// a chance to poll. Reading either as proof evicts genuine members, and since
+// the eviction is followed by a re-invite, it does so in a loop.
+
+#[test]
+fn a_device_that_consumed_a_newer_welcome_is_not_evicted() {
+    let mut ds = FakeDs::new();
+    let alice = Device::new("alice", "a1");
+    let bob = Device::new("bob", "b1");
+    let carol = Device::new("carol", "c1");
+    let gid = b"g-superseded".to_vec();
+    alice.handle.create_group(&gid).expect("create");
+
+    // W1: an invitation from a dead store incarnation. The matching KeyPackage
+    // private key is long gone, so this row can never be consumed — it sits
+    // unconsumed for the life of the chat. created_at 0 puts it first.
+    ds.queue_welcome_at(&bob.id, vec![0xde, 0xad, 0xbe, 0xef], 0, Some(0));
+
+    // W2: the invitation that actually worked.
+    bob.publish(&mut ds, 2);
+    add_member(&mut ds, &alice, &bob, &gid).expect("bob added");
+    assert_eq!(vec![gid.clone()], join_pending(&mut ds, &bob), "bob joins through W2");
+    assert_eq!(
+        1,
+        ds.get_welcomes(&bob.id).len(),
+        "W1 must stay pending: a Welcome that cannot be opened is never acked"
+    );
+
+    // Move the group past W2, so the staleness gate is NOT what saves bob here
+    // and supersession has to carry the test on its own.
+    carol.publish(&mut ds, 1);
+    add_member(&mut ds, &alice, &carol, &gid).expect("carol added");
+    join_pending(&mut ds, &carol);
+
+    let cov = ds.coverage();
+    assert!(cov.acked.contains(&bob.id), "consuming W2 is the join proof: {:?}", cov.acked);
+    assert!(
+        !cov.pending.contains(&bob.id),
+        "the dead W1 must not outrank the consumed W2: {:?}",
+        cov.pending
+    );
+    assert!(phantoms(&ds, &alice, &gid).is_empty(), "a joined member is not a phantom");
+
+    let before = (ds.epoch, ds.handshakes.len(), ds.welcomes.len());
+    invite_pass(&mut ds, &alice, &gid, &[&bob, &carol]);
+    assert_eq!(
+        before,
+        (ds.epoch, ds.handshakes.len(), ds.welcomes.len()),
+        "no eviction, no epoch advance, no replacement Welcome"
+    );
+
+    let roster = String::from_utf8(alice.handle.roster(&gid).unwrap()).unwrap();
+    assert!(roster.contains(&bob.id), "bob must still be a member: {roster}");
+
+    // The property every epoch assertion above is a proxy for.
+    catch_up(&ds, &bob, &gid);
+    let ct = alice.handle.encrypt(&gid, b"still here").expect("encrypt");
+    let (kind, pt) = bob.handle.process(&gid, &ct).expect("bob decrypts");
+    assert_eq!((kind, pt.as_slice()), (1u8, b"still here".as_slice()));
+}
+
+#[test]
+fn a_device_with_only_a_pending_welcome_stays_evictable() {
+    let mut ds = FakeDs::new();
+    let alice = Device::new("alice", "a1");
+    let ghost = Device::new("ghost", "g1");
+    let carol = Device::new("carol", "c1");
+    let gid = b"g-still-evictable".to_vec();
+    alice.handle.create_group(&gid).expect("create");
+
+    // Ghost gets a leaf and never joins: one unconsumed Welcome, and nothing
+    // consumed anywhere in its ledger.
+    ghost.publish(&mut ds, 2);
+    add_member(&mut ds, &alice, &ghost, &gid).expect("ghost added");
+
+    // The group moves past the invitation, which is what makes it outstanding
+    // rather than in flight.
+    carol.publish(&mut ds, 1);
+    add_member(&mut ds, &alice, &carol, &gid).expect("carol added");
+    join_pending(&mut ds, &carol);
+
+    assert!(
+        ds.coverage().pending.contains(&ghost.id),
+        "a stale unconsumed invitation is exactly the evidence recovery needs"
+    );
+    assert_eq!(vec![ghost.id.clone()], phantoms(&ds, &alice, &gid));
+
+    invite_pass(&mut ds, &alice, &gid, &[&ghost, &carol]);
+
+    assert_eq!(vec![gid.clone()], join_pending(&mut ds, &ghost), "ghost joins for real");
+    catch_up(&ds, &carol, &gid);
+    let roster = String::from_utf8(alice.handle.roster(&gid).unwrap()).unwrap();
+    assert!(roster.contains(&ghost.id), "ghost is a real member now: {roster}");
+    assert!(roster.contains(&carol.id), "carol must survive the eviction: {roster}");
+}
+
+#[test]
+fn a_just_invited_device_is_not_evicted_before_it_can_poll() {
+    let mut ds = FakeDs::new();
+    let alice = Device::new("alice", "a1");
+    let bob = Device::new("bob", "b1");
+    let gid = b"g-in-flight".to_vec();
+    alice.handle.create_group(&gid).expect("create");
+
+    bob.publish(&mut ds, 2);
+    add_member(&mut ds, &alice, &bob, &gid).expect("bob added");
+    assert!(!ds.get_welcomes(&bob.id).is_empty(), "the invitation is outstanding");
+
+    assert!(
+        ds.coverage().pending.is_empty(),
+        "an invitation at the current epoch is in flight, not abandoned"
+    );
+    assert!(phantoms(&ds, &alice, &gid).is_empty());
+
+    let before = (ds.epoch, ds.handshakes.len(), ds.welcomes.len());
+    invite_pass(&mut ds, &alice, &gid, &[&bob]);
+    assert_eq!(
+        before,
+        (ds.epoch, ds.handshakes.len(), ds.welcomes.len()),
+        "evicting a device milliseconds after inviting it is how the loop closed"
+    );
+
+    assert_eq!(vec![gid.clone()], join_pending(&mut ds, &bob), "bob joins when it polls");
+}
+
+/// The regression that matters most: the invite path must reach a fixed point.
+///
+/// Every other test here asserts a safety property — nobody wrong is removed,
+/// nobody right is stranded. None of them asserts liveness, and that is exactly
+/// the gap the production defect fell through: each individual eviction looked
+/// defensible, and only the fact that they never stopped was wrong.
+#[test]
+fn the_evict_reinvite_cycle_terminates() {
+    let mut ds = FakeDs::new();
+    let alice = Device::new("alice", "a1");
+    let bob = Device::new("bob", "b1");
+    let carol = Device::new("carol", "c1");
+    let gid = b"g-terminates".to_vec();
+    alice.handle.create_group(&gid).expect("create");
+
+    // The row that can never be consumed. Under "any unconsumed Welcome means
+    // pending" this alone makes bob a phantom for the life of the chat.
+    ds.queue_welcome_at(&bob.id, vec![0xde, 0xad, 0xbe, 0xef], 0, Some(0));
+
+    bob.publish(&mut ds, 4);
+    add_member(&mut ds, &alice, &bob, &gid).expect("bob added");
+    join_pending(&mut ds, &bob);
+
+    // A third device moves the group past bob's invitation, so the staleness
+    // gate cannot be what holds the loop shut.
+    carol.publish(&mut ds, 1);
+    add_member(&mut ds, &alice, &carol, &gid).expect("carol added");
+    join_pending(&mut ds, &carol);
+
+    let fixed = (ds.epoch, ds.handshakes.len(), ds.welcomes.len());
+    for pass in 1..=6 {
+        // A real client keeps its published stock topped up, so an eviction
+        // loop never runs out of fuel and never stops on its own.
+        bob.publish(&mut ds, 1);
+        invite_pass(&mut ds, &alice, &gid, &[&bob, &carol]);
+        join_pending(&mut ds, &bob);
+        catch_up(&ds, &bob, &gid);
+        catch_up(&ds, &carol, &gid);
+
+        assert_eq!(
+            fixed,
+            (ds.epoch, ds.handshakes.len(), ds.welcomes.len()),
+            "pass {pass} moved the group: a joined device was evicted and re-invited. \
+             That is the loop that walked a live group from epoch 4 to epoch 8."
+        );
+    }
+
+    let roster = String::from_utf8(alice.handle.roster(&gid).unwrap()).unwrap();
+    assert!(roster.contains(&bob.id), "bob must still be a member: {roster}");
+    assert_eq!(
+        1,
+        ds.get_welcomes(&bob.id).len(),
+        "the dead Welcome stays pending forever and must simply stop mattering"
+    );
+
+    let ct = alice.handle.encrypt(&gid, b"converged").expect("encrypt");
+    let (kind, pt) = bob.handle.process(&gid, &ct).expect("bob decrypts");
+    assert_eq!((kind, pt.as_slice()), (1u8, b"converged".as_slice()));
+}
+
+// ---------------------------------------------------------------- external commit
+//
+// A device that authored a commit the DS accepted, but lost the merge before it
+// reached storage, is stranded: it cannot replay its own handshake (the sender
+// discards its copy for forward secrecy) and it cannot skip ahead. A Welcome
+// cannot rescue it either, because MLS refuses to add an existing member.
+//
+// External commit is the escape, and the property that matters is that it costs
+// the group an epoch WITHOUT costing it a member.
+
+/// Reproduces the stranded-author state and returns
+/// `(ds, alice, bob, gid, bob_pre_commit_snapshot, bobs_own_commit)`.
+fn strand_the_author() -> (FakeDs, Device, Device, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut ds = FakeDs::new();
+    let alice = Device::new("u1", "alice");
+    let bob = Device::new("u1", "bob");
+    let carol = Device::new("u2", "carol");
+    let gid = b"chat-ext".to_vec();
+
+    alice.handle.create_group(&gid).expect("create");
+    bob.publish(&mut ds, 4);
+    carol.publish(&mut ds, 4);
+    add_member(&mut ds, &alice, &bob, &gid).expect("add bob");
+    join_pending(&mut ds, &bob);
+    add_member(&mut ds, &alice, &carol, &gid).expect("add carol");
+    join_pending(&mut ds, &carol);
+    catch_up(&ds, &bob, &gid);
+
+    // Bob authors a commit, the DS accepts it, but his merge is never persisted.
+    let pre = bob.handle.snapshot().expect("snapshot");
+    let commit = bob
+        .handle
+        .remove_members(&gid, &[carol.id.clone()])
+        .expect("stage remove");
+    assert!(matches!(
+        ds.submit_commit(bob.handle.epoch(&gid).unwrap(), commit.clone()),
+        SubmitResult::Accepted { .. }
+    ));
+    bob.handle.merge_pending(&gid).expect("merge in memory only");
+    catch_up(&ds, &alice, &gid);
+
+    (ds, alice, bob, gid, pre, commit)
+}
+
+#[test]
+fn an_author_cannot_replay_its_own_commit() {
+    let (_ds, _alice, _bob, gid, pre, own_commit) = strand_the_author();
+    let stranded = ClientHandle::restore(&pre, "u1", "bob").expect("restore");
+    stranded.load_group(&gid).expect("stale group loads");
+
+    let err = stranded
+        .process(&gid, &own_commit)
+        .expect_err("replaying our own commit must fail");
+    assert!(
+        err.to_string().contains("Cannot decrypt own messages"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn external_commit_recovers_the_author_without_changing_membership() {
+    let (mut ds, alice, _bob, gid, pre, _own) = strand_the_author();
+
+    let roster_before = sorted_roster(&alice.handle, &gid);
+    let keys_before = sorted_keys(&alice.handle, &gid);
+    let epoch_before = alice.handle.epoch(&gid).unwrap();
+
+    let info = alice.handle.export_group_info(&gid).expect("group info");
+    assert!(!info.is_empty(), "GroupInfo must carry the ratchet tree");
+
+    let stranded = ClientHandle::restore(&pre, "u1", "bob").expect("restore");
+    stranded.load_group(&gid).ok();
+    stranded.drop_group(&gid).expect("drop the stale group");
+    let (rgid, commit) = stranded.external_join(&info).expect("external join");
+    assert_eq!(rgid, gid, "external commit must target the same group");
+
+    assert!(matches!(
+        ds.submit_commit(epoch_before, commit.clone()),
+        SubmitResult::Accepted { .. }
+    ), "ds must accept the external commit");
+    let bob_epoch = stranded.merge_pending(&gid).expect("merge");
+    alice.handle.process(&gid, &commit).expect("alice applies it");
+
+    assert_eq!(
+        alice.handle.epoch(&gid).unwrap(),
+        epoch_before + 1,
+        "an external commit costs exactly one epoch"
+    );
+    assert_eq!(bob_epoch, alice.handle.epoch(&gid).unwrap());
+    assert_eq!(
+        sorted_roster(&alice.handle, &gid),
+        roster_before,
+        "membership set must be unchanged: the stale leaf is replaced, not added to"
+    );
+    assert_eq!(
+        sorted_keys(&alice.handle, &gid),
+        keys_before,
+        "the recovered device reuses its signature key, so even the key set is identical"
+    );
+
+    // and it works: the recovered device can read and write again.
+    let ct = alice.handle.encrypt(&gid, b"welcome back").expect("encrypt");
+    let (kind, pt) = stranded.process(&gid, &ct).expect("recovered device decrypts");
+    assert_eq!((kind, pt.as_slice()), (1u8, b"welcome back".as_slice()));
+    let ct2 = stranded.encrypt(&gid, b"thanks").expect("encrypt");
+    let (_, pt2) = alice.handle.process(&gid, &ct2).expect("alice decrypts");
+    assert_eq!(pt2.as_slice(), b"thanks".as_slice());
+}
+
+#[test]
+fn a_rejected_external_commit_leaves_the_group_untouched() {
+    let (mut ds, alice, _bob, gid, pre, _own) = strand_the_author();
+    let info = alice.handle.export_group_info(&gid).expect("group info");
+    let epoch_before = alice.handle.epoch(&gid).unwrap();
+    let roster_before = sorted_roster(&alice.handle, &gid);
+
+    let stranded = ClientHandle::restore(&pre, "u1", "bob").expect("restore");
+    stranded.load_group(&gid).ok();
+    stranded.drop_group(&gid).expect("drop");
+    let (_, commit) = stranded.external_join(&info).expect("external join");
+
+    // Someone else lands a commit first, so ours is stale.
+    assert!(
+        matches!(
+            ds.submit_commit(epoch_before - 1, commit),
+            SubmitResult::Conflict { .. }
+        ),
+        "the DS must fence a stale external commit like any other"
+    );
+    assert_eq!(alice.handle.epoch(&gid).unwrap(), epoch_before);
+    assert_eq!(sorted_roster(&alice.handle, &gid), roster_before);
+}
+
+#[test]
+fn external_join_rejects_input_that_is_not_group_info() {
+    let (_ds, alice, _bob, gid, pre, own_commit) = strand_the_author();
+    let stranded = ClientHandle::restore(&pre, "u1", "bob").expect("restore");
+    stranded.drop_group(&gid).ok();
+
+    assert!(
+        stranded.external_join(&[]).is_err(),
+        "empty input must not be treated as GroupInfo"
+    );
+    assert!(
+        stranded.external_join(b"not an mls message").is_err(),
+        "garbage must not be treated as GroupInfo"
+    );
+    // A well-formed MLS message of the WRONG kind must also be refused.
+    let err = stranded
+        .external_join(&own_commit)
+        .expect_err("a commit is not GroupInfo");
+    assert!(
+        err.to_string().contains("not a GroupInfo message"),
+        "unexpected error: {err}"
+    );
+    let _ = alice;
+}
+
+#[test]
+fn export_group_info_requires_a_loaded_group() {
+    let alice = Device::new("u1", "alice");
+    assert!(
+        alice.handle.export_group_info(b"no-such-group").is_err(),
+        "exporting from a group we do not hold must fail, not panic"
+    );
+}
+
+fn sorted_roster(c: &ClientHandle, gid: &[u8]) -> Vec<String> {
+    let mut v: Vec<String> = String::from_utf8(c.roster(gid).unwrap())
+        .unwrap()
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+fn sorted_keys(c: &ClientHandle, gid: &[u8]) -> Vec<Vec<u8>> {
+    let mut v = c.group_signature_keys(gid).unwrap();
+    v.sort();
+    v
 }

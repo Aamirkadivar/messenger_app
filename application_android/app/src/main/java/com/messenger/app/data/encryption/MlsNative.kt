@@ -30,6 +30,12 @@ internal object MlsNative {
 
     external fun groupCreate(handle: Long, gid: ByteArray)
     external fun groupAdd(handle: Long, gid: ByteArray, keyPackages: ByteArray): ByteArray
+
+    /**
+     * Stages a Remove for the newline-separated credentials. Returns the
+     * commit; merge only once the Delivery Service accepts it.
+     */
+    external fun groupRemove(handle: Long, gid: ByteArray, credentials: ByteArray): ByteArray
     external fun mergePending(handle: Long, gid: ByteArray): Long
     external fun clearPending(handle: Long, gid: ByteArray)
     external fun dropGroup(handle: Long, gid: ByteArray)
@@ -41,4 +47,16 @@ internal object MlsNative {
     external fun epoch(handle: Long, gid: ByteArray): Long
     external fun loadGroup(handle: Long, gid: ByteArray): Long
     external fun roster(handle: Long, gid: ByteArray): ByteArray
+
+    /**
+     * Signed GroupInfo carrying the ratchet tree. Public material only - no
+     * private keys - so it may be moved between devices or handed to the DS.
+     */
+    external fun exportGroupInfo(handle: Long, gid: ByteArray): ByteArray
+
+    /**
+     * Rejoins by external commit. Returns `len(gid) || gid || commit`, the same
+     * length-prefixed pairing [groupAdd] uses.
+     */
+    external fun externalJoin(handle: Long, groupInfo: ByteArray): ByteArray
 }

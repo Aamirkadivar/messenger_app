@@ -34,6 +34,53 @@ object MlsPolicy {
         return roster.minOrNull() == meCred
     }
 
+    /**
+     * Leaves whose device the Delivery Service reports as having an OUTSTANDING
+     * invitation, i.e. the phantoms: present in the tree, but not actually in
+     * the group.
+     *
+     * The two halves of that judgement live in different places and neither is
+     * sufficient alone. The DS holds the invitation ledger and decides what
+     * "outstanding" means - the device's NEWEST Welcome is unconsumed AND the
+     * group has already moved past it, so it is neither superseded by a later
+     * join nor merely in flight. But the DS never parses a commit, so it cannot
+     * see removals and cannot tell a current member from a removed one. Only
+     * [roster] knows that. A phantom is the disagreement.
+     *
+     * Positive evidence only: an empty [pendingDeviceIds] returns nobody.
+     * Absence of information must never justify evicting a member - and the
+     * caller must treat coverage it could not fetch the same way, because a
+     * device evicted here is re-invited, and a predicate that misfires on a
+     * genuine member does not misfire once. It loops.
+     */
+    fun phantomMembers(
+        roster: List<String>,
+        meDev: String,
+        pendingDeviceIds: Set<String>
+    ): List<String> {
+        val pending = pendingDeviceIds.filter { it.isNotBlank() && it != meDev }.toSet()
+        if (pending.isEmpty()) return emptyList()
+        // Credentials are "userId|deviceId"; the DS reports device ids, so the
+        // device half is what identifies a leaf here.
+        return roster.filter { cred ->
+            val device = cred.substringAfter('|', "")
+            device.isNotBlank() && device != meDev && device in pending
+        }
+    }
+
+    /**
+     * A Welcome can replace local state only when that state is demonstrably
+     * older than the invitation that would replace it. Equality is important:
+     * a current-epoch Welcome may simply be a successful join whose ack was
+     * interrupted, and opening it again would consume its single-use
+     * KeyPackage before OpenMLS reports that the group already exists.
+     *
+     * The repository establishes the same chat and active DS GID before
+     * calling this predicate. Unknown epochs never authorize destruction.
+     */
+    fun shouldReplaceLocalGroupForWelcome(localEpoch: Long?, welcomeEpoch: Long): Boolean =
+        localEpoch != null && localEpoch >= 0L && welcomeEpoch > localEpoch
+
     /** Live devices that cannot yet unprotect, excluding this install. */
     fun missingLiveDevices(
         meDev: String,

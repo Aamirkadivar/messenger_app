@@ -41,6 +41,31 @@ class MlsClient private constructor(
     companion object {
         private const val TAG = "MlsClient"
 
+        /** Credential separator understood by mls-core groupRemove. */
+        private val SEPARATOR = Char(10).toString()
+
+        /**
+         * Splits mls-core's `len(gid) || gid || commit` reply.
+         *
+         * Separated from [externalJoin] so the framing can be tested on the JVM
+         * without the native library: a length-prefix decode is exactly where an
+         * off-by-one hides, and the on-device path cannot be unit-tested.
+         */
+        internal fun decodeExternalJoin(blob: ByteArray): ExternalJoinResult {
+            require(blob.size >= 4) { "externalJoin returned a short buffer" }
+            val gidLen = ((blob[0].toInt() and 0xff) shl 24) or
+                ((blob[1].toInt() and 0xff) shl 16) or
+                ((blob[2].toInt() and 0xff) shl 8) or
+                (blob[3].toInt() and 0xff)
+            require(gidLen >= 0 && 4 + gidLen <= blob.size) {
+                "externalJoin length prefix out of range"
+            }
+            return ExternalJoinResult(
+                groupId = blob.copyOfRange(4, 4 + gidLen),
+                commit = blob.copyOfRange(4 + gidLen, blob.size)
+            )
+        }
+
         /** Fresh identity for this device. */
         fun create(userId: String, deviceId: String): MlsClient {
             require(MlsCore.isAvailable) { "mls-core unavailable: ${MlsCore.lastError}" }
@@ -131,6 +156,21 @@ class MlsClient private constructor(
     fun createGroup(groupId: ByteArray) = MlsNative.groupCreate(alive(), groupId)
 
     /**
+     * Stages a Remove of [credentials] (each "userId|deviceId"). Returns the
+     * commit, NOT applied until [mergePending] - same contract as [addMembers].
+     *
+     * Only for evicting a leaf whose device never consumed its Welcome: it looks
+     * like a member to everyone else, so it is never re-invited, while being
+     * unable to read anything. Removing the dead leaf lets the ordinary
+     * KeyPackage/Welcome flow add the device back for real.
+     */
+    fun removeMembers(groupId: ByteArray, credentials: List<String>): ByteArray =
+        MlsNative.groupRemove(
+            alive(), groupId, credentials.joinToString(SEPARATOR).toByteArray(Charsets.UTF_8)
+        )
+
+
+    /**
      * Stages an Add commit for [keyPackages]. Returns the commit and the Welcome.
      *
      * NOT applied locally: call [mergePending] only after the Delivery Service
@@ -199,6 +239,45 @@ class MlsClient private constructor(
         String(MlsNative.roster(alive(), groupId), Charsets.UTF_8)
             .split('\n')
             .filter { it.isNotBlank() }
+
+    /**
+     * Signed GroupInfo for [groupId], carrying the ratchet tree.
+     *
+     * Public material: no private keys, so it is safe to move between devices
+     * or hand to the Delivery Service. It is what a device that has lost its
+     * own group state needs in order to rejoin by external commit.
+     */
+    fun exportGroupInfo(groupId: ByteArray): ByteArray =
+        MlsNative.exportGroupInfo(alive(), groupId)
+
+    /**
+     * Rejoins a group this device still belongs to but can no longer follow.
+     *
+     * The one case a Welcome cannot fix: MLS refuses to add a device that is
+     * already a member, so a stranded member would otherwise have to be removed
+     * and re-added. OpenMLS folds a Remove for the matching identity into this
+     * same commit, so the membership set is preserved — the stale leaf is
+     * replaced, not added alongside — and the signature key is reused, so the
+     * roster is unchanged at both the credential and key level.
+     *
+     * Contract, which differs from [addMembers] and [removeMembers]: on DS
+     * acceptance call [mergePending]; on rejection call [dropGroup] and rebuild
+     * from fresh GroupInfo. [clearPending] CANNOT rescue an external commit,
+     * because this client was not in the tree before it and there is no
+     * pre-commit state to return to.
+     */
+    fun externalJoin(groupInfo: ByteArray): ExternalJoinResult =
+        decodeExternalJoin(MlsNative.externalJoin(alive(), groupInfo))
+
+    data class ExternalJoinResult(val groupId: ByteArray, val commit: ByteArray) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is ExternalJoinResult) return false
+            return groupId.contentEquals(other.groupId) && commit.contentEquals(other.commit)
+        }
+
+        override fun hashCode(): Int = 31 * groupId.contentHashCode() + commit.contentHashCode()
+    }
 
     override fun close() {
         if (handle != 0L) {
