@@ -33,6 +33,30 @@ import (
 //
 //	TEST_DATABASE_URL="host=localhost port=5432 user=postgres password=... dbname=messenger_e2ee_scratch sslmode=disable"
 
+// closeWhenDone releases the connection pool the test just opened.
+//
+// Every DB test here calls gorm.Open for itself, and gorm.Open builds a fresh
+// *sql.DB - a pool that keeps its connections idle and open forever. One pool
+// per test is invisible in a single run and fatal in a repeated one: under
+// `go test -count=20` the pools accumulate until Postgres answers
+// "FATAL: sorry, too many clients already" and every remaining test fails on
+// connect. That is a resource leak in the harness, not shared state between
+// iterations, and it is entirely separate from anything the handlers do.
+//
+// Registered by the opener so no caller can forget it. Cleanups run LIFO, so a
+// caller that afterwards swaps database.DB and registers its own restore still
+// restores before this closes.
+func closeWhenDone(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	t.Cleanup(func() {
+		sqlDB, err := db.DB()
+		if err != nil {
+			return
+		}
+		_ = sqlDB.Close()
+	})
+}
+
 func recreateTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -45,6 +69,7 @@ func recreateTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("connect scratch db: %v", err)
 	}
+	closeWhenDone(t, db)
 	return db
 }
 

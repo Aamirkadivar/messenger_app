@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -111,6 +112,18 @@ func countPackages(t *testing.T, app *fiber.App, device, store string) int {
 }
 
 // claimPackage returns the ref_hash of whatever was served, or "" on 404.
+//
+// The ref comes out of the RESPONSE, not out of a "most recently claimed row"
+// query. That query used to be how this helper worked and it was not a faithful
+// witness: claimed_at is time.Now(), the Windows wall clock advances in ~0.5ms
+// steps, and two claims routinely land in the same tick. ORDER BY claimed_at
+// DESC then fell through to its id DESC tiebreak - a random v4 UUID - and named
+// a package claimed several calls ago. That is the whole of the intermittent
+// "FIFO broken: wanted third, got second", and it accused the handler of a bug
+// the handler never had.
+//
+// Test packages carry their ref in their bytes ("kp:<ref>"), so the response
+// identifies the consumed row exactly, with no tie to break.
 func claimPackage(t *testing.T, app *fiber.App, db *gorm.DB, target uuid.UUID, device string) string {
 	t.Helper()
 	raw, _ := json.Marshal(map[string]any{
@@ -130,16 +143,34 @@ func claimPackage(t *testing.T, app *fiber.App, db *gorm.DB, target uuid.UUID, d
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("unexpected claim status %d: %s", resp.StatusCode, body)
 	}
-	_, _ = io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 
-	// The handler returns opaque bytes; map them back to the row just consumed
-	// so a test can name it.
-	var ref string
+	var out struct {
+		KeyPackageB64 string `json:"key_package_b64"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("claim response %q: %v", body, err)
+	}
+	data, err := base64.StdEncoding.DecodeString(out.KeyPackageB64)
+	if err != nil {
+		t.Fatalf("claim response key_package_b64 %q: %v", out.KeyPackageB64, err)
+	}
+	if !bytes.HasPrefix(data, []byte("kp:")) {
+		t.Fatalf("claim served %q, which no test seeded", data)
+	}
+	ref := string(bytes.TrimPrefix(data, []byte("kp:")))
+
+	// The row the response named must be the row the handler actually consumed.
+	// Without this the helper would report a claim that never happened.
+	var marked int64
 	if err := db.Raw(
-		`SELECT ref_hash FROM mls_key_packages
-		  WHERE claimed_at IS NOT NULL ORDER BY claimed_at DESC, id DESC LIMIT 1`).
-		Scan(&ref).Error; err != nil {
-		t.Fatalf("read back claimed row: %v", err)
+		`SELECT count(*) FROM mls_key_packages
+		  WHERE ref_hash = ? AND claimed_at IS NOT NULL AND claimed_by IS NOT NULL`, ref).
+		Scan(&marked).Error; err != nil {
+		t.Fatalf("verify claimed row: %v", err)
+	}
+	if marked != 1 {
+		t.Fatalf("claim served %q but that row is not marked consumed", ref)
 	}
 	return ref
 }

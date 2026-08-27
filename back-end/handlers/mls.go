@@ -210,7 +210,21 @@ func (h *MLSHandler) ClaimKeyPackage(c *fiber.Ctx) error {
 		// FIFO within the incarnation: oldest first is the right consumption
 		// order for single-use prekeys, and was never what caused stale packages
 		// to be served.
-		if err := q.Order("created_at asc").First(&claimed).Error; err != nil {
+		//
+		// created_at is the FIFO key and the only one that carries real order:
+		// the id is a random v4 UUID, so ordering by it would consume packages
+		// in an order unrelated to when they were published. A whole publish
+		// batch shares one timestamp - the wall clock is coarser than the loop
+		// that writes it - so within a batch created_at ties, and the ties are
+		// harmless: every row in a batch is an equally valid single-use prekey
+		// from the same incarnation. What FIFO guarantees is oldest-BATCH-first.
+		//
+		// id asc is spelled out only to settle those ties deterministically.
+		// GORM's First() already appends the primary key to whatever ORDER BY
+		// it is given, so this changes no SQL - it states the invariant in the
+		// source instead of leaving it to an implicit driver behaviour that a
+		// switch to Take/Find would silently drop.
+		if err := q.Order("created_at asc, id asc").First(&claimed).Error; err != nil {
 			return err
 		}
 		now := time.Now()
