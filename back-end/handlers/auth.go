@@ -235,6 +235,14 @@ func (h *AuthService) RefreshToken(c *fiber.Ctx) error {
 			"error": "Invalid or expired refresh token",
 		})
 	}
+	// Only a refresh credential may mint credentials. An access token carries an
+	// equally valid signature, so without this check it could renew itself and a
+	// stolen access token would become effectively permanent.
+	if !claims.HasUse(middleware.TokenUseRefresh) {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Invalid or expired refresh token",
+		})
+	}
 
 	// Find user
 	var user models.User

@@ -13,6 +13,8 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
+	"gorm.io/gorm"
 )
 
 // MessageService handles message-related operations
@@ -556,7 +558,25 @@ func (s *MessageService) DeleteMessage(c *fiber.Ctx) error {
 				"message": "You can only delete your own messages for everyone",
 			})
 		}
-		database.DB.Delete(&message, messageIDParsed)
+		// Atomic: the message row and EVERY user's encrypted history archive of
+		// it go together or not at all. The archives are removed by the
+		// message_id ON DELETE CASCADE, so the guarantee is the database's
+		// rather than this handler's - but the delete must still be wrapped, or
+		// a crash mid-statement could leave the two out of step.
+		//
+		// The WebSocket event is published AFTER commit, never inside the
+		// transaction: hub.Broadcast is an UNBUFFERED channel, so sending on it
+		// blocks until the hub's run loop receives, and doing that with an open
+		// transaction would hold database locks for the duration of a blocking
+		// send. See the publish block below.
+		if err := database.DB.Transaction(func(tx *gorm.DB) error {
+			return tx.Delete(&message, messageIDParsed).Error
+		}); err != nil {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+				"error":   "internal error",
+				"message": "Could not delete message",
+			})
+		}
 	} else {
 		// Record the deletion against this user rather than removing the row,
 		// so the other participant keeps their copy - the same "mine only"
@@ -622,10 +642,31 @@ func (s *MessageService) DeleteChat(c *fiber.Ctx) error {
 		})
 	}
 
-	result := database.DB.Model(&models.ChatParticipant{}).
-		Where("chat_id = ? AND user_id = ? AND left_at IS NULL",
-			chatIDParsed.String(), userID).
-		Update("left_at", time.Now())
+	// Deleting a chat is a per-user departure: it records left_at rather than
+	// removing anything shared. This user's encrypted history archives for the
+	// chat must go with it, in the SAME transaction - otherwise "I deleted this
+	// chat" leaves a decryptable copy behind. The other participant's archives
+	// are untouched, which is what per-user archive identity is for.
+	var result *gorm.DB
+	txErr := database.DB.Transaction(func(tx *gorm.DB) error {
+		result = tx.Model(&models.ChatParticipant{}).
+			Where("chat_id = ? AND user_id = ? AND left_at IS NULL",
+				chatIDParsed.String(), userID).
+			Update("left_at", time.Now())
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return nil
+		}
+		return models.PurgeArchivesForParticipant(tx, chatIDParsed.String(), userID)
+	})
+	if txErr != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "internal error",
+			"message": "Failed to delete chat",
+		})
+	}
 
 	if result.Error != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{

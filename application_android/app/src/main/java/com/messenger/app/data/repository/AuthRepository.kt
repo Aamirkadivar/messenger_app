@@ -21,7 +21,13 @@ class AuthRepository(
     private val authApiService: AuthApiService,
     private val tokenManager: TokenManager,
     private val keyStoreManager: KeyStoreManager,
-    private val userDao: UserDao
+    private val userDao: UserDao,
+    /**
+     * Session-scoped E2EE state to clear on logout. Lazy because the vault
+     * repository sits downstream of this one in the graph; resolving it eagerly
+     * would close a cycle.
+     */
+    private val e2eeSession: dagger.Lazy<E2EEVaultRepository>? = null
 ) {
     companion object {
         private const val TAG = "AuthRepository"
@@ -220,6 +226,17 @@ class AuthRepository(
     }
 
     private suspend fun clearAuthData() {
+        // Before the tokens go, drop everything session-scoped: the master key,
+        // the one-shot recovery flag, the published-revision counter, and the
+        // opened keyring. Durable material - the sealed keyring, its cache, the
+        // vault - is deliberately untouched; logging out must not destroy history
+        // keys the account still needs on the next sign-in.
+        //
+        // Without this, a second account signing in on the same process inherits
+        // the first account's MK in memory and its "recovery already attempted"
+        // flag, so it silently skips its own recovery for that whole session.
+        runCatching { e2eeSession?.get()?.clearSessionSecrets() }
+            .onFailure { Log.w(TAG, "could not clear E2EE session state on logout: ${it.message}") }
         tokenManager.clearTokens()
     }
 

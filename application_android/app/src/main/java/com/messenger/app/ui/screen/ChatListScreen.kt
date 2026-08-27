@@ -25,9 +25,11 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.MarkChatRead
 import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.outlined.NotificationsOff
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -37,7 +39,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -47,6 +51,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.messenger.app.R
+import com.messenger.app.ui.adaptive.AdaptiveMetrics
 import com.messenger.app.ui.components.AmbientGlow
 import com.messenger.app.ui.components.Avatar
 import com.messenger.app.ui.components.ChatPeekDialog
@@ -71,7 +76,9 @@ fun ChatListScreen(
     onOpenSettings: () -> Unit,
     onCreateGroup: () -> Unit,
     onSessionExpired: () -> Unit,
-    onLogout: () -> Unit
+    onLogout: () -> Unit,
+    selectedChatId: String? = null,
+    paneMode: Boolean = false
 ) {
     var showNewChat by remember { mutableStateOf(false) }
     // Non-null while the delete confirmation for that chat is showing.
@@ -81,6 +88,7 @@ fun ChatListScreen(
     var pendingBlock by remember { mutableStateOf<ChatListItemUi?>(null) }
     // Non-null while the avatar peek is open for that chat.
     var peekChat by remember { mutableStateOf<ChatListItemUi?>(null) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
     val listState by chatViewModel.chatListState.collectAsStateWithLifecycle()
     val sessionExpired by chatViewModel.sessionExpired.collectAsStateWithLifecycle()
     val keyTakeover by chatViewModel.keyTakeover.collectAsStateWithLifecycle()
@@ -163,6 +171,12 @@ fun ChatListScreen(
             if (needsVaultUnlock) {
                 VaultUnlockBanner(onDismiss = chatViewModel::dismissVaultUnlockNotice)
             }
+            if (paneMode) {
+                ChatListSearchField(
+                    query = searchQuery,
+                    onQueryChange = { searchQuery = it }
+                )
+            }
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -195,6 +209,18 @@ fun ChatListScreen(
                         )
                     }
                     else -> {
+                        val visibleChats = AdaptiveMetrics.filterChatList(listState.chats, searchQuery)
+                        if (visibleChats.isEmpty()) {
+                            Text(
+                                if (searchQuery.isNotBlank()) {
+                                    stringResource(R.string.no_matching_chats)
+                                } else {
+                                    listState.error ?: "No conversations yet"
+                                },
+                                modifier = Modifier.align(Alignment.Center),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
                         LazyColumn(
                             modifier = Modifier.fillMaxSize(),
                             // The connecting pill floats over this list, so the
@@ -206,9 +232,11 @@ fun ChatListScreen(
                                 bottom = 88.dp
                             )
                         ) {
-                            items(listState.chats, key = { it.id }) { chat ->
+                            items(visibleChats, key = { it.id }) { chat ->
                                 ChatRow(
                                     chat,
+                                    selected = chat.id == selectedChatId,
+                                    immediateOpen = paneMode,
                                     onClick = { onChatClick(chat.id, chat.name, chat.isGroup) },
                                     onLongClick = { menuChat = chat },
                                     onAvatarLongPress = {
@@ -217,6 +245,7 @@ fun ChatListScreen(
                                     }
                                 )
                             }
+                        }
                         }
                     }
                 }
@@ -436,13 +465,59 @@ private fun KeyTakeoverBanner(onDismiss: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChatListSearchField(
+    query: String,
+    onQueryChange: (String) -> Unit
+) {
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+            .heightIn(min = 48.dp)
+            .testTag("chat_list_search"),
+        singleLine = true,
+        placeholder = { Text(stringResource(R.string.search_chats)) },
+        leadingIcon = {
+            Icon(
+                Icons.Outlined.Search,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        },
+        trailingIcon = {
+            if (query.isNotEmpty()) {
+                IconButton(onClick = { onQueryChange("") }) {
+                    Icon(
+                        Icons.Outlined.Close,
+                        contentDescription = "Clear search",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        },
+        shape = RoundedCornerShape(16.dp),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = MaterialTheme.colorScheme.primary,
+            unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+            focusedContainerColor = Color.Transparent,
+            unfocusedContainerColor = Color.Transparent
+        )
+    )
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ChatRow(
     chat: ChatListItemUi,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
-    onAvatarLongPress: () -> Unit = {}
+    onAvatarLongPress: () -> Unit = {},
+    selected: Boolean = false,
+    immediateOpen: Boolean = false
 ) {
     val haptics = LocalHapticFeedback.current
     val dark = MessengerExtendedColors.isDark
@@ -451,8 +526,8 @@ private fun ChatRow(
     val pressed by interactionSource.collectIsPressedAsState()
     val scope = rememberCoroutineScope()
 
-    // Baseline glow for unread rows; press / click bloom on top of that.
-    val baseline = if (chat.unreadCount > 0) 0.42f else 0f
+    // Baseline glow for unread or the currently open two-pane conversation.
+    val baseline = if (selected || chat.unreadCount > 0) 0.42f else 0f
     val pressAnim = remember { Animatable(baseline) }
     var opening by remember { mutableStateOf(false) }
     val pressInSpec = luxuryTween<Float>(durationMs = 280, easing = Tokens.Motion.easeOut)
@@ -470,13 +545,21 @@ private fun ChatRow(
     val cardShape = RoundedCornerShape(16.dp)
     val cardColor = accent.copy(
         alpha = lerp(
-            if (chat.unreadCount > 0) (if (dark) 0.10f else 0.08f) else 0f,
+            when {
+                selected -> if (dark) 0.16f else 0.12f
+                chat.unreadCount > 0 -> if (dark) 0.10f else 0.08f
+                else -> 0f
+            },
             0.16f,
             amount
         )
     )
     val borderAlpha = lerp(
-        if (chat.unreadCount > 0) 0.22f else 0f,
+        when {
+            selected -> 0.40f
+            chat.unreadCount > 0 -> 0.22f
+            else -> 0f
+        },
         0.40f,
         amount
     )
@@ -484,10 +567,14 @@ private fun ChatRow(
     val elevation = lerp(0f, 12f, amount).dp
     val shadowAlpha = lerp(0f, if (dark) 0.50f else 0.16f, amount)
     val catchLight = lerp(0f, 0.24f, amount)
-    val barAlpha = lerp(if (chat.unreadCount > 0) 0.55f else 0f, 1f, amount)
+    val barAlpha = lerp(if (selected || chat.unreadCount > 0) 0.55f else 0f, 1f, amount)
 
     fun openChat() {
         if (opening) return
+        if (immediateOpen) {
+            onClick()
+            return
+        }
         opening = true
         scope.launch {
             // Bloom the card, then navigate so the press reads before the screen changes.
@@ -566,6 +653,9 @@ private fun ChatRow(
                         onLongClick()
                     }
                 )
+                .semantics {
+                    this.selected = selected
+                }
         ) {
             // Top catch-light blooms with the press.
             if (catchLight > 0.01f) {
@@ -683,12 +773,23 @@ private fun ChatRow(
                 Spacer(Modifier.width(8.dp))
 
                 Column(horizontalAlignment = Alignment.End) {
-                    Text(
-                        chat.timestamp,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = if (chat.unreadCount > 0) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (chat.unreadCount > 0) accent else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (chat.isMuted) {
+                            Icon(
+                                Icons.Outlined.NotificationsOff,
+                                contentDescription = "Muted",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                        }
+                        Text(
+                            chat.timestamp,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = if (chat.unreadCount > 0) FontWeight.SemiBold else FontWeight.Normal,
+                            color = if (chat.unreadCount > 0) accent else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     if (chat.unreadCount > 0) {
                         Spacer(Modifier.height(8.dp))
                         Box(contentAlignment = Alignment.Center) {

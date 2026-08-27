@@ -1,5 +1,6 @@
 package com.messenger.app.data.local.entity
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
@@ -55,5 +56,25 @@ data class MessageEntity(
     val senderDeviceId: String = "",
     val isForwarded: Boolean = false,
     val forwardedFromName: String = "",
-    val forwardedFromMessageId: String = ""
+    val forwardedFromMessageId: String = "",
+    // ---- Layer B recoverable history archive (added in schema v8) ----
+    // Added additively: [content] above stays exactly as it was for this rollout, so these
+    // columns coexist with the existing plaintext copy rather than replacing it.
+    /**
+     * XChaCha20-Poly1305 archive of this message, Base64, as produced by
+     * `HistoryMessageCipher.seal` (nonce || ciphertext || tag). Null when the row has no archive.
+     * Never holds plaintext: a failed seal leaves this null rather than writing anything.
+     */
+    val archiveCiphertext: String? = null,
+    /**
+     * Which per-chat history root version sealed [archiveCiphertext]. Bound into both the key
+     * derivation and the AAD, so without it the archive cannot be opened after a rotation.
+     * 0 means "no archive"; real versions start at 1.
+     */
+    @ColumnInfo(defaultValue = "0")
+    val archiveRootVersion: Int = 0,
+    /**
+     * `ArchiveState.wire`. Null reads as `NONE`, which is what every pre-v8 row is.
+     */
+    val archiveState: String? = null
 )

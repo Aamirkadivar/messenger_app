@@ -10,6 +10,7 @@ import com.messenger.app.data.local.dao.ConversationDao
 import com.messenger.app.data.local.dao.MessageDao
 import com.messenger.app.data.local.entity.CachedChatEntity
 import com.messenger.app.data.local.entity.ConversationEntity
+import com.messenger.app.data.encryption.history.ArchiveState
 import com.messenger.app.data.local.entity.MessageEntity
 import com.messenger.app.data.model.*
 import com.messenger.app.data.remote.api.ChatApiService
@@ -54,7 +55,22 @@ class ChatRepository(
     /** Fired after local vault-relevant material changes (sender keys / peer pubs). */
     private val onVaultMaterialChanged: (suspend (token: String) -> Unit)? = null,
     /** Pull+merge vault from server (sibling device ratchets). */
-    private val onVaultPullNeeded: (suspend (token: String, force: Boolean) -> Unit)? = null
+    private val onVaultPullNeeded: (suspend (token: String, force: Boolean) -> Unit)? = null,
+    /**
+     * Seals a decrypted message into the Layer B archive, or returns null if it could not be
+     * archived. Passed as a lambda for the same reason as the two above: [MessageArchiver] reaches
+     * E2EEVaultRepository, which depends on this class, and a direct constructor dependency would
+     * close that cycle. Null when archiving is not wired, which leaves behaviour exactly as before.
+     */
+    private val onArchiveMessage: (
+        suspend (userId: String, chatId: String, messageId: String, plaintext: String) -> SealedArchive?
+    )? = null,
+    /**
+     * Fetches this user's server-side archives for a chat, already validated.
+     * Same lambda seam and same reason as [onArchiveMessage]. Null leaves the
+     * fetch path behaving exactly as it did before.
+     */
+    private val onArchiveFetch: (suspend (chatId: String) -> ArchivePage)? = null
 ) {
     /**
      * MLS group messaging (encryption_version 5). Optional and set after
@@ -1272,6 +1288,38 @@ class ChatRepository(
                 if (conversationDao.getConversationById(sent.chatId) == null) {
                     conversationDao.insertConversation(ConversationEntity(id = sent.chatId, type = chatType))
                 }
+                // Layer B archive for our OWN message.
+                //
+                // This is the only chance to capture it: an MLS sender holds no key for its own
+                // ciphertext, so once this row is lost the server copy is unrecoverable. The
+                // plaintext cache below has always existed for exactly that reason; the archive is
+                // the durable, recoverable form of the same thing.
+                //
+                // Ordering is send -> server success -> authoritative id -> seal -> one Room write.
+                // Sealing runs only after the server assigns `sent.id`, because that id is bound
+                // into both the key derivation and the AAD; archiving any earlier would require an
+                // invented id and produce a record the real message could never open. The seal and
+                // the insert are one statement apart, so the row lands complete in a single write
+                // rather than being inserted and then updated.
+                //
+                // Best effort throughout: OutboundArchivePolicy returns the row unchanged on every
+                // failure path, so a locked vault or an unavailable Keystore costs the archive and
+                // never the message.
+                val archiveFields = OutboundArchivePolicy.archiveFor(
+                    userId = tokenManager.getCurrentUserId().getOrNull(),
+                    chatId = sent.chatId,
+                    messageId = sent.id,
+                    plaintext = plaintext,
+                    prior = runCatching { messageDao.getMessageById(sent.id) }.getOrNull()
+                        ?.let {
+                            OutboundArchivePolicy.Fields(
+                                it.archiveCiphertext, it.archiveRootVersion, it.archiveState
+                            )
+                        }
+                        ?: OutboundArchivePolicy.Fields.NONE,
+                    placeholder = ENCRYPTED_PLACEHOLDER,
+                    seal = { u, c, m, p -> onArchiveMessage?.invoke(u, c, m, p) }
+                )
                 messageDao.insertMessage(
                     MessageEntity(
                         id = sent.id,
@@ -1301,7 +1349,10 @@ class ChatRepository(
                         replyTo = replyToId.ifBlank { null },
                         isForwarded = forward.isForwarded,
                         forwardedFromName = forward.fromName,
-                        forwardedFromMessageId = forward.fromMessageId
+                        forwardedFromMessageId = forward.fromMessageId,
+                        archiveCiphertext = archiveFields.ciphertext,
+                        archiveRootVersion = archiveFields.rootVersion,
+                        archiveState = archiveFields.state
                     )
                 )
                 Result.success(sent)
@@ -1554,6 +1605,8 @@ class ChatRepository(
                 ?: "direct"
             conversationDao.insertConversation(ConversationEntity(id = chatId, type = authoritativeType))
         }
+        // Resolved once: the archive AAD binds the owning user, and this is a cheap read.
+        val archiveUserId = tokenManager.getCurrentUserId().getOrNull()?.takeIf { it.isNotBlank() }
         val entities = dtos.map { dto ->
             // Decrypt-on-store for text rows. Ratchet message keys are consumed
             // on first use, so a row cached as ciphertext may never open again
@@ -1580,6 +1633,33 @@ class ChatRepository(
                     }
                 }
             }
+            // Layer B archive, in the fixed order decrypt -> seal -> Room commit. Sealing happens
+            // here, after the row is readable and before it is written, so a row is never committed
+            // carrying an archive that does not match its content.
+            //
+            // insertMessages REPLACEs the row, so an existing archive must be carried forward
+            // explicitly or a refresh would silently erase it.
+            val prior = runCatching { messageDao.getMessageById(dto.id) }.getOrNull()
+            var archiveCiphertext = prior?.archiveCiphertext
+            var archiveRootVersion = prior?.archiveRootVersion ?: 0
+            var archiveState = prior?.archiveState
+            val archivable = !encrypted && !isMedia && content.isNotBlank() &&
+                content != ENCRYPTED_PLACEHOLDER
+            // Only ever archive a row once. Re-sealing on every refresh would waste work, and
+            // re-sealing a RETRACTED row would resurrect a message the user deleted for everyone.
+            if (archivable && ArchiveState.fromWire(prior?.archiveState) == ArchiveState.NONE) {
+                archiveUserId?.let { uid ->
+                    runCatching { onArchiveMessage?.invoke(uid, chatId, dto.id, content) }
+                        .getOrNull()
+                        ?.let { sealed ->
+                            archiveCiphertext = sealed.ciphertextB64
+                            archiveRootVersion = sealed.rootVersion
+                            archiveState = ArchiveState.SEALED.wire
+                        }
+                    // A failed seal deliberately leaves the archive columns as they were. It must
+                    // never write the plaintext into them, and the message itself is unaffected.
+                }
+            }
             MessageEntity(
                 id = dto.id,
                 conversation_id = chatId,
@@ -1601,7 +1681,10 @@ class ChatRepository(
                 replyTo = dto.replyToId,
                 isForwarded = dto.isForwarded,
                 forwardedFromName = fwdName,
-                forwardedFromMessageId = dto.forwardedFromMessageId.orEmpty()
+                forwardedFromMessageId = dto.forwardedFromMessageId.orEmpty(),
+                archiveCiphertext = archiveCiphertext,
+                archiveRootVersion = archiveRootVersion,
+                archiveState = archiveState
             )
         }
         // Rows we already hold in the clear (our own sends) must not be
@@ -1612,6 +1695,53 @@ class ChatRepository(
             if (existing != null && !existing.isEncrypted) ent.id else null
         }.toSet()
         messageDao.insertMessages(entities.filterNot { it.isEncrypted && keepPlain.contains(it.id) })
+
+        // Layer B: pull down archives this device does not have. Runs after the
+        // rows exist so a downloaded archive always lands on a real message.
+        applyRemoteArchives(chatId)
+    }
+
+    /**
+     * Writes server archives onto local rows that have none.
+     *
+     * Everything the server returned is treated as untrusted. Three refusals
+     * matter, and none of them may be relaxed:
+     *
+     *  - a record whose chat does not match is dropped, so a wrong or hostile
+     *    server cannot bind an archive to another conversation;
+     *  - a record for a message this device does not hold is dropped, rather
+     *    than inventing a row for it;
+     *  - a row that is already SEALED or RETRACTED is left completely alone. The
+     *    local copy wins over the server's, and a RETRACTED tombstone can never
+     *    be undone by a refresh - that is what stops deleted history from being
+     *    resurrected by sync.
+     *
+     * Only the archive columns are ever touched; `content` is never read or
+     * written here, so a bad archive cannot damage the message itself. Repeating
+     * the operation is a no-op because the second pass sees SEALED.
+     */
+    private suspend fun applyRemoteArchives(chatId: String) {
+        val page = runCatching { onArchiveFetch?.invoke(chatId) }.getOrNull() ?: return
+        if (!page.complete) {
+            // Explicit continuation signal from the sync layer. Whatever arrived is
+            // still applied; what must not happen is treating a truncated pass as a
+            // finished one, which is how "sync completed" quietly becomes a lie.
+            Log.w(TAG, "archive sync for this chat was incomplete; will continue on a later refresh")
+        }
+        val remote = page.records
+        if (remote.isEmpty()) return
+        for (r in remote) {
+            if (r.chatId != chatId) continue
+            val existing = runCatching { messageDao.getMessageById(r.messageId) }.getOrNull()
+                ?: continue
+            if (existing.conversation_id != chatId) continue
+            if (ArchiveState.fromWire(existing.archiveState) != ArchiveState.NONE) continue
+            runCatching {
+                messageDao.setArchive(
+                    r.messageId, r.ciphertextB64, r.rootVersion, ArchiveState.SEALED.wire
+                )
+            }.onFailure { Log.w(TAG, "could not apply a downloaded archive: ${it.message}") }
+        }
     }
 
     suspend fun searchUsers(token: String, query: String): Result<List<UserSearchResult>> =
@@ -1719,6 +1849,10 @@ class ChatRepository(
                 return@withContext if (response.code() == 401) Result.failure(SessionExpiredException())
                 else Result.failure(Exception("Failed to delete message: ${response.code()}"))
             }
+            // Retract this device's archive before the row goes, for BOTH kinds of delete. A
+            // delete-for-me still means the user wants the message gone from this device, and an
+            // archive that outlived it would quietly make it recoverable again.
+            retractArchive(messageId)
             messageDao.deleteMessage(messageId)
             Result.success(Unit)
         } catch (e: Exception) {
@@ -1733,9 +1867,124 @@ class ChatRepository(
     /** chatIds whose MLS group advanced an epoch (see WebSocketManager). */
     val mlsCommits = webSocketManager.mlsCommits
 
-    /** Drops a locally cached message, for a retraction that arrived over the socket. */
+    /**
+     * Drops a locally cached message, for a retraction that arrived over the socket.
+     *
+     * The server pushes `message:deleted` ONLY for a delete-for-everyone (see the backend handler),
+     * so reaching this method already means the deletion was global, not one participant hiding
+     * their own copy.
+     *
+     * Retracts the archive BEFORE deleting the row, so the archive bytes are gone even if the row
+     * removal is what fails.
+     */
     suspend fun removeCachedMessage(messageId: String) = withContext(Dispatchers.IO) {
+        retractArchive(messageId)
         runCatching { messageDao.deleteMessage(messageId) }
+    }
+
+    /**
+     * Marks this device's archive of [messageId] retracted and drops its ciphertext.
+     *
+     * Terminal and idempotent: a repeat call, a socket replay, or a delete for a message that was
+     * never archived all leave the row in the same place and cost one no-op query at most. The
+     * RETRACTED state is what stops the inbound and outbound archivers from re-sealing the message
+     * if it shows up again in a later refresh.
+     *
+     * LOCAL ONLY. This erases nothing on other devices, on devices that were offline at the time,
+     * or in backups - the server offers no mechanism to reach those.
+     */
+    suspend fun retractArchive(messageId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (messageId.isBlank()) return@runCatching
+            val current = messageDao.getArchiveState(messageId)
+            val plan = ArchiveRetractionPolicy.plan(current)
+            if (!plan.write) return@runCatching
+            messageDao.clearArchive(messageId, plan.newState.wire)
+        }.onFailure { Log.w(TAG, "archive retraction skipped: ${it.message}") }
+    }
+
+    /**
+     * Archives a message that arrived over the socket and was decrypted for display.
+     *
+     * The realtime path previously left its plaintext in UI state only. That is a real gap rather
+     * than a stylistic one: a ratchet or MLS message key is consumed on first use, so when the
+     * later REST refresh re-fetches the same row it can no longer open it, finds no cached copy,
+     * and stores the ciphertext - which then renders as the encrypted placeholder. Persisting here
+     * both closes that gap and gives the archive somewhere to live.
+     *
+     * Goes through the same [onArchiveMessage] use-case as the fetch path, so key selection,
+     * context binding, and failure policy exist in exactly one place.
+     *
+     * A row that already carries an archive - or a retracted one - is left completely alone.
+     */
+    suspend fun archiveRealtimeMessage(
+        chatId: String,
+        messageId: String,
+        senderId: String,
+        plaintext: String,
+        timestampMs: Long,
+        keyVersion: Int,
+        encryptionVersion: Int,
+        senderDeviceId: String,
+        chatType: String = "direct"
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            if (messageId.isBlank() || chatId.isBlank()) return@withContext Result.success(Unit)
+            if (plaintext.isBlank() || plaintext == ENCRYPTED_PLACEHOLDER) {
+                return@withContext Result.success(Unit)
+            }
+            val userId = tokenManager.getCurrentUserId().getOrNull()?.takeIf { it.isNotBlank() }
+                ?: return@withContext Result.failure(
+                    IllegalStateException("no current user; cannot bind an archive")
+                )
+
+            val existing = messageDao.getMessageById(messageId)
+            if (ArchiveState.fromWire(existing?.archiveState) != ArchiveState.NONE) {
+                // Already sealed, or retracted. Never re-seal: that would resurrect a message the
+                // user deleted for everyone.
+                return@withContext Result.success(Unit)
+            }
+
+            val sealed = onArchiveMessage?.invoke(userId, chatId, messageId, plaintext)
+                ?: return@withContext Result.failure(
+                    IllegalStateException("message could not be archived")
+                )
+
+            if (existing != null) {
+                // Touch only the archive columns; never rewrite message fields as a side effect.
+                messageDao.setArchive(
+                    messageId, sealed.ciphertextB64, sealed.rootVersion, ArchiveState.SEALED.wire
+                )
+            } else {
+                if (conversationDao.getConversationById(chatId) == null) {
+                    conversationDao.insertConversation(
+                        ConversationEntity(id = chatId, type = chatType)
+                    )
+                }
+                messageDao.insertMessage(
+                    MessageEntity(
+                        id = messageId,
+                        conversation_id = chatId,
+                        senderId = senderId,
+                        content = plaintext,
+                        type = "text",
+                        status = "SENT",
+                        timestamp = timestampMs,
+                        isEncrypted = false,
+                        keyVersion = keyVersion,
+                        encryptionVersion = encryptionVersion,
+                        senderDeviceId = senderDeviceId,
+                        archiveCiphertext = sealed.ciphertextB64,
+                        archiveRootVersion = sealed.rootVersion,
+                        archiveState = ArchiveState.SEALED.wire
+                    )
+                )
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.w(TAG, "realtime archive skipped: ${e.message}")
+            Result.failure(e)
+        }
     }
 
     /**

@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Spacer
@@ -59,6 +60,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.messenger.app.data.settings.MediaKind
 import com.messenger.app.data.settings.NetworkKind
@@ -94,6 +96,8 @@ private sealed interface ActiveDialog {
     data object Licenses : ActiveDialog
     data object ConfirmClearCache : ActiveDialog
     data object ChangePassword : ActiveDialog
+    data object ConfirmResetE2EE : ActiveDialog
+    data object ResetE2EEPassword : ActiveDialog
     data object AuthenticatorSetup : ActiveDialog
     data object AuthenticatorDisable : ActiveDialog
     data object AuthenticatorBackupCodes : ActiveDialog
@@ -113,6 +117,10 @@ fun SettingsScreen(
     val mutedChats by viewModel.mutedChats.collectAsStateWithLifecycle()
     val blockedUsers by viewModel.blockedUsers.collectAsStateWithLifecycle()
     val blockedUsersLoading by viewModel.blockedUsersLoading.collectAsStateWithLifecycle()
+    val resettingE2EE by viewModel.resettingE2EE.collectAsStateWithLifecycle()
+    val resetRecoveryKey by viewModel.resetRecoveryKey.collectAsStateWithLifecycle()
+    val resetError by viewModel.resetError.collectAsStateWithLifecycle()
+    val resetWarning by viewModel.resetWarning.collectAsStateWithLifecycle()
     val e2eeDevices by viewModel.e2eeDevices.collectAsStateWithLifecycle()
     val e2eeDevicesLoading by viewModel.e2eeDevicesLoading.collectAsStateWithLifecycle()
     val currentDeviceId by viewModel.currentDeviceId.collectAsStateWithLifecycle()
@@ -217,10 +225,16 @@ fun SettingsScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         containerColor = MaterialTheme.colorScheme.background
     ) { padding ->
-        Column(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
+                .padding(padding),
+            contentAlignment = Alignment.TopCenter
+        ) {
+        Column(
+            modifier = Modifier
+                .widthIn(max = 720.dp)
+                .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
         ) {
             ProfileCard(
@@ -271,7 +285,8 @@ fun SettingsScreen(
                 },
                 onBackupCodes = { activeDialog = ActiveDialog.AuthenticatorBackupCodes },
                 onLinkDevice = { activeDialog = ActiveDialog.LinkDevice },
-                onRevoke = viewModel::revokeE2EEDevice
+                onRevoke = viewModel::revokeE2EEDevice,
+                onResetEncryption = { activeDialog = ActiveDialog.ConfirmResetE2EE }
             )
 
             StorageSection(
@@ -343,6 +358,7 @@ fun SettingsScreen(
                     }
                 }
             )
+        }
         }
     }
 
@@ -465,6 +481,28 @@ fun SettingsScreen(
             )
         }
 
+        ActiveDialog.ConfirmResetE2EE -> ConfirmDialog(
+            title = "Reset your encryption key?",
+            message = "A new encryption key will replace the current one. Messages " +
+                "already stored encrypted become permanently unreadable, every other " +
+                "signed-in device is signed out, and you will be given a new recovery " +
+                "key. This cannot be undone.",
+            amountAtRisk = "All existing encrypted history and recovery data becomes " +
+                "permanently inaccessible",
+            confirmLabel = "Continue",
+            destructive = true,
+            onConfirm = { activeDialog = ActiveDialog.ResetE2EEPassword },
+            onDismiss = { activeDialog = null }
+        )
+
+        ActiveDialog.ResetE2EEPassword -> ResetE2EEDialog(
+            busy = resettingE2EE,
+            onConfirm = { password ->
+                viewModel.resetE2EE(password)
+            },
+            onDismiss = { if (!resettingE2EE) activeDialog = null }
+        )
+
         ActiveDialog.ChangePassword -> ChangePasswordDialog(
             busy = changingPassword,
             onDismiss = { if (!changingPassword) activeDialog = null },
@@ -539,6 +577,64 @@ fun SettingsScreen(
             },
             onDismiss = { activeDialog = null }
         )
+    }
+
+    // ---- Reset outcome. Three distinct meanings, so three distinct surfaces:
+    //  * resetError   -> provably nothing changed; the old recovery key still works
+    //  * resetWarning -> the key WAS (or may have been) replaced; cleanup incomplete
+    //  * resetRecoveryKey -> the replacement key, shown whenever a commit is
+    //    possible, because it is the only one that can open the new vault.
+    LaunchedEffect(resetRecoveryKey, resetError, resetWarning) {
+        if (resetRecoveryKey != null || resetError != null || resetWarning != null) {
+            if (activeDialog == ActiveDialog.ResetE2EEPassword) activeDialog = null
+        }
+    }
+
+    resetRecoveryKey?.let { key ->
+        ResetRecoveryKeyDialog(
+            recoveryKey = key,
+            caveat = resetWarning,
+            onDismiss = {
+                viewModel.dismissResetRecoveryKey()
+                viewModel.dismissResetWarning()
+            }
+        )
+    }
+
+    if (resetRecoveryKey == null) {
+        resetWarning?.let { message ->
+            LuxDialog(
+                title = "Reset finished with problems",
+                onDismiss = viewModel::dismissResetWarning,
+                confirmLabel = "OK",
+                onConfirm = viewModel::dismissResetWarning
+            ) {
+                Column(Modifier.padding(horizontal = Tokens.Space.lg)) {
+                    Text(
+                        text = message,
+                        style = Tokens.Type.rowSubtitle,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+
+    resetError?.let { message ->
+        LuxDialog(
+            title = "Reset was not performed",
+            onDismiss = viewModel::dismissResetError,
+            confirmLabel = "OK",
+            onConfirm = viewModel::dismissResetError
+        ) {
+            Column(Modifier.padding(horizontal = Tokens.Space.lg)) {
+                Text(
+                    text = message,
+                    style = Tokens.Type.rowSubtitle,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }
 
@@ -861,6 +957,100 @@ private fun QuietHourPicker(
                     timeSelectorSelectedContentColor = Tokens.Palette.accent(dark)
                 )
             )
+        }
+    }
+}
+
+/**
+ * Password prompt for the destructive E2EE reset.
+ *
+ * The password is the authorization step, not a formality: the reset only runs
+ * for someone who can already unlock the vault being replaced, so an unattended
+ * unlocked session cannot trigger it.
+ */
+@Composable
+private fun ResetE2EEDialog(
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (password: String) -> Unit
+) {
+    var password by remember { mutableStateOf("") }
+    var localError by remember { mutableStateOf<String?>(null) }
+
+    LuxDialog(
+        title = "Confirm with your password",
+        onDismiss = onDismiss,
+        confirmLabel = if (busy) "Resetting…" else "Reset encryption",
+        onConfirm = {
+            if (busy) return@LuxDialog
+            localError = if (password.isBlank()) "Enter your password" else null
+            if (localError == null) onConfirm(password)
+        },
+        dismissLabel = "Cancel"
+    ) {
+        Column(Modifier.padding(horizontal = Tokens.Space.lg)) {
+            Text(
+                text = "Your encrypted message history will become permanently " +
+                    "unreadable. Other devices will be signed out.",
+                style = Tokens.Type.rowSubtitle,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(Tokens.Space.sm))
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it; localError = null },
+                label = { Text("Password") },
+                singleLine = true,
+                enabled = !busy,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            localError?.let { err ->
+                Spacer(Modifier.height(Tokens.Space.sm))
+                Text(
+                    text = err,
+                    style = Tokens.Type.rowSubtitle,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+    }
+}
+
+/** Shown once after a successful reset - the key cannot be retrieved again. */
+@Composable
+private fun ResetRecoveryKeyDialog(
+    recoveryKey: String,
+    caveat: String?,
+    onDismiss: () -> Unit
+) {
+    LuxDialog(
+        title = if (caveat == null) "Your new recovery key" else "Save your new recovery key",
+        onDismiss = onDismiss,
+        confirmLabel = "I saved it",
+        onConfirm = onDismiss,
+        dismissLabel = "Close"
+    ) {
+        Column(Modifier.padding(horizontal = Tokens.Space.lg)) {
+            caveat?.let {
+                Text(
+                    text = it,
+                    style = Tokens.Type.rowSubtitle,
+                    color = MaterialTheme.colorScheme.error
+                )
+                Spacer(Modifier.height(Tokens.Space.sm))
+            }
+            Text(
+                text = "Save this now. It is the only way back into your account if " +
+                    "you forget your password, and it is not shown again. Your previous " +
+                    "recovery key no longer works.",
+                style = Tokens.Type.rowSubtitle,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(Tokens.Space.sm))
+            SelectionContainer {
+                Text(text = recoveryKey, style = Tokens.Type.rowValue)
+            }
         }
     }
 }

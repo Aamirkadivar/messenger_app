@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -124,7 +125,13 @@ fun CreateGroupScreen(
         },
         containerColor = MaterialTheme.colorScheme.background
     ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+            contentAlignment = Alignment.TopCenter
+        ) {
+        Column(modifier = Modifier.widthIn(max = 720.dp).fillMaxWidth()) {
 
             AnimatedVisibility(
                 visible = state.error != null,
@@ -190,6 +197,7 @@ fun CreateGroupScreen(
                 onToggle = viewModel::toggleMember,
                 modifier = Modifier.fillMaxSize()
             )
+        }
         }
     }
 }

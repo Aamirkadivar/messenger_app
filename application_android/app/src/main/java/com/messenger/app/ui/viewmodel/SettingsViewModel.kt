@@ -97,7 +97,9 @@ class SettingsViewModel @Inject constructor(
     private val avatarRepository: AvatarRepository,
     private val chatApiService: ChatApiService,
     private val tokenManager: TokenManager,
-    private val e2eeVaultRepository: E2EEVaultRepository
+    private val e2eeVaultRepository: E2EEVaultRepository,
+    private val conversationDao: com.messenger.app.data.local.dao.ConversationDao,
+    private val historyRotation: com.messenger.app.data.repository.HistoryRotationCoordinator
 ) : ViewModel() {
 
     /**
@@ -207,6 +209,8 @@ class SettingsViewModel @Inject constructor(
     val currentDeviceId: StateFlow<String?> = _currentDeviceId.asStateFlow()
 
     init {
+        // Pick up a reset that completed while this screen was not on screen.
+        adoptParkedResetOutcome()
         // Kick off the (slow) scan as soon as Settings is first constructed.
         storageAnalyzer.scan()
         loadProfile()
@@ -270,6 +274,20 @@ class SettingsViewModel @Inject constructor(
             val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
             e2eeVaultRepository.revokeDevice(token, device.deviceId)
                 .onSuccess {
+                    // A revoked device may hold cached history roots for ANY chat, so every
+                    // locally known chat rotates. Failures leave those chats' archiving barriers
+                    // raised; the revocation itself already succeeded and is not reported as failed.
+                    val chats = runCatching { conversationDao.getAllConversations().map { c -> c.id } }
+                        .getOrDefault(emptyList())
+                    historyRotation.onSecurityEvent(
+                        com.messenger.app.data.repository.SecurityEvent.DeviceRevoked(device.deviceId),
+                        chats
+                    ).onFailure { e ->
+                        android.util.Log.w(
+                            "SettingsViewModel",
+                            "history rotation after revoke: ${e.message}"
+                        )
+                    }
                     _e2eeDevices.update { list ->
                         list.map {
                             if (it.deviceId == device.deviceId) it.copy(revoked = true) else it
@@ -307,6 +325,108 @@ class SettingsViewModel @Inject constructor(
                     _toast.value = e.message ?: "Failed to change password"
                 }
             _changingPassword.value = false
+        }
+    }
+
+
+    // ==================== E2EE reset (Gate 6.1) ====================
+
+    /** UI state for the destructive E2EE reset. */
+    private val _resettingE2EE = MutableStateFlow(false)
+    val resettingE2EE: StateFlow<Boolean> = _resettingE2EE.asStateFlow()
+
+    /** Shown once on success; the user cannot get this key again. */
+    private val _resetRecoveryKey = MutableStateFlow<String?>(null)
+    val resetRecoveryKey: StateFlow<String?> = _resetRecoveryKey.asStateFlow()
+
+    private val _resetError = MutableStateFlow<String?>(null)
+    val resetError: StateFlow<String?> = _resetError.asStateFlow()
+
+    /**
+     * A post-commit caveat. Separate from [resetError] because the two need
+     * opposite wording: an error means nothing changed, a warning means the key
+     * WAS replaced and the recovery key beside it is now the only usable one.
+     */
+    private val _resetWarning = MutableStateFlow<String?>(null)
+    val resetWarning: StateFlow<String?> = _resetWarning.asStateFlow()
+
+    /**
+     * Replaces this account's encryption key. Destructive - the caller must have
+     * shown a confirmation first.
+     *
+     * The password is the authorization: the reset only proceeds for someone who
+     * can already unlock the vault being replaced.
+     */
+    fun resetE2EE(password: String) {
+        if (_resettingE2EE.value) return
+        viewModelScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull() ?: return@launch
+            _resettingE2EE.value = true
+            _resetError.value = null
+            when (val r = e2eeVaultRepository.resetE2EEVault(token, password)) {
+                is E2EEVaultRepository.E2EEResetResult.Success -> {
+                    _resetRecoveryKey.value = r.recoveryKeyDisplay
+                    _toast.value = "Encryption key replaced"
+                    loadE2EEDevices()
+                }
+                is E2EEVaultRepository.E2EEResetResult.Aborted -> {
+                    // Provably nothing changed: no key was installed, so the
+                    // user's existing recovery key is still the right one.
+                    _resetError.value = r.message
+                }
+                is E2EEVaultRepository.E2EEResetResult.IncompleteAfterReplacement -> {
+                    // The key DID change. Showing the replacement takes priority
+                    // over the warning - without it the account has no usable
+                    // recovery path at all.
+                    _resetRecoveryKey.value = r.recoveryKeyDisplay
+                    _resetWarning.value = r.message
+                    loadE2EEDevices()
+                }
+                is E2EEVaultRepository.E2EEResetResult.PossiblyCompleted -> {
+                    // Commit state unknown. Assume it happened, because the cost
+                    // of being wrong the other way is an unrecoverable account.
+                    _resetRecoveryKey.value = r.recoveryKeyDisplay
+                    _resetWarning.value = r.message
+                    loadE2EEDevices()
+                }
+            }
+            e2eeVaultRepository.acknowledgeResetOutcome()
+            _resettingE2EE.value = false
+        }
+    }
+
+    fun dismissResetRecoveryKey() { _resetRecoveryKey.value = null }
+
+    fun dismissResetError() { _resetError.value = null }
+
+    fun dismissResetWarning() { _resetWarning.value = null }
+
+    /**
+     * Adopts a post-commit outcome the repository parked while this screen was
+     * gone. Without this, navigating away mid-reset would take the only copy of
+     * the new recovery key with it.
+     */
+    private fun adoptParkedResetOutcome() {
+        viewModelScope.launch {
+            // Ownership-checked: a parked outcome belongs to the account that
+            // produced it and must never be shown to a different one.
+            val currentUser = tokenManager.getCurrentUserId().getOrNull()
+            val parked = e2eeVaultRepository.pendingResetOutcomeFor(currentUser)
+            when (val r = parked) {
+                null -> Unit
+                is E2EEVaultRepository.E2EEResetResult.Success ->
+                    _resetRecoveryKey.value = r.recoveryKeyDisplay
+                is E2EEVaultRepository.E2EEResetResult.IncompleteAfterReplacement -> {
+                    _resetRecoveryKey.value = r.recoveryKeyDisplay
+                    _resetWarning.value = r.message
+                }
+                is E2EEVaultRepository.E2EEResetResult.PossiblyCompleted -> {
+                    _resetRecoveryKey.value = r.recoveryKeyDisplay
+                    _resetWarning.value = r.message
+                }
+                is E2EEVaultRepository.E2EEResetResult.Aborted -> Unit
+            }
+            if (parked != null) e2eeVaultRepository.acknowledgeResetOutcome()
         }
     }
 

@@ -216,6 +216,28 @@ func main() {
 	e2eeRoutes.Post("/pairing/:session_id/complete", e2eeHandler.CompletePairing)
 	e2eeRoutes.Get("/pairing/:session_id/payload", e2eeHandler.TakePairingPayload)
 
+	// Encrypted history archives. Opaque bytes in, opaque bytes out - the server
+	// cannot decrypt them. RequireDeviceIdentity is applied per-route on top of
+	// the group's permissive DeviceRevocationGuard: archive access demands a
+	// known, non-revoked X-Device-Id and never auto-registers one.
+	//
+	// There is deliberately no DELETE. Archives are removed only by the
+	// lifetime rules (message/chat/user cascade, participant departure purge).
+	archiveHandler := handlers.NewArchiveHandler()
+	e2eeRoutes.Post("/archives", middleware.RequireDeviceIdentity(), archiveHandler.UploadArchive)
+	e2eeRoutes.Get("/archives", middleware.RequireDeviceIdentity(), archiveHandler.ListArchives)
+
+	// Per-user MK-sealed history keyring. This is what lets a fresh install or a
+	// replacement device recover the roots needed to open archive ciphertext -
+	// the keyring was otherwise device-local, so losing the device lost history
+	// permanently. The server stores one opaque versioned blob and can decrypt
+	// nothing. No DELETE: the blob dies with its owner via ON DELETE CASCADE.
+	keyringHandler := handlers.NewKeyringRecoveryHandler()
+	e2eeRoutes.Get("/history-keyring", middleware.RequireDeviceIdentity(), keyringHandler.GetHistoryKeyring)
+	e2eeRoutes.Put("/history-keyring", middleware.RequireDeviceIdentity(), keyringHandler.PutHistoryKeyring)
+	// Only reachable use: invalidating a blob stranded by a fresh master key.
+	e2eeRoutes.Delete("/history-keyring", middleware.RequireDeviceIdentity(), keyringHandler.DeleteHistoryKeyring)
+
 	// MLS (RFC 9420) Delivery Service. The server relays opaque bytes and
 	// enforces commit ordering; it never parses protocol material.
 	mlsHandler := handlers.NewMLSHandler(hub)

@@ -145,7 +145,7 @@ fun LoginScreen(
     AuthBackground {
         GlassSurface(
             shape = CardShape,
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth().widthIn(max = 480.dp)
         ) {
             Column(
                 modifier = Modifier.padding(28.dp),
@@ -472,7 +472,7 @@ fun RegisterScreen(
     AuthBackground {
         GlassSurface(
             shape = CardShape,
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth().widthIn(max = 480.dp)
         ) {
             Column(
                 modifier = Modifier.padding(28.dp),

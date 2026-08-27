@@ -84,6 +84,7 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.messenger.app.data.repository.guessMimeType
+import com.messenger.app.ui.adaptive.LocalMessageBubbleMaxWidth
 import com.messenger.app.ui.components.AmbientGlow
 import com.messenger.app.ui.components.Avatar
 import com.messenger.app.ui.components.ChatBackground
@@ -139,7 +140,9 @@ fun ChatScreen(
     /** Non-null for direct chats - places a 1:1 voice/video call. */
     onStartCall: ((calleeId: String, calleeName: String, video: Boolean) -> Unit)? = null,
     /** Non-null for group chats - places a mesh group voice/video call. */
-    onStartGroupCall: ((video: Boolean) -> Unit)? = null
+    onStartGroupCall: ((video: Boolean) -> Unit)? = null,
+    /** False in the tablet detail pane, where the list remains visible. */
+    showBackButton: Boolean = true
 ) {
     val state by viewModel.chatState.collectAsStateWithLifecycle()
     val recording by viewModel.recording.collectAsStateWithLifecycle()
@@ -150,7 +153,7 @@ fun ChatScreen(
     val safetyVerified by viewModel.safetyVerified.collectAsStateWithLifecycle()
     var showSafetyNumber by remember { mutableStateOf(false) }
     var showSafetyScan by remember { mutableStateOf(false) }
-    var messageText by remember { mutableStateOf("") }
+    var messageText by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
 
     val context = LocalContext.current
@@ -331,8 +334,10 @@ fun ChatScreen(
             } else {
             TopAppBar(
                 navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    if (showBackButton) {
+                        IconButton(onClick = onNavigateBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
                     }
                 },
                 title = {
@@ -861,7 +866,7 @@ private fun SystemMessageRow(text: String) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             modifier = Modifier
-                .widthIn(max = 280.dp)
+                .widthIn(max = LocalMessageBubbleMaxWidth.current)
                 .padding(vertical = 4.dp, horizontal = 12.dp)
         )
     }
@@ -934,6 +939,8 @@ private fun MessageBubble(
     onLongPress: () -> Unit = {},
     onReplyQuoteClick: (String) -> Unit = {}
 ) {
+    val bubbleMax = LocalMessageBubbleMaxWidth.current
+    val quoteMax = minOf(bubbleMax, 220.dp)
     val timeFormat = remember { SimpleDateFormat("h:mm a", Locale.getDefault()) }
     val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
 
@@ -982,7 +989,7 @@ private fun MessageBubble(
                         parent = replyParent,
                         isMine = message.isMine,
                         modifier = Modifier
-                            .widthIn(max = 220.dp)
+                            .widthIn(max = quoteMax)
                             .then(longPressModifier)
                             .clickable(enabled = replyParent != null) {
                                 replyParent?.let { onReplyQuoteClick(it.id) }
@@ -1022,7 +1029,7 @@ private fun MessageBubble(
     ) {
         Column(
             modifier = Modifier
-                .widthIn(max = 280.dp)
+                .widthIn(max = bubbleMax)
                 .clip(if (message.isMine) ChatBubbleShapeSent else ChatBubbleShapeReceived)
                 .background(if (message.isMine) MessengerExtendedColors.sentBubble else MessengerExtendedColors.receivedBubble)
                 .padding(horizontal = 12.dp, vertical = 8.dp)
@@ -1494,6 +1501,7 @@ private fun AttachmentContent(
     onFetchAttachment: suspend () -> File?
 ) {
     val context = LocalContext.current
+    val mediaMax = minOf(LocalMessageBubbleMaxWidth.current, 240.dp)
     val scope = rememberCoroutineScope()
     var localFile by remember(message.id) { mutableStateOf<File?>(null) }
     var fetchFailed by remember(message.id) { mutableStateOf(false) }
@@ -1506,7 +1514,7 @@ private fun AttachmentContent(
         val file = localFile
         Box(
             modifier = Modifier
-                .widthIn(max = 240.dp)
+                .widthIn(max = mediaMax)
                 .heightIn(min = 120.dp, max = 240.dp)
                 .clip(RoundedCornerShape(10.dp))
                 .background((if (isMine) Color.White else MaterialTheme.colorScheme.primary).copy(alpha = 0.08f))
@@ -1536,7 +1544,7 @@ private fun AttachmentContent(
         val tint = if (isMine) Color.White else MaterialTheme.colorScheme.primary
         Row(
             modifier = Modifier
-                .widthIn(min = 160.dp, max = 240.dp)
+                .widthIn(min = 160.dp, max = mediaMax)
                 .clickable(role = Role.Button) {
                     scope.launch {
                         val file = localFile ?: onFetchAttachment().also { localFile = it }

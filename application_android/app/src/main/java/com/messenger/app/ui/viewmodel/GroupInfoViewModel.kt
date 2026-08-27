@@ -72,7 +72,8 @@ class GroupInfoViewModel @Inject constructor(
     private val avatarRepository: AvatarRepository,
     private val chatRepository: ChatRepository,
     private val mlsRepository: com.messenger.app.data.repository.MlsRepository,
-    private val tokenManager: TokenManager
+    private val tokenManager: TokenManager,
+    private val historyRotation: com.messenger.app.data.repository.HistoryRotationCoordinator
 ) : ViewModel() {
 
     companion object {
@@ -182,6 +183,14 @@ class GroupInfoViewModel @Inject constructor(
             _state.update { it.copy(busyMemberId = member.id) }
             groupRepository.removeMember(token, chatId, member.id)
                 .onSuccess {
+                    // Membership changed: rotate this chat's history root now, not at the next
+                    // send. A failure leaves archiving blocked for the chat rather than letting it
+                    // continue under the retired root; the removal itself already succeeded.
+                    rotateHistoryFor(
+                        com.messenger.app.data.repository.SecurityEvent.GroupMemberRemoved(
+                            chatId, member.id
+                        )
+                    )
                     _state.update {
                         it.copy(busyMemberId = null, message = "${member.bestName()} removed")
                     }
@@ -240,6 +249,11 @@ class GroupInfoViewModel @Inject constructor(
             _addMembers.update { it.copy(isSubmitting = true) }
             groupRepository.addMembers(token, chatId, selected.map { it.id })
                 .onSuccess {
+                    rotateHistoryFor(
+                        com.messenger.app.data.repository.SecurityEvent.GroupMembersAdded(
+                            chatId, selected.map { m -> m.id }
+                        )
+                    )
                     _addMembers.value = AddMembersUiState()
                     _state.update { it.copy(message = "Added ${selected.size} member(s)") }
                     // MLS-invite the new members too; before this they only
@@ -274,7 +288,12 @@ class GroupInfoViewModel @Inject constructor(
         withToken { token ->
             _state.update { it.copy(isBusy = true) }
             groupRepository.leaveGroup(token, chatId)
-                .onSuccess { _state.update { it.copy(isBusy = false, exited = true) } }
+                .onSuccess {
+                    rotateHistoryFor(
+                        com.messenger.app.data.repository.SecurityEvent.GroupLeft(chatId)
+                    )
+                    _state.update { it.copy(isBusy = false, exited = true) }
+                }
                 .onFailure { e ->
                     _state.update { it.copy(isBusy = false, error = e.message) }
                 }
@@ -345,6 +364,22 @@ class GroupInfoViewModel @Inject constructor(
                 return@launch
             }
             block(token)
+        }
+    }
+
+    /**
+     * Rotates the history root after a membership change.
+     *
+     * Best effort with respect to the USER's action - the membership change has already succeeded
+     * server-side and must not be reported as failed - but never best effort with respect to
+     * security: a failed rotation leaves the chat's archiving barrier raised, so nothing is sealed
+     * under the root the change was meant to retire.
+     */
+    private suspend fun rotateHistoryFor(
+        event: com.messenger.app.data.repository.SecurityEvent
+    ) {
+        historyRotation.onSecurityEvent(event).onFailure {
+            Log.w(TAG, "history root rotation did not complete: ${it.message}")
         }
     }
 }

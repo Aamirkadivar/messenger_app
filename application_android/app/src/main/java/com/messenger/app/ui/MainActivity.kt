@@ -11,10 +11,12 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -28,6 +30,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.compose.rememberNavController
 import com.messenger.app.data.call.CallStatus
 import com.messenger.app.service.RealtimeService
+import com.messenger.app.ui.adaptive.AdaptiveMetrics
+import com.messenger.app.ui.adaptive.LocalTwoPane
+import com.messenger.app.ui.adaptive.LocalWidthClass
 import com.messenger.app.ui.navigation.MainNavGraph
 import com.messenger.app.ui.navigation.Routes
 import com.messenger.app.ui.screen.CallOverlay
@@ -184,32 +189,41 @@ private fun MessengerApp(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        MainNavGraph(
-            navController = navController,
-            startDestination = if (isAuthenticated) Routes.CHAT_LIST else Routes.LOGIN,
-            callViewModel = callViewModel
-        )
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val widthClass = AdaptiveMetrics.widthClass(maxWidth.value)
+        val twoPane = AdaptiveMetrics.usesTwoPane(widthClass)
+        CompositionLocalProvider(
+            LocalWidthClass provides widthClass,
+            LocalTwoPane provides twoPane
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                MainNavGraph(
+                    navController = navController,
+                    startDestination = if (isAuthenticated) Routes.CHAT_LIST else Routes.LOGIN,
+                    callViewModel = callViewModel
+                )
 
-        if (callState.status != CallStatus.IDLE) {
-            val localVideoTrack by callViewModel.localVideoTrack.collectAsStateWithLifecycle()
-            val remoteVideoTrack by callViewModel.remoteVideoTrack.collectAsStateWithLifecycle()
-            val remoteVideoTracks by callViewModel.remoteVideoTracks.collectAsStateWithLifecycle()
-            CallOverlay(
-                state = callState,
-                localVideoTrack = localVideoTrack,
-                remoteVideoTrack = remoteVideoTrack,
-                remoteVideoTracks = remoteVideoTracks,
-                eglContext = callViewModel.eglBaseContext,
-                onAccept = { accept() },
-                onReject = callViewModel::rejectCall,
-                onEnd = callViewModel::endCall,
-                onToggleMute = callViewModel::toggleMute,
-                onToggleSpeaker = callViewModel::toggleSpeaker,
-                onToggleCamera = callViewModel::toggleCamera,
-                onSwitchCamera = callViewModel::switchCamera,
-                onDismissEnded = callViewModel::dismissEnded
-            )
+                if (callState.status != CallStatus.IDLE) {
+                    val localVideoTrack by callViewModel.localVideoTrack.collectAsStateWithLifecycle()
+                    val remoteVideoTrack by callViewModel.remoteVideoTrack.collectAsStateWithLifecycle()
+                    val remoteVideoTracks by callViewModel.remoteVideoTracks.collectAsStateWithLifecycle()
+                    CallOverlay(
+                        state = callState,
+                        localVideoTrack = localVideoTrack,
+                        remoteVideoTrack = remoteVideoTrack,
+                        remoteVideoTracks = remoteVideoTracks,
+                        eglContext = callViewModel.eglBaseContext,
+                        onAccept = { accept() },
+                        onReject = callViewModel::rejectCall,
+                        onEnd = callViewModel::endCall,
+                        onToggleMute = callViewModel::toggleMute,
+                        onToggleSpeaker = callViewModel::toggleSpeaker,
+                        onToggleCamera = callViewModel::toggleCamera,
+                        onSwitchCamera = callViewModel::switchCamera,
+                        onDismissEnded = callViewModel::dismissEnded
+                    )
+                }
+            }
         }
     }
 }

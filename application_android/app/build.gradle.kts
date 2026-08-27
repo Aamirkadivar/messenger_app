@@ -125,6 +125,13 @@ android {
     room {
         schemaDirectory("$projectDir/schemas")
     }
+
+    // MigrationTestHelper loads the exported schema JSONs from the test APK's assets, so the
+    // schema directory has to be on the androidTest asset path. Without this the migration test
+    // fails with "Cannot find the schema file in the assets folder".
+    sourceSets.getByName("androidTest") {
+        assets.srcDirs(files("$projectDir/schemas"))
+    }
 }
 
 dependencies {
@@ -272,7 +279,19 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     testImplementation(libs.mockk)
+    // Test-only. Lets the API contract be exercised over a real Retrofit/OkHttp
+    // stack instead of a hand-written fake, which is the only way to catch a
+    // wrong HTTP verb, path, or header - a fake implements the interface and so
+    // cannot disagree with the annotations.
+    testImplementation(libs.okhttp.mockwebserver)
     testImplementation(libs.kotlin.coroutines.test)
+    // Room MigrationTestHelper. Test scope only - the production dependency graph is unchanged.
+    androidTestImplementation(libs.androidx.room.testing)
+    // Test-only. Lets an instrumented test stand in for the two collaborators the
+    // reset path never touches (ChatRepository, WebSocketManager) so the REAL
+    // E2EEVaultRepository.resetLocked can be executed on-device against real
+    // libsodium and a real Android Keystore.
+    androidTestImplementation(libs.mockk.android)
 }
 
 secrets {

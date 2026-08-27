@@ -385,6 +385,8 @@ func MigrateDB(db *gorm.DB) error {
 		&GroupSenderKey{},
 		&CallLog{},
 		&MessageDeletion{},
+		&MessageArchive{},
+		&HistoryKeyringRecovery{},
 		&UserBlock{},
 		&E2EEVault{},
 		&E2EEDevice{},
@@ -408,5 +410,46 @@ func MigrateDB(db *gorm.DB) error {
 	// cannot map into the slice, so a single populated row makes EVERY read of
 	// the messages table fail. Clearing it is safe and idempotent.
 	db.Exec("UPDATE messages SET deleted_for = NULL WHERE deleted_for IS NOT NULL")
+
+	// Encrypted history archives are decryptable by any device holding the
+	// chat's history root, so unlike a message row - whose ciphertext is inert
+	// once its MLS/ratchet key is consumed - an orphaned archive is a live
+	// privacy liability. Its lifetime is therefore enforced by the database
+	// rather than by remembering to clean up in every deletion handler.
+	//
+	// AutoMigrate does not emit these: the model uses plain scalar columns with
+	// no GORM association, by design (an association would invite the ORM to
+	// load or cascade archive rows implicitly). Declaring them here follows the
+	// same post-migrate fixup convention as the statements above.
+	//
+	//   message_id -> delete-for-everyone hard-deletes the message row
+	//   chat_id    -> DeleteGroup hard-deletes the chat row
+	//   user_id    -> gives archives an explicit owner, so if an account is ever
+	//                 deleted its archives go with it. See the account-deletion
+	//                 gap documented on PurgeArchivesForParticipant.
+	//
+	// Idempotent: Postgres has no ADD CONSTRAINT IF NOT EXISTS.
+	for _, fk := range []struct{ name, spec string }{
+		{"fk_message_archives_message", "FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE"},
+		{"fk_message_archives_chat", "FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE"},
+		{"fk_message_archives_user", "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"},
+	} {
+		db.Exec(`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '` + fk.name + `') THEN
+				ALTER TABLE message_archives ADD CONSTRAINT ` + fk.name + ` ` + fk.spec + `;
+			END IF;
+		END $$;`)
+	}
+
+	// The history keyring recovery blob is owned by its user and dies with them.
+	// Same reasoning as the archive cascades above: an orphaned blob is a live
+	// liability rather than dead weight, so its lifetime is enforced by the
+	// database rather than by remembering to clean up in a handler.
+	db.Exec(`DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_history_keyring_user') THEN
+			ALTER TABLE history_keyring_recoveries ADD CONSTRAINT fk_history_keyring_user
+				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+		END IF;
+	END $$;`)
 	return nil
 }

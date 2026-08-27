@@ -292,6 +292,52 @@ interface ChatApiService {
         @Body body: E2EEVaultPutRequest
     ): Response<E2EEVaultDto>
 
+    // ==================== Encrypted history archives (Gate 4) ====================
+    //
+    // X-Device-Id is added to every request by the OkHttp interceptor in
+    // AppModule, which is what satisfies the server's mandatory device gate on
+    // these two routes. Nothing extra is needed here.
+
+    @POST("e2ee/archives")
+    suspend fun uploadArchive(
+        @Header("Authorization") token: String,
+        @Body body: ArchiveUploadRequest
+    ): Response<ArchiveUploadResponse>
+
+    /**
+     * `since` + `since_id` form the server's EXCLUSIVE keyset cursor: pass the
+     * created_at AND message_id of the last row seen. created_at alone is not
+     * unique, so a cursor without the tie-break silently skips rows that share a
+     * timestamp across a page boundary.
+     */
+    @GET("e2ee/archives")
+    suspend fun listArchives(
+        @Header("Authorization") token: String,
+        @Query("chat_id") chatId: String? = null,
+        @Query("since") since: String? = null,
+        @Query("since_id") sinceId: String? = null
+    ): Response<ArchiveListResponse>
+
+    // History keyring recovery. X-Device-Id is supplied by the OkHttp interceptor,
+    // satisfying the server's mandatory device gate on both routes.
+
+    @GET("e2ee/history-keyring")
+    suspend fun getHistoryKeyring(
+        @Header("Authorization") token: String
+    ): Response<HistoryKeyringDto>
+
+    @PUT("e2ee/history-keyring")
+    suspend fun putHistoryKeyring(
+        @Header("Authorization") token: String,
+        @Body body: HistoryKeyringPutRequest
+    ): Response<HistoryKeyringPutResponse>
+
+    /** Invalidates a blob stranded by a fresh master key. Idempotent. */
+    @DELETE("e2ee/history-keyring")
+    suspend fun deleteHistoryKeyring(
+        @Header("Authorization") token: String
+    ): Response<Unit>
+
     @POST("e2ee/devices")
     suspend fun registerE2EEDevice(
         @Header("Authorization") token: String,

@@ -54,4 +54,27 @@ interface MessageDao {
 
     @Query("SELECT * FROM messages WHERE content LIKE '%' || :query || '%' OR conversation_id IN (SELECT id FROM conversations WHERE name LIKE '%' || :query || '%') ORDER BY timestamp DESC")
     fun searchMessages(query: String): Flow<List<MessageEntity>>
+
+    // ---- Layer B archive (schema v8) ----
+
+    /**
+     * Attaches archive ciphertext to an existing row, leaving `content` and every other column
+     * alone. Separate from [updateMessage] so archiving can never rewrite message fields as a
+     * side effect of a partially built entity.
+     */
+    @Query(
+        "UPDATE messages SET archiveCiphertext = :ciphertext, archiveRootVersion = :rootVersion, " +
+            "archiveState = :state WHERE id = :messageId"
+    )
+    suspend fun setArchive(messageId: String, ciphertext: String, rootVersion: Int, state: String)
+
+    /**
+     * Drops archive ciphertext while recording why. Used for delete-for-everyone, where the state
+     * must remain as a tombstone so a later pass cannot re-archive the message.
+     */
+    @Query("UPDATE messages SET archiveCiphertext = NULL, archiveState = :state WHERE id = :messageId")
+    suspend fun clearArchive(messageId: String, state: String)
+
+    @Query("SELECT archiveState FROM messages WHERE id = :messageId")
+    suspend fun getArchiveState(messageId: String): String?
 }

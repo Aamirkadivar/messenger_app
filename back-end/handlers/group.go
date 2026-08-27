@@ -570,10 +570,26 @@ func (s *GroupService) RemoveMember(c *fiber.Ctx) error {
 			Where("chat_id = ? AND user_id = ?", chatID, userID).
 			Update("left_at", time.Now())
 	} else {
-		// Remove the member
-		database.DB.Model(&models.ChatParticipant{}).
-			Where("chat_id = ? AND user_id = ?", chatID, memberID).
-			Update("left_at", time.Now())
+		// Remove the member, dropping their archives for this chat in the same
+		// transaction - see the note in LeaveGroup.
+		if err := database.DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&models.ChatParticipant{}).
+				Where("chat_id = ? AND user_id = ?", chatID, memberID).
+				Update("left_at", time.Now()).Error; err != nil {
+				return err
+			}
+			// memberID arrives as a path param; a malformed one simply purges
+			// nothing rather than failing the removal.
+			if parsed, err := uuid.Parse(memberID); err == nil {
+				return models.PurgeArchivesForParticipant(tx, chatID, parsed)
+			}
+			return nil
+		}); err != nil {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+				"error":   "internal error",
+				"message": "Failed to remove member",
+			})
+		}
 	}
 
 	s.bumpKeyEpoch(chatID)
@@ -768,10 +784,23 @@ func (s *GroupService) LeaveGroup(c *fiber.Ctx) error {
 			Update("role", "admin")
 	}
 
-	// Leave the group
-	database.DB.Model(&models.ChatParticipant{}).
-		Where("chat_id = ? AND user_id = ?", chatID, userID).
-		Update("left_at", time.Now())
+	// Leave the group. The departing member's encrypted history archives for
+	// this chat go in the same transaction: left_at is an UPDATE, so no foreign
+	// key can observe the departure, and an archive left behind would keep a
+	// decryptable copy of a chat the user is no longer in.
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.ChatParticipant{}).
+			Where("chat_id = ? AND user_id = ?", chatID, userID).
+			Update("left_at", time.Now()).Error; err != nil {
+			return err
+		}
+		return models.PurgeArchivesForParticipant(tx, chatID, userID)
+	}); err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "internal error",
+			"message": "Failed to leave group",
+		})
+	}
 
 	s.bumpKeyEpoch(chatID)
 

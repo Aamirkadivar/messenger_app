@@ -182,7 +182,8 @@ class ChatViewModel @Inject constructor(
     private val roundVideoRecorder: RoundVideoRecorder,
     private val roundVideoRepository: RoundVideoRepository,
     private val playerPool: RoundVideoPlayerPool,
-    private val tokenManager: TokenManager
+    private val tokenManager: TokenManager,
+    private val historyRotation: com.messenger.app.data.repository.HistoryRotationCoordinator
 ) : ViewModel() {
 
     companion object {
@@ -275,8 +276,17 @@ class ChatViewModel @Inject constructor(
         if (id.isBlank()) return
         viewModelScope.launch {
             chatRepository.acceptPeerKeyChange(id)
+            val fingerprint = chatRepository.safetyNumberForChat(id)
+            // Accepting a changed peer identity is the direct-chat security boundary: a different
+            // key decrypts from here on. Rotate now rather than at the next send. A failure leaves
+            // this chat's archiving barrier raised instead of continuing under the retired root.
+            historyRotation.onSecurityEvent(
+                com.messenger.app.data.repository.SecurityEvent.DirectPeerIdentityAccepted(
+                    id, fingerprint.orEmpty()
+                )
+            ).onFailure { Log.w(TAG, "history root rotation did not complete: ${it.message}") }
             _pendingPeerKeyChange.value = false
-            _safetyNumber.value = chatRepository.safetyNumberForChat(id)
+            _safetyNumber.value = fingerprint
             _safetyVerified.value = false
         }
     }
@@ -581,6 +591,31 @@ class ChatViewModel @Inject constructor(
                     }
                 }
 
+                // Layer B: archive the realtime copy while its plaintext still exists. The
+                // decryption above consumed the message key, so if this process dies before the
+                // row is durable the plaintext is gone for good - the later REST refetch cannot
+                // reopen it. Ordering is decrypt -> seal -> Room commit, all inside the repository.
+                //
+                // Best effort by design: a failure leaves the message and the UI untouched, and
+                // never writes plaintext into the archive columns.
+                if (!isVoice && !isAttachment && !isVideoNote &&
+                    text.isNotBlank() && text != ChatRepository.ENCRYPTED_PLACEHOLDER
+                ) {
+                    runCatching {
+                        chatRepository.archiveRealtimeMessage(
+                            chatId = incoming.chatId,
+                            messageId = incoming.messageId,
+                            senderId = incoming.senderId,
+                            plaintext = text,
+                            timestampMs = System.currentTimeMillis(),
+                            keyVersion = incoming.keyVersion,
+                            encryptionVersion = incoming.encryptionVersion,
+                            senderDeviceId = incoming.senderDeviceId,
+                            chatType = chatRepository.chatTypeFor(incoming.chatId) ?: "direct"
+                        )
+                    }
+                }
+
                 val state = _chatState.value
                 if (incoming.chatId == state.chatId) {
                     // Being viewed live - append directly instead of just bumping the badge.
@@ -681,7 +716,22 @@ class ChatViewModel @Inject constructor(
             .launchIn(viewModelScope)
     }
 
+    /**
+     * Drops composer-side transient state so switching (or deselecting) a chat
+     * cannot leave a recording, reply, or selection attached to the previous
+     * thread. Safe to call when nothing is in progress.
+     */
+    fun abandonInProgressCapture() {
+        if (_recording.value.isRecording) cancelRecording()
+        if (_capture.value.videoActive) cancelVideoRecording()
+        clearSelection()
+        clearReply()
+    }
+
     fun openChat(chatId: String, chatName: String, isGroupHint: Boolean = false) {
+        if (_chatState.value.chatId != chatId) {
+            abandonInProgressCapture()
+        }
         // Deliberately not leaving the previous chat's room here: loadChats()
         // joins every known chat's room up front precisely so notifications and
         // live badge/preview updates keep arriving for chats that aren't the

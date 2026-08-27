@@ -27,6 +27,15 @@ import com.messenger.app.security.KeyStoreManager
 import com.messenger.app.security.KeyStoreManagerImpl
 import com.messenger.app.security.TokenManager
 import com.messenger.app.security.TokenManagerImpl
+import com.messenger.app.data.encryption.history.ArchiveCipher
+import com.messenger.app.data.encryption.history.HistoryArchiveFeature
+import com.messenger.app.data.encryption.history.HistoryKeyringStore
+import com.messenger.app.data.encryption.history.HistoryKeyringRecoveryTransport
+import com.messenger.app.data.encryption.history.HistoryKeyringVault
+import com.messenger.app.data.encryption.history.HistoryUserProvider
+import com.messenger.app.data.encryption.history.RealArchiveCipher
+import com.messenger.app.data.repository.ArchiveSync
+import com.messenger.app.data.repository.MessageArchiver
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -111,12 +120,59 @@ object AppModule {
     fun provideKeyStoreManager(@ApplicationContext context: Context): KeyStoreManager =
         KeyStoreManagerImpl(context)
 
+    // Bound once and exposed under two interfaces. TokenManagerImpl implements both TokenManager
+    // and HistoryKeyringStore, and they must be the SAME instance - they share one preferences file
+    // and one Keystore alias.
     @Provides
     @Singleton
-    fun provideTokenManager(
+    fun provideTokenManagerImpl(
         @ApplicationContext context: Context,
         keyStoreManager: KeyStoreManager
-    ): TokenManager = TokenManagerImpl(context, keyStoreManager)
+    ): TokenManagerImpl = TokenManagerImpl(context, keyStoreManager)
+
+    @Provides
+    @Singleton
+    fun provideTokenManager(impl: TokenManagerImpl): TokenManager = impl
+
+    @Provides
+    @Singleton
+    fun provideHistoryKeyringStore(impl: TokenManagerImpl): HistoryKeyringStore = impl
+
+    @Provides
+    @Singleton
+    fun provideHistoryKeyringVault(repo: E2EEVaultRepository): HistoryKeyringVault = repo
+
+    /**
+     * Server-recovery transport for the keyring. Same instance as the vault so MK
+     * never leaves E2EEVaultRepository; a distinct AAD domain keeps a recovery
+     * blob from ever being opened as a local keyring or a vault body.
+     */
+    @Provides
+    @Singleton
+    fun provideHistoryKeyringRecoveryTransport(
+        repo: E2EEVaultRepository
+    ): HistoryKeyringRecoveryTransport = repo
+
+    @Provides
+    @Singleton
+    fun provideArchiveCipher(): ArchiveCipher = RealArchiveCipher
+
+    /**
+     * Binds the history keyring cache to the signed-in account, using the same
+     * identity source every other account-scoped decision uses.
+     */
+    @Provides
+    @Singleton
+    fun provideHistoryUserProvider(tokenManager: TokenManager): HistoryUserProvider =
+        HistoryUserProvider { tokenManager.getCurrentUserId().getOrNull() }
+
+    /**
+     * History archiving is OFF by default. This is the only production binding; flipping it means
+     * changing HistoryArchiveFeature.DEFAULT_ENABLED, a deliberate per-build act.
+     */
+    @Provides
+    @Singleton
+    fun provideHistoryArchiveFeature(): HistoryArchiveFeature = HistoryArchiveFeature.Default
 
     @Provides
     @Singleton
@@ -154,8 +210,10 @@ object AppModule {
         authApiService: AuthApiService,
         tokenManager: TokenManager,
         keyStoreManager: KeyStoreManager,
-        userDao: UserDao
-    ): AuthRepository = AuthRepository(authApiService, tokenManager, keyStoreManager, userDao)
+        userDao: UserDao,
+        e2eeSession: dagger.Lazy<E2EEVaultRepository>
+    ): AuthRepository =
+        AuthRepository(authApiService, tokenManager, keyStoreManager, userDao, e2eeSession)
 
     /**
      * Scope for work that must outlive any one screen - notably the storage
@@ -229,12 +287,25 @@ object AppModule {
         tokenManager: TokenManager,
         groupRepository: GroupRepository,
         json: Json,
-        vaultRepository: dagger.Lazy<E2EEVaultRepository>
+        vaultRepository: dagger.Lazy<E2EEVaultRepository>,
+        // Lazy for the same reason as vaultRepository: MessageArchiver reaches the vault, which
+        // depends on this repository. Resolving it eagerly would close the dependency cycle.
+        messageArchiver: dagger.Lazy<MessageArchiver>,
+        // Lazy for the same cycle reason: ArchiveSync reaches MessageArchiver and
+        // the vault, both of which reach back to this repository.
+        archiveSync: dagger.Lazy<ArchiveSync>
     ): ChatRepository = ChatRepository(
         chatApiService, messageDao, conversationDao, cachedChatDao, webSocketManager, tokenManager,
         groupRepository, json,
         onVaultMaterialChanged = { token -> vaultRepository.get().scheduleRefreshVaultContents(token) },
-        onVaultPullNeeded = { token, force -> vaultRepository.get().pullAndMergeVault(token, force) }
+        onVaultPullNeeded = { token, force -> vaultRepository.get().pullAndMergeVault(token, force) },
+        // Seal locally, then best-effort upload. The seal result is returned
+        // either way, so a failed upload leaves a local archive for a later
+        // refresh to retry under the same authoritative message id.
+        onArchiveMessage = { userId, chatId, messageId, plaintext ->
+            archiveSync.get().sealAndUpload(userId, chatId, messageId, plaintext)
+        },
+        onArchiveFetch = { chatId -> archiveSync.get().downloadFor(chatId) }
     )
 
     @Provides

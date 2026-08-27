@@ -2,7 +2,9 @@ package com.messenger.app.security
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Base64
 import com.messenger.app.data.encryption.DoubleRatchet
+import com.messenger.app.data.encryption.history.HistoryKeyringStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -100,10 +102,15 @@ interface TokenManager {
 class TokenManagerImpl(
     private val context: Context,
     private val keyStoreManager: KeyStoreManager
-) : TokenManager {
+) : TokenManager, HistoryKeyringStore {
 
     companion object {
         private const val SHARED_PREFS_NAME = "messenger_secure_prefs"
+        /** MK-sealed Layer B history keyring. Deliberately not an `mls1_` bundle. */
+        private const val KEY_HISTORY_KEYRING = "history_keyring_v1"
+        /** Keystore-only cache of the same keyring, for cold-start reads without a password. */
+        private const val KEY_HISTORY_KEYRING_CACHE = "history_keyring_cache_v1"
+        private const val KEY_HISTORY_KEYRING_GEN = "history_keyring_gen_v1"
         private const val KEY_ACCESS_TOKEN_ENCRYPTED = "access_token_enc"
         private const val KEY_REFRESH_TOKEN = "refresh_token"
         private const val KEY_EXPIRES_AT = "access_token_expires_at"
@@ -669,11 +676,37 @@ class TokenManagerImpl(
         }
     }
 
+    /**
+     * Durably stores an MLS bundle. The `Result` is a promise the caller relies
+     * on, so this must not return success for a write that has not landed.
+     *
+     * `commit()`, never `apply()`. `apply()` returns `void` and schedules the
+     * write on a background thread, so `Result.success` after it is a claim this
+     * function cannot support: a process that exits before the flush loses the
+     * write while the caller has already been told it succeeded. That is not
+     * hypothetical - it is how a device came to sit on a stale MLS epoch after
+     * the Delivery Service had accepted its commit. The merge was reported
+     * persisted, the process ended, and the snapshot on disk was still the
+     * pre-commit one. Because an author cannot replay its own MLS commit, that
+     * device could not catch up by any ordinary path.
+     *
+     * `commit()` blocks until the write is on disk and reports whether it
+     * worked. We are already on [Dispatchers.IO], so blocking here is correct.
+     */
     override suspend fun saveMlsBundle(key: String, json: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val wrapped = wrapSecret(json).getOrElse { json }
-            sharedPreferences.edit().putString("mls1_$key", wrapped).apply()
-            Result.success(Unit)
+            val committed = sharedPreferences.edit().putString("mls1_$key", wrapped).commit()
+            if (!committed) {
+                Result.failure(
+                    IllegalStateException(
+                        "MLS bundle '$key' was not committed to storage; " +
+                            "treat the state as unpersisted rather than saved"
+                    )
+                )
+            } else {
+                Result.success(Unit)
+            }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -743,10 +776,23 @@ class TokenManagerImpl(
         }
     }
 
+    /**
+     * Durably removes an MLS bundle. `commit()` for the same reason
+     * [saveMlsBundle] uses it, in the other direction: an `apply()`d delete that
+     * has not reached disk when the process ends leaves the bundle in place, so
+     * a caller that has been told the state was discarded would find it back on
+     * the next start.
+     */
     override suspend fun deleteMlsBundle(key: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            sharedPreferences.edit().remove("mls1_$key").apply()
-            Result.success(Unit)
+            val committed = sharedPreferences.edit().remove("mls1_$key").commit()
+            if (!committed) {
+                Result.failure(
+                    IllegalStateException("MLS bundle '$key' was not removed from storage")
+                )
+            } else {
+                Result.success(Unit)
+            }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -839,4 +885,150 @@ class TokenManagerImpl(
         if (ready.isFailure) return null
         return keyStoreManager.decryptData(stored.removePrefix(KS_WRAP_PREFIX), KEY_ALIAS_TOKEN).getOrNull()
     }
+
+    // ---------------------------------------------------------------- HistoryKeyringStore
+    //
+    // A separate, FAIL-CLOSED path. It shares the preferences file and the Keystore alias with the
+    // rest of this class but deliberately not the behaviour of `saveMlsBundle`, which does
+    //
+    //     wrapSecret(json).getOrElse { json }
+    //
+    // and therefore writes plaintext when the Keystore is unavailable. That fallback exists for
+    // legacy MLS migration and is intentionally left untouched. History roots must never take it:
+    // a root written in the clear would defeat the whole layer, so these operations fail instead.
+    //
+    // Two copies are kept, both through the same fail-closed helpers below:
+    //
+    //   KEY_HISTORY_KEYRING       the MK-sealed keyring. Recovery copy and source of truth;
+    //                             reading it usefully requires an unlocked vault.
+    //   KEY_HISTORY_KEYRING_CACHE the keyring's plain encoding, protected by the Keystore alone,
+    //                             so an ordinary restart can read archived history with no
+    //                             password prompt.
+    //
+    // The cache holds root material under Keystore protection only. That is the explicit cost of
+    // cold-start access; it is never written unprotected, and a device whose Keystore is
+    // compromised loses those roots whichever copy is stored.
+
+    override suspend fun saveHistoryKeyring(sealed: ByteArray): Result<Unit> =
+        putSecretBytes(KEY_HISTORY_KEYRING, sealed, "history keyring")
+
+    override suspend fun loadHistoryKeyring(): Result<ByteArray?> =
+        getSecretBytes(KEY_HISTORY_KEYRING, "history keyring")
+
+    override suspend fun deleteHistoryKeyring(): Result<Unit> =
+        removeSecret(KEY_HISTORY_KEYRING, "history keyring")
+
+    override suspend fun saveHistoryKeyringCache(plain: ByteArray): Result<Unit> =
+        putSecretBytes(KEY_HISTORY_KEYRING_CACHE, plain, "history keyring cache")
+
+    override suspend fun loadHistoryKeyringCache(): Result<ByteArray?> =
+        getSecretBytes(KEY_HISTORY_KEYRING_CACHE, "history keyring cache")
+
+    override suspend fun deleteHistoryKeyringCache(): Result<Unit> =
+        removeSecret(KEY_HISTORY_KEYRING_CACHE, "history keyring cache")
+
+    /**
+     * The generation marker.
+     *
+     * Wrapped like the other two rather than stored as a bare integer: it is not
+     * secret, but a value an attacker could edit freely would let a stale cache be
+     * re-validated, which is exactly the failure the marker exists to detect.
+     * Stored big-endian so the bytes order the same way the number does.
+     */
+    override suspend fun saveHistoryKeyringGeneration(generation: Long): Result<Unit> {
+        val bytes = ByteArray(8) { i -> ((generation ushr (56 - 8 * i)) and 0xFF).toByte() }
+        return putSecretBytes(KEY_HISTORY_KEYRING_GEN, bytes, "history keyring generation")
+    }
+
+    override suspend fun loadHistoryKeyringGeneration(): Result<Long?> =
+        getSecretBytes(KEY_HISTORY_KEYRING_GEN, "history keyring generation").map { raw ->
+            if (raw == null || raw.size != 8) return@map null
+            var v = 0L
+            for (b in raw) v = (v shl 8) or (b.toLong() and 0xFF)
+            if (v < 0) null else v
+        }
+
+    override suspend fun deleteHistoryKeyringGeneration(): Result<Unit> =
+        removeSecret(KEY_HISTORY_KEYRING_GEN, "history keyring generation")
+
+    /**
+     * Keystore-wraps and commits, or fails. There is deliberately no `getOrElse { plaintext }`
+     * here - that is the difference from [saveMlsBundle].
+     */
+    private suspend fun putSecretBytes(
+        key: String,
+        bytes: ByteArray,
+        label: String,
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            val wrapped = wrapSecret(encoded).getOrElse {
+                return@withContext Result.failure(
+                    IllegalStateException(
+                        "$label not saved: Keystore wrapping unavailable. " +
+                            "Refusing to persist it unprotected.",
+                        it
+                    )
+                )
+            }
+            val committed = sharedPreferences.edit().putString(key, wrapped).commit()
+            if (!committed) {
+                Result.failure(
+                    IllegalStateException(
+                        "$label was not committed to storage; treat it as unpersisted rather than saved"
+                    )
+                )
+            } else {
+                Result.success(Unit)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Absent is success(null); present-but-unreadable is a failure.
+     *
+     * Reporting an unreadable keyring as absent would look like a fresh device and invite the
+     * caller to mint a new root, orphaning every archive sealed under the old one.
+     */
+    private suspend fun getSecretBytes(key: String, label: String): Result<ByteArray?> =
+        withContext(Dispatchers.IO) {
+            try {
+                val stored = sharedPreferences.getString(key, null)
+                    ?: return@withContext Result.success(null)
+                if (!stored.startsWith(KS_WRAP_PREFIX)) {
+                    // This path never writes unwrapped values, so an unprefixed one is corruption
+                    // or tampering - not a legacy row to be trusted the way `unwrapSecret` trusts
+                    // one.
+                    return@withContext Result.failure(
+                        IllegalStateException("$label is not Keystore-wrapped; refusing to read it")
+                    )
+                }
+                val plain = unwrapSecret(stored)
+                    ?: return@withContext Result.failure(
+                        IllegalStateException(
+                            "$label is present but could not be unwrapped; " +
+                                "refusing to report it as absent"
+                        )
+                    )
+                Result.success(Base64.decode(plain, Base64.NO_WRAP))
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    private suspend fun removeSecret(key: String, label: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val committed = sharedPreferences.edit().remove(key).commit()
+                if (!committed) {
+                    Result.failure(IllegalStateException("$label deletion was not committed"))
+                } else {
+                    Result.success(Unit)
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
 }

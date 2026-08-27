@@ -1,5 +1,6 @@
 package com.messenger.app.ui.viewmodel
 
+import com.messenger.app.data.encryption.history.HistoryArchiveFeature
 import com.messenger.app.data.repository.ChatRepository
 import com.messenger.app.security.TokenManager
 import io.mockk.coEvery
@@ -53,7 +54,19 @@ class GroupInfoMlsRecoveryTest {
             avatarRepository = mockk(relaxed = true),
             chatRepository = chatRepository,
             mlsRepository = mockk(relaxed = true),
-            tokenManager = FakeTokenManager()
+            tokenManager = FakeTokenManager(),
+            // Real coordinator over in-memory ports: this test does not exercise rotation, but the
+            // ViewModel now calls it after a membership change, so it must be a working instance
+            // rather than a mock that silently swallows the call.
+            historyRotation = run {
+                val k = com.messenger.app.data.repository.HistoryKeyringRepository(
+                    NoopKeyringVault(), NoopKeyringStore(),
+                    com.messenger.app.data.encryption.history.HistoryUserProvider { "test-user" }
+                , HistoryArchiveFeature { true })
+                com.messenger.app.data.repository.HistoryRotationCoordinator(
+                    k, com.messenger.app.data.repository.RecoveryTestSupport.disabledLazy(k)
+                , HistoryArchiveFeature { true })
+            }
         )
     }
 
@@ -182,4 +195,33 @@ private class FakeTokenManager : TokenManager {
     override suspend fun clearTokens() = Result.success(Unit)
     override suspend fun isAccessTokenExpired() = Result.success(false)
     override fun isAuthenticated() = true
+}
+
+/** Minimal in-memory keyring ports so the ViewModel under test can be constructed. */
+private class NoopKeyringVault : com.messenger.app.data.encryption.history.HistoryKeyringVault {
+    override suspend fun sealHistoryKeyring(plaintext: ByteArray) =
+        Result.success(byteArrayOf(0x7F) + plaintext.copyOf())
+    override suspend fun openHistoryKeyring(sealed: ByteArray) =
+        if (sealed.isNotEmpty() && sealed[0] == 0x7F.toByte()) {
+            Result.success(sealed.copyOfRange(1, sealed.size))
+        } else Result.failure(IllegalStateException("not sealed"))
+}
+
+private class NoopKeyringStore : com.messenger.app.data.encryption.history.HistoryKeyringStore {
+    private var blob: ByteArray? = null
+    private var cache: ByteArray? = null
+    override suspend fun saveHistoryKeyring(sealed: ByteArray) =
+        Result.success(Unit).also { blob = sealed.copyOf() }
+    override suspend fun loadHistoryKeyring() = Result.success(blob?.copyOf())
+    override suspend fun deleteHistoryKeyring() = Result.success(Unit).also { blob = null }
+    override suspend fun saveHistoryKeyringCache(plain: ByteArray) =
+        Result.success(Unit).also { cache = plain.copyOf() }
+    override suspend fun loadHistoryKeyringCache() = Result.success(cache?.copyOf())
+    override suspend fun deleteHistoryKeyringCache() = Result.success(Unit).also { cache = null }
+    private var generation: Long? = null
+    override suspend fun saveHistoryKeyringGeneration(generation: Long) =
+        Result.success(Unit).also { this.generation = generation }
+    override suspend fun loadHistoryKeyringGeneration() = Result.success(generation)
+    override suspend fun deleteHistoryKeyringGeneration() =
+        Result.success(Unit).also { generation = null }
 }

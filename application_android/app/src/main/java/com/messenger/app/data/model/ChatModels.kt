@@ -508,3 +508,75 @@ data class QrLoginApproveRequest(
     @SerialName("session_id") val sessionId: String,
     @SerialName("scan_secret") val scanSecret: String
 )
+
+// ==================== Encrypted history archives (Gate 4) ====================
+//
+// The server stores and returns opaque sealed bytes. These DTOs carry no root,
+// no keyring, no plaintext and no MLS material - only the ciphertext produced by
+// HistoryMessageCipher and the context needed to reopen it locally.
+
+@Serializable
+data class ArchiveUploadRequest(
+    @SerialName("message_id") val messageId: String,
+    @SerialName("root_version") val rootVersion: Int,
+    /**
+     * No Kotlin default on purpose. kotlinx.serialization omits a property equal
+     * to its default, which would drop the version field from a versioned wire
+     * format - the server would still default it to 1, but the omission would be
+     * silent and would only surface when the format actually changed.
+     */
+    @SerialName("protocol_version") val protocolVersion: Int,
+    @SerialName("ciphertext_b64") val ciphertextB64: String
+)
+
+@Serializable
+data class ArchiveUploadResponse(
+    @SerialName("message_id") val messageId: String = "",
+    @SerialName("chat_id") val chatId: String = "",
+    /** false means an archive already existed server-side and was left untouched. */
+    val stored: Boolean = false
+)
+
+/**
+ * One archive as returned by the server. Every field is UNTRUSTED and must be
+ * validated before it is allowed near Room - see ArchiveSync.validate.
+ */
+@Serializable
+data class ArchiveDto(
+    @SerialName("message_id") val messageId: String = "",
+    @SerialName("chat_id") val chatId: String = "",
+    @SerialName("root_version") val rootVersion: Int = 0,
+    @SerialName("protocol_version") val protocolVersion: Int = 0,
+    @SerialName("ciphertext_b64") val ciphertextB64: String = "",
+    @SerialName("created_at") val createdAt: String = ""
+)
+
+@Serializable
+data class ArchiveListResponse(
+    val archives: List<ArchiveDto> = emptyList(),
+    val count: Int = 0
+)
+
+// ==================== History keyring recovery (Gate 5) ====================
+//
+// The blob is MK-sealed on the device under a dedicated recovery AAD. The server
+// stores opaque bytes plus a version and can decrypt nothing.
+
+@Serializable
+data class HistoryKeyringDto(
+    val version: Int = 0,
+    @SerialName("ciphertext_b64") val ciphertextB64: String = ""
+)
+
+@Serializable
+data class HistoryKeyringPutRequest(
+    /** The version the client believes is current; 0 means "no object yet". */
+    @SerialName("expected_version") val expectedVersion: Int,
+    @SerialName("ciphertext_b64") val ciphertextB64: String
+)
+
+@Serializable
+data class HistoryKeyringPutResponse(
+    val version: Int = 0,
+    val created: Boolean = false
+)

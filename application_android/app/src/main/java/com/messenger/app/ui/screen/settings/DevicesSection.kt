@@ -9,6 +9,7 @@ import androidx.compose.material.icons.outlined.Devices
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -28,7 +29,8 @@ fun DevicesSection(
     onAuthenticator: () -> Unit,
     onBackupCodes: () -> Unit,
     onLinkDevice: () -> Unit,
-    onRevoke: (E2EEDeviceUi) -> Unit
+    onRevoke: (E2EEDeviceUi) -> Unit,
+    onResetEncryption: () -> Unit
 ) {
     SectionHeader(title = "Security", overline = "Account")
 
@@ -58,6 +60,17 @@ fun DevicesSection(
         subtitle = "Scan or paste the pairing code from a new device",
         icon = Icons.Outlined.Link,
         onClick = onLinkDevice
+    )
+
+    // Destructive, so it sits apart from the routine rows and is styled as a
+    // hazard - the same treatment the MLS group reset gets. Wording says what is
+    // lost, not what the mechanism is: people do not reason about master keys.
+    SettingsRow(
+        title = "Reset encryption key",
+        subtitle = "Replaces this account's encryption key. Encrypted history " +
+            "becomes permanently unreadable and other devices are signed out.",
+        icon = Icons.Outlined.Warning,
+        onClick = onResetEncryption
     )
 
     Spacer(Modifier.height(Tokens.Space.md))
