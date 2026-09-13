@@ -4,9 +4,14 @@ Upstream: https://github.com/openmls/openmls/
 Licence:  MIT (see `license = "MIT"` in `Cargo.toml`)
 Version:  0.8.1, copied verbatim from the crates.io package
 
-Registry package SHA-256 (matches `mls-core/Cargo.lock`):
+SHA-256 of the published crates.io package (`openmls-0.8.1.crate`), as listed
+in the crates.io registry index:
 
     dcb512bfe6a55777518853ea535c6241f069cb0e8984678c117151d2a1e7e903
+
+`mls-core/Cargo.lock` does not record this checksum: the `[patch.crates-io]`
+path override replaces the registry source, so the lockfile's `openmls` entry
+carries no `source` or `checksum` line.
 
 `src/` is byte-identical to the published crate apart from three corrections,
 in `src/treesync/node/leaf_node/capabilities.rs`,
@@ -15,8 +20,8 @@ in `src/treesync/node/leaf_node/capabilities.rs`,
 The only other additions to this directory are this file and the removal of
 Cargo's internal `.cargo-ok` extraction marker. It is wired in through
 `[patch.crates-io]` in `mls-core/Cargo.toml`, so the build compiles this source
-rather than the registry copy. The version is NOT bumped: this is 0.8.1 with one
-defect corrected, not an upgrade.
+rather than the registry copy. The version is NOT bumped: this is 0.8.1 with three
+defects corrected, not an upgrade.
 
 ## The fixes
 
@@ -136,9 +141,12 @@ validation GREASE values are "treated the same as unknown values and filtered
 out appropriately". No such filtering exists. RFC 9420 §13.5 exists precisely so
 implementations do not reject values they do not recognise.
 
-Reproduced through OpenMLS's own public GREASE injection in
-`mls-core/tests/grease_extension_type.rs`
-(`capabilities_do_not_contain_the_grease_extension_they_declare`).
+Covered by `mls-core/tests/grease_extension_type.rs`, which drives the real
+`Capabilities::contains_extensions()` through the public
+`MlsGroupCreateConfigBuilder::with_leaf_node_extensions()` for all 15
+`openmls_traits::grease::GREASE_VALUES`: `grease_used_and_declared_is_accepted`
+is the assertion that fails against pristine 0.8.1, and
+`grease_used_but_undeclared_is_rejected` guards the other direction.
 
 ## Why the first attempted fix was withdrawn
 
