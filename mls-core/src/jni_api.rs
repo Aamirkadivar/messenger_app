@@ -76,20 +76,6 @@ pub extern "system" fn Java_com_messenger_app_data_encryption_MlsCore_nativeInst
     _env: JNIEnv,
     _class: JClass,
 ) {
-    // DIAGNOSTIC (temporary): register a backend for the `log` facade.
-    //
-    // android_log() above forwards this core's messages INTO log::log!, and
-    // OpenMLS reports its own validation failures with log::error! - but no
-    // logger was ever registered, so every such record was discarded. That is
-    // why the reason a LeafNode fails validation has been invisible.
-    //
-    // Logging only: installs a sink. No validation, protocol, configuration,
-    // cryptography or return value is affected.
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Trace)
-            .with_tag("mls_core_rs"),
-    );
     crate::ffi::mls_set_log_callback(android_log);
 }
 
