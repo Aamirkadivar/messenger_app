@@ -1,5 +1,7 @@
 package com.messenger.app.data.model
 
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -56,7 +58,9 @@ data class MessageDto(
     val type: String? = null,
     @SerialName("delivered_at") val deliveredAt: String? = null,
     @SerialName("read_at") val readAt: String? = null,
-    @SerialName("created_at") val createdAt: String
+    @SerialName("created_at") val createdAt: String,
+    /** Position in the chat: gap-free, commit-ordered, the sync cursor. 0 from a pre-Phase-71 server. */
+    val seq: Long = 0
 )
 
 @Serializable
@@ -65,7 +69,12 @@ data class MessagesResponse(
     val total: Long = 0,
     val limit: Int = 0,
     val offset: Int = 0,
-    @SerialName("has_more") val hasMore: Boolean = false
+    @SerialName("has_more") val hasMore: Boolean = false,
+    /** "asc" for ?after= (catch-up), "desc" otherwise. */
+    val order: String? = null
+    // `cursor` is deliberately not declared. Nothing reads it (ChatSyncPager advances on
+    // data[].seq), and its type differs by backend - UUID strings vs int64 seqs - so
+    // declaring it made every page from one of them fail to parse whole (Phase 72N-X).
 )
 
 @Serializable
@@ -92,7 +101,13 @@ data class SendMessageRequest(
     @SerialName("reply_to_id") val replyToId: String = "",
     @SerialName("is_forwarded") val isForwarded: Boolean = false,
     @SerialName("forwarded_from_name") val forwardedFromName: String = "",
-    @SerialName("forwarded_from_message_id") val forwardedFromMessageId: String = ""
+    @SerialName("forwarded_from_message_id") val forwardedFromMessageId: String = "",
+    /**
+     * The sender's logical id for this message, minted once before the first transmission and
+     * repeated by every retry, so the server can resolve a retry to the message it already stored.
+     * Empty (and then omitted, encodeDefaults being off) for sends that do not go through the outbox.
+     */
+    @SerialName("client_message_id") val clientMessageId: String = ""
 )
 
 /** Display-only forward attribution stamped on a newly sent message. */
@@ -109,7 +124,13 @@ data class SendMessageResponseData(
     @SerialName("sender_id") val senderId: String,
     val content: String? = null,
     val encrypted: Boolean = false,
-    @SerialName("created_at") val createdAt: String
+    @SerialName("created_at") val createdAt: String,
+    /** "accepted": durably stored by the server. Not delivery - nothing reports delivery. */
+    val status: String? = null,
+    val seq: Long = 0,
+    @SerialName("client_message_id") val clientMessageId: String? = null,
+    /** True when this answered a retry of a message the server already held. */
+    @SerialName("idempotent_replay") val idempotentReplay: Boolean = false
 )
 
 @Serializable
@@ -139,6 +160,18 @@ data class LastMessageDto(
     val encrypted: Boolean = false,
     @SerialName("key_version") val keyVersion: Int = 0,
     @SerialName("encryption_version") val encryptionVersion: Int = 1,
+    /**
+     * Which of the sender's devices sealed this row.
+     *
+     * The chat-list preview decrypts [content], and for MLS (v6) a client must
+     * not hand its OWN ciphertext to OpenMLS: the sending leaf's key is dropped
+     * at encrypt time for forward secrecy. Without this the preview could not
+     * tell its own row from a peer's, so it asked OpenMLS to open it on every
+     * refresh and got "Cannot decrypt own messages" each time.
+     *
+     * Defaults to empty so an older server that omits the field still parses.
+     */
+    @SerialName("sender_device_id") val senderDeviceId: String = "",
     @SerialName("created_at") val createdAt: String
 )
 
@@ -265,7 +298,45 @@ data class E2EEDeviceRegisterRequest(
     @SerialName("device_id") val deviceId: String,
     val name: String,
     val platform: String,
+    @SerialName("public_key") val publicKey: String,
+    // Phase 44: registration is no longer an assertion. The server issues a
+    // challenge sealed to publicKey and only trusts the device once the
+    // decrypted challenge comes back, so these two are mandatory in practice -
+    // a body without them is refused with 400.
+    @SerialName("challenge_id") val challengeId: String = "",
+    @SerialName("proof_b64") val proofB64: String = "",
+    // Phase 67: declares that publicKey is a key minted for THIS device rather
+    // than the account-wide identity key. A declaration, not a proof - the server
+    // records per-device authority only when this and a spent account-recovery
+    // marker agree - but without it a legacy client and a modern one look alike.
+    //
+    // @EncodeDefault is load-bearing. The app's Json does not encode defaults, and
+    // "device" IS the default, so without it this field never reached the wire and
+    // the server - correctly - treated every Android enrolment as legacy (Phase 68,
+    // real hardware). Scoped to this one field on purpose: turning on encodeDefaults
+    // globally would change the wire shape of every other default-valued request field.
+    @OptIn(ExperimentalSerializationApi::class)
+    @EncodeDefault
+    @SerialName("authority_kind") val authorityKind: String = "device"
+)
+
+/** Asks the server to seal a proof-of-possession challenge to [publicKey]. */
+@Serializable
+data class E2EEDeviceChallengeRequest(
+    @SerialName("device_id") val deviceId: String,
     @SerialName("public_key") val publicKey: String
+)
+
+/**
+ * The sealed challenge. [sealedB64] is nonce || crypto_box_easy output under
+ * [senderPubHex], the same wire shape as the pairing payload - so the existing
+ * VaultCrypto.openPairingMk opens it and no second box implementation is needed.
+ */
+@Serializable
+data class E2EEDeviceChallengeResponse(
+    @SerialName("challenge_id") val challengeId: String = "",
+    @SerialName("sender_pub_hex") val senderPubHex: String = "",
+    @SerialName("sealed_b64") val sealedB64: String = ""
 )
 
 @Serializable

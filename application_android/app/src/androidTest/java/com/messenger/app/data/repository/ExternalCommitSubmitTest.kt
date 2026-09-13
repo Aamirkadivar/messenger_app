@@ -5,11 +5,13 @@ import android.util.Log
 import androidx.test.platform.app.InstrumentationRegistry
 import com.messenger.app.BuildConfig
 import com.messenger.app.data.model.MlsCommitRequest
+import com.messenger.app.data.remote.SessionRefresher
 import com.messenger.app.data.remote.TokenRefreshAuthenticator
 import com.messenger.app.data.remote.api.AuthApiService
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.security.KeyStoreManagerImpl
 import com.messenger.app.security.TokenManagerImpl
+import javax.inject.Provider
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -35,6 +37,9 @@ import java.io.File
  * commit), no persist - so the durable epoch-8 snapshot survives untouched.
  */
 class ExternalCommitSubmitTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "EXTSUBMIT"
@@ -60,7 +65,7 @@ class ExternalCommitSubmitTest {
             .client(OkHttpClient()).addConverterFactory(json.asConverterFactory(ct))
             .build().create(AuthApiService::class.java)
         val client = OkHttpClient.Builder()
-            .authenticator(TokenRefreshAuthenticator(tm) { authApi }).build()
+            .authenticator(TokenRefreshAuthenticator(SessionRefresher(tm, Provider { authApi }))).build()
         val api: ChatApiService = Retrofit.Builder().baseUrl(BuildConfig.API_BASE_URL)
             .client(client).addConverterFactory(json.asConverterFactory(ct))
             .build().create(ChatApiService::class.java)
@@ -111,7 +116,7 @@ class ExternalCommitSubmitTest {
 
         // ---- GATE 3: local state, and the four leaves we must preserve
         if (!repo.hasGroup(CHAT)) { p("ABORT: hasGroup false"); return@runBlocking }
-        val gid = Base64.decode(tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
+        val gid = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
         if (gid.hex() != EXPECTED_GID) { p("ABORT: local GID mismatch"); return@runBlocking }
         val c = repo.ensureClient()
         if (c == null) { p("ABORT: no client"); return@runBlocking }

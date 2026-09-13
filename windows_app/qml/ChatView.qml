@@ -187,12 +187,21 @@ Item {
         function onMessageError(error) {
             console.log("[ChatView] Error:", error)
             chatViewRoot.isLoadingMore = false
-            // Leave sendStatus as pending so reconnect / flushOutgoingText can retry.
-            chatViewRoot.resetOutgoingInFlight()
         }
 
         function onMessageSent(chatId, message) {
             chatViewRoot.markOutgoingSent(chatId, message)
+        }
+
+        // Phase 71: refused by the server, or could not be sealed - not left on a clock.
+        function onOutgoingFailed(chatId, clientMessageId, error) {
+            chatViewRoot.markOutgoingFailed(chatId, clientMessageId)
+        }
+
+        // Catch-up ingested messages for this chat while it is open: repaint it.
+        function onChatCaughtUp(chatId) {
+            if (chatId === chatViewRoot.currentChatId)
+                chatService.fetchMessages(chatId)
         }
 
         // Voice notes aren't shown optimistically like text - the bubble
@@ -660,7 +669,7 @@ Item {
             for (var i = 0; i < messagesModel.count; i++) {
                 var row = messagesModel.get(i)
                 // Only ACK'd messages can show double ticks.
-                if (row.isMine && row.sendStatus !== "pending") {
+                if (row.isMine && row.sendStatus !== "pending" && row.sendStatus !== "failed") {
                     messagesModel.setProperty(i, "isRead", true)
                 }
             }
@@ -674,6 +683,9 @@ Item {
                 // silently skipping whatever arrived during the outage.
                 chatService.fetchMessages(chatViewRoot.currentChatId)
             }
+            // Every chat, however many messages arrived (see MessageSyncPager),
+            // and whatever is still in the outbox.
+            chatService.syncAllChats()
             chatViewRoot.flushOutgoingText()
         }
 
@@ -1428,6 +1440,7 @@ Item {
                         // Pure local scroll — never gated on websocket / replyAvailable.
                         chatViewRoot.jumpToMessage(model.replyToId || "")
                     }
+                    onRetryRequested: chatViewRoot.retryOutgoing(model.messageId)
                     // Restored from the model, so a recycled delegate comes
                     // back expanded - see onTextExpandToggled above.
                     textExpanded: model.textExpanded === true
@@ -2039,12 +2052,15 @@ Item {
                         if (!canSend) return
                         var text = messageInput.text.trim()
                         var replyId = chatViewRoot.pendingReplyId
-                        var localId = "local-" + Date.now()
+                        // Phase 71: sealed once, stored in the durable outbox and POSTed
+                        // over HTTP whatever the socket is doing. The bubble is keyed by
+                        // the client_message_id until the server accepts it.
+                        var clientMessageId = chatService.sendTextMessage(chatViewRoot.currentChatId, text,
+                                                                          chatViewRoot.currentChatType, replyId)
+                        var localId = "outbox:" + clientMessageId
                         chatViewRoot.addMessage(authService.currentUserId, "Me", text, chatViewRoot.formatTime(new Date().toISOString()), true, false,
                                                  "", 0, false, localId, "", "", 0, "",
                                                  "", false, 0, 1, false, "", replyId)
-                        chatViewRoot.queueOutgoingText(localId, chatViewRoot.currentChatId, text,
-                                                       chatViewRoot.currentChatType, replyId)
                         chatViewRoot.clearReply()
                         messageInput.text = ""
                     }
@@ -2268,102 +2284,81 @@ Item {
         chatService.pendingReplyToId = ""
     }
 
-    // Outgoing text waiting for a live connection / successful ACK.
-    property var pendingOutgoing: []
-
-    function queueOutgoingText(localId, chatId, text, chatType, replyToId) {
-        var q = chatViewRoot.pendingOutgoing.slice()
-        q.push({
-            localId: localId,
-            chatId: chatId,
-            text: text,
-            chatType: chatType || "direct",
-            replyToId: replyToId || "",
-            inFlight: false
-        })
-        chatViewRoot.pendingOutgoing = q
-        chatViewRoot.flushOutgoingText()
-    }
-
-    function resetOutgoingInFlight() {
-        var q = chatViewRoot.pendingOutgoing.slice()
-        for (var i = 0; i < q.length; i++) q[i].inFlight = false
-        chatViewRoot.pendingOutgoing = q
-    }
+    // Phase 71: unsent messages live in ChatService's durable outbox (this
+    // account's SQLite), not in this view - so they survive the view, a chat
+    // switch, a reconnect and an application restart. The view only mirrors
+    // them as "outbox:<client_message_id>" bubbles, rehydrated on every load.
 
     function flushOutgoingText() {
-        if (typeof websocketService === "undefined" || !websocketService) return
-        if (websocketService.connectionState !== "connected") return
-        var q = chatViewRoot.pendingOutgoing
-        if (!q || q.length === 0) return
-        var item = null
-        for (var i = 0; i < q.length; i++) {
-            if (!q[i].inFlight) { item = q[i]; break }
-        }
-        if (!item) return
-        item.inFlight = true
-        chatViewRoot.pendingOutgoing = q.slice()
-        if (item.replyToId && item.replyToId.length > 0)
-            chatService.pendingReplyToId = item.replyToId
-        else
-            chatService.pendingReplyToId = ""
-        chatService.sendMessage(item.chatId, item.text, item.chatType)
+        // No WebSocket check: the outbox POSTs over HTTP whatever the socket is
+        // doing. (The old gate here left messages on a clock with no attempt.)
+        chatService.processOutbox()
     }
 
+    function outboxBubbleIndex(clientMessageId) {
+        var id = "outbox:" + clientMessageId
+        for (var j = 0; j < messagesModel.count; j++) {
+            if (messagesModel.get(j).messageId === id) return j
+        }
+        return -1
+    }
+
+    // Matches by client_message_id - never by message text, which two
+    // different messages can share.
     function markOutgoingSent(chatId, message) {
-        var content = message.content || message.messageText || ""
+        if (chatId !== chatViewRoot.currentChatId) return
+        var cmid = message.clientMessageId || ""
         var serverId = message.id || ""
-        // Prefer matching the head of the queue for this chat.
-        var q = chatViewRoot.pendingOutgoing.slice()
-        var matchedLocal = ""
-        for (var i = 0; i < q.length; i++) {
-            if (q[i].chatId === chatId && q[i].text === content) {
-                matchedLocal = q[i].localId
-                q.splice(i, 1)
+        if (cmid.length === 0) return
+        var j = chatViewRoot.outboxBubbleIndex(cmid)
+        if (j < 0) return
+        if (serverId.length > 0) {
+            // A repaint may already show the accepted row under its server id:
+            // one bubble per message.
+            for (var k = 0; k < messagesModel.count; k++) {
+                if (k !== j && messagesModel.get(k).messageId === serverId) {
+                    messagesModel.remove(j)
+                    return
+                }
+            }
+            messagesModel.setProperty(j, "messageId", serverId)
+        }
+        messagesModel.setProperty(j, "sendStatus", "sent")
+        messagesModel.setProperty(j, "isRead", false)
+    }
+
+    function markOutgoingFailed(chatId, clientMessageId) {
+        if (chatId !== chatViewRoot.currentChatId) return
+        var j = chatViewRoot.outboxBubbleIndex(clientMessageId)
+        if (j >= 0) messagesModel.setProperty(j, "sendStatus", "failed")
+    }
+
+    // Same outbox row, same client_message_id, same ciphertext: a message the
+    // server did store resolves to that message instead of being sent twice.
+    function retryOutgoing(messageId) {
+        var id = "" + messageId
+        if (id.indexOf("outbox:") !== 0) return
+        if (!chatService.retryOutgoing(id.substring(7))) return
+        for (var j = 0; j < messagesModel.count; j++) {
+            if (messagesModel.get(j).messageId === id) {
+                messagesModel.setProperty(j, "sendStatus", "pending")
                 break
             }
         }
-        if (matchedLocal.length === 0 && q.length > 0 && q[0].chatId === chatId && q[0].inFlight) {
-            matchedLocal = q[0].localId
-            q.splice(0, 1)
-        }
-        chatViewRoot.pendingOutgoing = q
-
-        if (chatId === chatViewRoot.currentChatId) {
-            for (var j = 0; j < messagesModel.count; j++) {
-                var row = messagesModel.get(j)
-                if (!row.isMine || row.sendStatus !== "pending") continue
-                if ((matchedLocal.length > 0 && row.messageId === matchedLocal) ||
-                    (matchedLocal.length === 0 && row.messageText === content)) {
-                    if (serverId.length > 0)
-                        messagesModel.setProperty(j, "messageId", serverId)
-                    messagesModel.setProperty(j, "sendStatus", "sent")
-                    messagesModel.setProperty(j, "isRead", false)
-                    break
-                }
-            }
-        }
-        chatViewRoot.flushOutgoingText()
     }
 
     function rehydratePendingOutgoing() {
         if (!chatViewRoot.currentChatId) return
-        var q = chatViewRoot.pendingOutgoing || []
+        var q = chatService.pendingOutgoing(chatViewRoot.currentChatId)
         for (var i = 0; i < q.length; i++) {
             var item = q[i]
-            if (item.chatId !== chatViewRoot.currentChatId) continue
-            var exists = false
-            for (var j = 0; j < messagesModel.count; j++) {
-                if (messagesModel.get(j).messageId === item.localId) { exists = true; break }
-            }
-            if (exists) continue
-            item.inFlight = false
+            if (chatViewRoot.outboxBubbleIndex(item.clientMessageId) >= 0) continue
             chatViewRoot.addMessage(authService.currentUserId, "Me", item.text,
-                                    chatViewRoot.formatTime(new Date().toISOString()), true, false,
-                                    "", 0, false, item.localId, "", "", 0, "",
+                                    chatViewRoot.formatTime(item.createdAt || new Date().toISOString()), true, false,
+                                    "", 0, false, "outbox:" + item.clientMessageId, "", "", 0, "",
                                     "", false, 0, 1, false, "", item.replyToId || "")
+            if (item.failed) messagesModel.setProperty(messagesModel.count - 1, "sendStatus", "failed")
         }
-        chatViewRoot.pendingOutgoing = q.slice()
     }
 
     function jumpToMessage(messageId) {
@@ -2444,7 +2439,8 @@ Item {
             isMine: isMine,
             isRead: isRead === true,
             // Clock until the server ACKs; history / media with real ids are sent.
-            sendStatus: (isMine && (!messageId || ("" + messageId).indexOf("local-") === 0))
+            sendStatus: (isMine && (!messageId || ("" + messageId).indexOf("local-") === 0
+                                    || ("" + messageId).indexOf("outbox:") === 0))
                         ? "pending" : "sent",
             showSender: showSender,
             voiceUrl: fileUrl || "",

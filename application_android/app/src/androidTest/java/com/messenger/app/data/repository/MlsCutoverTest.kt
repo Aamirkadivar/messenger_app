@@ -19,6 +19,9 @@ import org.junit.runner.RunWith
  */
 @RunWith(AndroidJUnit4::class)
 class MlsCutoverTest {
+    private val TEST_OWNER =
+        com.messenger.app.security.MlsOwner("mls-cutover-test", "dev")
+
 
     /**
      * v5 must be distinct from the direct-message versions. A collision would
@@ -53,15 +56,15 @@ class MlsCutoverTest {
         aliceGroup = added.group
         val bobGroup = MlsGroupCrypto.joinFromWelcome(bobKp, bob, added.welcome)
 
-        val sealed = MlsGroupCrypto.protect(aliceGroup, "group text".toByteArray())
+        val sealed = MlsGroupCrypto.protect(TEST_OWNER, aliceGroup, "group text".toByteArray())
         assertNotNull(sealed)
-        assertEquals("group text", String(MlsGroupCrypto.unprotect(bobGroup, sealed)!!))
+        assertEquals("group text", String(MlsGroupCrypto.unprotect(TEST_OWNER, bobGroup, sealed)!!))
         // The other device of the same account is just another leaf, so it
         // must survive the UI decrypting the same ciphertext twice.
-        assertEquals("group text", String(MlsGroupCrypto.unprotect(bobGroup, sealed)!!))
+        assertEquals("group text", String(MlsGroupCrypto.unprotect(TEST_OWNER, bobGroup, sealed)!!))
         // The sending device cannot reopen its own MLS generation, but protect()
         // remembers the plaintext so history refetch on that device still works.
-        assertEquals("group text", String(MlsGroupCrypto.unprotect(aliceGroup, sealed)!!))
+        assertEquals("group text", String(MlsGroupCrypto.unprotect(TEST_OWNER, aliceGroup, sealed)!!))
     }
 
     /**
@@ -74,10 +77,10 @@ class MlsCutoverTest {
         val alice = MlsGroupCrypto.newIdentity("alice")
         val groupA = MlsGroupCrypto.createGroup("chat-A".toByteArray(), alice)
         val groupB = MlsGroupCrypto.createGroup("chat-B".toByteArray(), alice)
-        val sealed = MlsGroupCrypto.protect(groupA, "for A only".toByteArray())
+        val sealed = MlsGroupCrypto.protect(TEST_OWNER, groupA, "for A only".toByteArray())
         org.junit.Assert.assertNull(
             "group B must not open group A's ciphertext",
-            MlsGroupCrypto.unprotect(groupB, sealed)
+            MlsGroupCrypto.unprotect(TEST_OWNER, groupB, sealed)
         )
     }
 }

@@ -43,20 +43,20 @@ class HistoryKeyringRecoveryTest {
     private class DeviceStore : HistoryKeyringStore {
         var blob: ByteArray? = null
         var cache: ByteArray? = null
-        override suspend fun saveHistoryKeyring(sealed: ByteArray) =
+        override suspend fun saveHistoryKeyring(owner: String, sealed: ByteArray) =
             Result.success(Unit).also { blob = sealed.copyOf() }
-        override suspend fun loadHistoryKeyring() = Result.success(blob?.copyOf())
-        override suspend fun deleteHistoryKeyring() = Result.success(Unit).also { blob = null }
-        override suspend fun saveHistoryKeyringCache(plain: ByteArray) =
+        override suspend fun loadHistoryKeyring(owner: String) = Result.success(blob?.copyOf())
+        override suspend fun deleteHistoryKeyring(owner: String) = Result.success(Unit).also { blob = null }
+        override suspend fun saveHistoryKeyringCache(owner: String, plain: ByteArray) =
             Result.success(Unit).also { cache = plain.copyOf() }
-        override suspend fun loadHistoryKeyringCache() = Result.success(cache?.copyOf())
-        override suspend fun deleteHistoryKeyringCache() = Result.success(Unit).also { cache = null }
+        override suspend fun loadHistoryKeyringCache(owner: String) = Result.success(cache?.copyOf())
+        override suspend fun deleteHistoryKeyringCache(owner: String) = Result.success(Unit).also { cache = null }
 
         private var generation: Long? = null
-        override suspend fun saveHistoryKeyringGeneration(generation: Long) =
+        override suspend fun saveHistoryKeyringGeneration(owner: String, generation: Long) =
             Result.success(Unit).also { this.generation = generation }
-        override suspend fun loadHistoryKeyringGeneration() = Result.success(generation)
-        override suspend fun deleteHistoryKeyringGeneration() =
+        override suspend fun loadHistoryKeyringGeneration(owner: String) = Result.success(generation)
+        override suspend fun deleteHistoryKeyringGeneration(owner: String) =
             Result.success(Unit).also { generation = null }
     }
 
@@ -249,8 +249,8 @@ class HistoryKeyringRecoveryTest {
     fun malformedKeyringPayloadIsRejectedOnImport() = runBlocking {
         val store = DeviceStore()
         val r = repo(store, AccountVault(USER_A), USER_A)
-        assertTrue(r.importFromRecovery(byteArrayOf(9, 9, 9)).isFailure)
-        assertTrue(r.importFromRecovery(ByteArray(0)).isFailure)
+        assertTrue(r.importFromRecovery(byteArrayOf(9, 9, 9), USER_A).isFailure)
+        assertTrue(r.importFromRecovery(ByteArray(0), USER_A).isFailure)
     }
 
     @Test
@@ -261,7 +261,7 @@ class HistoryKeyringRecoveryTest {
         val localRoot = r.ensureRoot(CHAT).getOrThrow().root
 
         val remote = keyring(entry(OTHER, 1, 7)).encode()
-        val merged = r.importFromRecovery(remote).getOrThrow()
+        val merged = r.importFromRecovery(remote, USER_A).getOrThrow()
 
         assertEquals(2, merged.entries.size)
         assertArrayEquals("the local root must survive", localRoot, merged.find(CHAT, 1)!!.root)
@@ -275,7 +275,7 @@ class HistoryKeyringRecoveryTest {
         r.ensureRoot(CHAT).getOrThrow()
 
         val before = r.load().getOrThrow()
-        r.importFromRecovery(keyring(entry(CHAT, 1, before.find(CHAT, 1)!!.root[0])).encode())
+        r.importFromRecovery(keyring(entry(CHAT, 1, before.find(CHAT, 1)!!.root[0])).encode(), USER_A)
 
         val after = r.load().getOrThrow()
         assertEquals("recovery must not add versions", before.entries.size, after.entries.size)
@@ -287,7 +287,7 @@ class HistoryKeyringRecoveryTest {
     fun importedRootsAreReboundToTheImportingAccount() = runBlocking {
         val store = DeviceStore()
         val r = repo(store, AccountVault(USER_B), USER_B)
-        r.importFromRecovery(keyring(entry(CHAT, 1, 4)).encode()).getOrThrow()
+        r.importFromRecovery(keyring(entry(CHAT, 1, 4)).encode(), USER_B).getOrThrow()
 
         assertNotNull("a cache must have been written", store.cache)
         assertEquals(
@@ -310,7 +310,7 @@ class HistoryKeyringRecoveryTest {
 
         // Same (chat, version), different material.
         val hostile = keyring(entry(CHAT, 1, 99)).encode()
-        assertTrue(r.importFromRecovery(hostile).isFailure)
+        assertTrue(r.importFromRecovery(hostile, USER_A).isFailure)
 
         r.clearCache()
         assertArrayEquals(
@@ -340,14 +340,14 @@ class HistoryKeyringRecoveryTest {
         val locked = repo(store, AccountVault(USER_A, locked = true), USER_A)
         locked.clearCache()
         store.cache = null
-        assertTrue(locked.importFromRecovery(keyring(entry(OTHER, 1, 8)).encode()).isFailure)
+        assertTrue(locked.importFromRecovery(keyring(entry(OTHER, 1, 8)).encode(), USER_A).isFailure)
     }
 
     @Test
     fun missingIdentityFailsClosedOnImport() = runBlocking {
         val store = DeviceStore()
         val r = repo(store, AccountVault(null), null)
-        assertTrue(r.importFromRecovery(keyring(entry(CHAT, 1, 1)).encode()).isFailure)
+        assertTrue(r.importFromRecovery(keyring(entry(CHAT, 1, 1)).encode(), USER_A).isFailure)
     }
 
     @Test
@@ -359,7 +359,7 @@ class HistoryKeyringRecoveryTest {
         // Remote contributes nothing new. The remote entry must carry the ACTUAL
         // local root - a synthesized one would differ and count as a conflict.
         val same = keyring(HistoryRootEntry(CHAT, 1, localRoot)).encode()
-        val merged = r.importFromRecovery(same)
+        val merged = r.importFromRecovery(same, USER_A)
         assertTrue("an import that adds nothing must not fail", merged.isSuccess)
         assertFalse(merged.getOrThrow().entries.isEmpty())
     }

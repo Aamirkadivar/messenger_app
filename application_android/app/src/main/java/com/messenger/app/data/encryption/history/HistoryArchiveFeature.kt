@@ -18,13 +18,30 @@ fun interface HistoryArchiveFeature {
 
     companion object {
         /**
-         * OFF by default.
+         * ON.
          *
-         * The archive layer is complete and tested, but nothing has yet run it against real
-         * traffic, and the flag is what keeps that decision explicit. Flipping this is a deliberate
-         * per-build act - the same posture `MlsV2Repository.ENABLED` takes.
+         * Why this layer exists: an MLS sender-ratchet secret is consumed by the first
+         * successful decrypt, so a message whose local plaintext is lost can never be reopened
+         * from its own ciphertext. The archive is the only second copy, and it is keyed
+         * independently of MLS - a per-chat root from the keyring, never any MLS state.
+         *
+         * Turned on after the WRITE half was exercised against real Windows <-> Android traffic:
+         * root minted and published, message sealed, archive uploaded, and the backend verified to
+         * hold nothing but opaque ciphertext.
+         *
+         * KNOWN GAP, stated so nobody mistakes this for a working restore: `MessageArchiver.open`
+         * has no production caller. Archives are produced and stored, and the download path
+         * attaches them to their rows, but no code opens one to put plaintext back. Until that is
+         * wired the archive is a durable second copy that nothing consumes. Sealing is still worth
+         * having on now - a copy that does not exist can never be restored later.
+         *
+         * Requires an UNLOCKED vault: the keyring root is sealed under the session master key, so a
+         * device that logs in and restarts without unlocking archives nothing, silently.
+         *
+         * Flipping this is a deliberate per-build act - the same posture
+         * `MlsV2Repository.ENABLED` takes.
          */
-        const val DEFAULT_ENABLED = false
+        const val DEFAULT_ENABLED = true
 
         /** Production binding. */
         val Default = HistoryArchiveFeature { DEFAULT_ENABLED }

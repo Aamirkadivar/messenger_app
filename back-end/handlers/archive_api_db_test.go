@@ -39,6 +39,11 @@ type archiveAPI struct {
 	// currentUser is what the stand-in auth middleware injects; subtests swap it
 	// to act as a different account without rebuilding the app.
 	currentUser uuid.UUID
+
+	// Phase 44: authorization resolves through the session, so the fixture keeps
+	// one live session per proven (user, device) pair, plus each user's fallback.
+	sessionFor map[string]uuid.UUID
+	primaryFor map[uuid.UUID]uuid.UUID
 }
 
 // archiveAPIEnv builds the real schema via MigrateDB, one group chat with two
@@ -73,10 +78,16 @@ func archiveAPIEnv(t *testing.T) *archiveAPI {
 			u, "u"+u.String()[:8], u.String()[:8]+"@test.local", now, now).Error; err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
-		db.Create(&models.E2EEDevice{
-			ID: uuid.New(), UserID: u, DeviceID: "device-" + u.String()[:4],
-			CreatedAt: now, UpdatedAt: now,
-		})
+	}
+	// Phase 44: a device row alone no longer authorizes anything. Each user gets a
+	// device that proved possession plus the session it proved itself on, which is
+	// the state a real client reaches after registration.
+	env.sessionFor = map[string]uuid.UUID{}
+	env.primaryFor = map[uuid.UUID]uuid.UUID{}
+	for _, u := range []uuid.UUID{env.userA, env.userB} {
+		dev := "device-" + u.String()[:4]
+		env.sessionFor[dev] = seedVerifiedDeviceSession(t, db, u, dev)
+		env.primaryFor[u] = env.sessionFor[dev]
 	}
 	env.device = "device-" + env.userA.String()[:4]
 
@@ -95,7 +106,16 @@ func archiveAPIEnv(t *testing.T) *archiveAPI {
 	env.app = fiber.New()
 	env.currentUser = env.userA
 	env.app.Use(func(c *fiber.Ctx) error {
-		c.Locals(middleware.ContextKeyUser, &middleware.JWTClaims{UserID: env.currentUser})
+		// Stand in for AuthMiddleware. The session follows the device the request
+		// claims to be; anything unproven falls back to the caller's real session,
+		// which is what a client asserting another device's id would carry.
+		sid, ok := env.sessionFor[c.Get("X-Device-Id")]
+		if !ok {
+			sid = env.primaryFor[env.currentUser]
+		}
+		c.Locals(middleware.ContextKeyUser, &middleware.JWTClaims{
+			UserID: env.currentUser, SessionID: sid,
+		})
 		return c.Next()
 	})
 	env.app.Use(middleware.RequireDeviceIdentity())
@@ -240,10 +260,13 @@ func TestArchiveAPI_Authorization(t *testing.T) {
 		now := time.Now()
 		e.db.Exec(`INSERT INTO users (id, username, email, password_hash, created_at, updated_at)
 			VALUES (?, 'outsider', 'outsider@test.local', 'x', ?, ?)`, outsider, now, now)
-		e.db.Create(&models.E2EEDevice{
-			ID: uuid.New(), UserID: outsider, DeviceID: "device-outsider",
-			CreatedAt: now, UpdatedAt: now,
-		})
+		// A FULLY legitimate device: verified and session-bound. The point of
+		// this test is that a properly authorized non-member still learns nothing,
+		// so the outsider must clear the device gate and be refused by the
+		// membership check - not bounced earlier for lacking a device.
+		e.sessionFor["device-outsider"] =
+			seedVerifiedDeviceSession(t, e.db, outsider, "device-outsider")
+		e.primaryFor[outsider] = e.sessionFor["device-outsider"]
 
 		prev := e.currentUser
 		e.currentUser = outsider

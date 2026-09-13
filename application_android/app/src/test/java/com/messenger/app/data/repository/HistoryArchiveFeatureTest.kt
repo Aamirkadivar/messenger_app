@@ -58,20 +58,20 @@ class HistoryArchiveFeatureTest {
         var cache: ByteArray? = null
         var writes = 0
         var reads = 0
-        override suspend fun saveHistoryKeyring(sealed: ByteArray) =
+        override suspend fun saveHistoryKeyring(owner: String, sealed: ByteArray) =
             Result.success(Unit).also { writes++; blob = sealed.copyOf() }
-        override suspend fun loadHistoryKeyring() = Result.success(blob?.copyOf()).also { reads++ }
-        override suspend fun deleteHistoryKeyring() = Result.success(Unit).also { blob = null }
-        override suspend fun saveHistoryKeyringCache(plain: ByteArray) =
+        override suspend fun loadHistoryKeyring(owner: String) = Result.success(blob?.copyOf()).also { reads++ }
+        override suspend fun deleteHistoryKeyring(owner: String) = Result.success(Unit).also { blob = null }
+        override suspend fun saveHistoryKeyringCache(owner: String, plain: ByteArray) =
             Result.success(Unit).also { writes++; cache = plain.copyOf() }
-        override suspend fun loadHistoryKeyringCache() = Result.success(cache?.copyOf()).also { reads++ }
-        override suspend fun deleteHistoryKeyringCache() = Result.success(Unit).also { cache = null }
+        override suspend fun loadHistoryKeyringCache(owner: String) = Result.success(cache?.copyOf()).also { reads++ }
+        override suspend fun deleteHistoryKeyringCache(owner: String) = Result.success(Unit).also { cache = null }
 
         private var generation: Long? = null
-        override suspend fun saveHistoryKeyringGeneration(generation: Long) =
+        override suspend fun saveHistoryKeyringGeneration(owner: String, generation: Long) =
             Result.success(Unit).also { this.generation = generation }
-        override suspend fun loadHistoryKeyringGeneration() = Result.success(generation)
-        override suspend fun deleteHistoryKeyringGeneration() =
+        override suspend fun loadHistoryKeyringGeneration(owner: String) = Result.success(generation)
+        override suspend fun deleteHistoryKeyringGeneration(owner: String) =
             Result.success(Unit).also { generation = null }
     }
 
@@ -95,13 +95,13 @@ class HistoryArchiveFeatureTest {
     // ------------------------------------------------------------------ 1. default
 
     @Test
-    fun theFlagDefaultsOff() {
-        assertFalse(
-            "history archiving must ship OFF",
+    fun theFlagDefaultsOn() {
+        assertTrue(
+            "history archiving must ship ON",
             HistoryArchiveFeature.DEFAULT_ENABLED
         )
-        assertFalse(
-            "the production binding must be the OFF one",
+        assertTrue(
+            "the production binding must be the ON one",
             HistoryArchiveFeature.Default.isEnabled()
         )
     }

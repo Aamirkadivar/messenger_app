@@ -29,6 +29,14 @@ func main() {
 	// Load configuration
 	cfg := config.LoadConfig()
 
+	// Fail closed before anything is served. Session revocation is only as
+	// trustworthy as the signature carrying the session id, and a missing
+	// secret degrades silently rather than loudly: an empty JWT secret still
+	// signs and still verifies.
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("configuration rejected: %v", err)
+	}
+
 	// Initialize database
 	database.InitDB(cfg)
 	defer database.CloseDB()
@@ -41,6 +49,10 @@ func main() {
 	// Initialize WebSocket Hub
 	hub := websocket.NewHub()
 	go hub.Run()
+	// Revocation happens in handlers that own no hub (logout, password change,
+	// password reset); register it once so every path can close the sockets it
+	// just invalidated.
+	handlers.SetSessionHub(hub)
 
 	// Initialize Firebase (optional)
 	if err := firebase.InitFCM(firebase.Config{
@@ -119,6 +131,7 @@ func main() {
 
 	authProtected := protected.Group("/auth")
 	// Approving a QR sign-in requires an already-authenticated device.
+	authProtected.Post("/logout", authService.Logout)
 	authProtected.Post("/qr/approve", authService.ApproveQRLogin)
 	authProtected.Get("/2fa/status", authService.TotpStatus)
 	authProtected.Post("/2fa/totp/setup", authService.TotpSetup)
@@ -204,16 +217,32 @@ func main() {
 	// Opaque E2EE vault + device registry (server never decrypts vault bytes).
 	e2eeRoutes := protected.Group("/e2ee")
 	e2eeRoutes.Get("/vault", e2eeHandler.GetVault)
-	e2eeRoutes.Put("/vault", e2eeHandler.PutVault)
+	// Phase 67: the vault is device-gated for CREATE and UPDATE alike. There is no
+	// account-only exception, because there no longer needs to be one - Phase 60
+	// stopped here believing a first vault write had to precede device authority,
+	// and Phase 66 measured the opposite: enrolment reads and writes no vault, so
+	// the order is password + TOTP -> K_device enrolment -> vault CREATE.
+	e2eeRoutes.Put("/vault", middleware.RequireDeviceIdentity(), e2eeHandler.PutVault)
 	e2eeRoutes.Get("/vault/versions", e2eeHandler.GetVaultVersions)
 	e2eeRoutes.Get("/devices", e2eeHandler.ListDevices)
 	e2eeRoutes.Get("/chats/:chat_id/devices", e2eeHandler.ListChatDevices)
+	// Two-step device registration: challenge, then proof. Both are ordinary
+	// authenticated routes - the proof, not the token, is what confers trust.
+	e2eeRoutes.Post("/devices/challenge", e2eeHandler.CreateDeviceChallenge)
 	e2eeRoutes.Post("/devices", e2eeHandler.RegisterDevice)
 	e2eeRoutes.Delete("/devices/:device_id", e2eeHandler.DeleteDevice)
 	e2eeRoutes.Post("/devices/:device_id/revoke", e2eeHandler.RevokeDevice)
+	// Pairing is asymmetric, so the gate is too. The three destination-side routes
+	// are used by a device that is BY DEFINITION not yet authorized - gating them
+	// would break the flow they exist for. Completion is the odd one out: it is an
+	// EXISTING device handing trusted material to a new one, so it is the only
+	// pairing route where device authority is both meaningful and required.
+	// Without it a revoked device simply omits X-Device-Id and the permissive
+	// DeviceRevocationGuard, which only refuses a device that names itself, waves
+	// the handoff through.
 	e2eeRoutes.Post("/pairing", e2eeHandler.CreatePairing)
 	e2eeRoutes.Get("/pairing/:session_id", e2eeHandler.GetPairing)
-	e2eeRoutes.Post("/pairing/:session_id/complete", e2eeHandler.CompletePairing)
+	e2eeRoutes.Post("/pairing/:session_id/complete", middleware.RequireDeviceIdentity(), e2eeHandler.CompletePairing)
 	e2eeRoutes.Get("/pairing/:session_id/payload", e2eeHandler.TakePairingPayload)
 
 	// Encrypted history archives. Opaque bytes in, opaque bytes out - the server

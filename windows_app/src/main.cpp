@@ -209,6 +209,12 @@ int main(int argc, char* argv[]) {
 #endif
     });
 
+    // A group appeared or its membership changed. Joining the MLS group already
+    // worked over mls:commit, but the chat list was only ever read at startup,
+    // so a group created elsewhere stayed invisible until the app restarted.
+    QObject::connect(&websocketService, &WebSocketService::groupLifecycleEvent,
+                     &chatService, &ChatService::onGroupLifecycleEvent);
+
     QObject::connect(&websocketService, &WebSocketService::mlsCommitReceived,
                      &chatService, [&chatService](const QString& chatId) {
         if (chatService.mlsV2Ready()) {

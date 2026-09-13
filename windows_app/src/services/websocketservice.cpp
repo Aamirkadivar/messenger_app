@@ -208,6 +208,26 @@ void WebSocketService::onTextMessageReceived(const QString& message) {
         return;
     }
 
+    // Group lifecycle. The server already emits these (handlers/group.go) so a
+    // member's list updates without a manual refresh, but nothing consumed them
+    // and an Android-created group stayed invisible here until a restart.
+    //
+    // These ride the hub's GLOBAL broadcast channel, so every connected client
+    // receives them regardless of membership. The event is therefore treated as
+    // a hint to re-read the authoritative chat list, never as proof that this
+    // account belongs to the group - the server decides that when it answers
+    // GET /chats. That also keeps the list free of duplicates and of groups we
+    // were never in.
+    if (type == QStringLiteral("group_created") || type == QStringLiteral("member_added")
+        || type == QStringLiteral("member_removed") || type == QStringLiteral("member_role_changed")
+        || type == QStringLiteral("group_deleted") || type == QStringLiteral("user_left")) {
+        QString chatId = data.value(QStringLiteral("chat_id")).toString();
+        if (chatId.isEmpty())
+            chatId = obj.value(QStringLiteral("chat_id")).toString();
+        emit groupLifecycleEvent(type, chatId);
+        return;
+    }
+
     if (type == QStringLiteral("message")) {
         QString chatId = data[QStringLiteral("chat_id")].toString();
 

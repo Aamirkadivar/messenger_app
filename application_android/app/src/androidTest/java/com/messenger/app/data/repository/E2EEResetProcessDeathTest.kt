@@ -80,15 +80,15 @@ class E2EEResetProcessDeathTest {
     @Test
     fun phase1_writeDurableGeneration() = runBlocking {
         val s = store()
-        s.deleteHistoryKeyring()
-        s.deleteHistoryKeyringCache()
-        s.deleteHistoryKeyringGeneration()
+        s.deleteHistoryKeyring(USER)
+        s.deleteHistoryKeyringCache(USER)
+        s.deleteHistoryKeyringGeneration(USER)
 
         val root = keyring().ensureRoot(CHAT).getOrThrow()
         assertNotNull(root)
         // Prove it is durable before the kill, from a fresh store instance.
-        assertNotNull(store().loadHistoryKeyring().getOrThrow())
-        assertNotNull(store().loadHistoryKeyringGeneration().getOrThrow())
+        assertNotNull(store().loadHistoryKeyring(USER).getOrThrow())
+        assertNotNull(store().loadHistoryKeyringGeneration(USER).getOrThrow())
     }
 
     /**
@@ -100,15 +100,15 @@ class E2EEResetProcessDeathTest {
     @Test
     fun phase1_writeInterruptedDiscardState() = runBlocking {
         val s = store()
-        s.deleteHistoryKeyring()
-        s.deleteHistoryKeyringCache()
-        s.deleteHistoryKeyringGeneration()
+        s.deleteHistoryKeyring(USER)
+        s.deleteHistoryKeyringCache(USER)
+        s.deleteHistoryKeyringGeneration(USER)
 
         keyring().ensureRoot(CHAT).getOrThrow()
         // The first delete of discardForMkReplacement, and only that one.
-        store().deleteHistoryKeyringGeneration().getOrThrow()
-        assertNull(store().loadHistoryKeyringGeneration().getOrThrow())
-        assertNotNull(store().loadHistoryKeyringCache().getOrThrow())
+        store().deleteHistoryKeyringGeneration(USER).getOrThrow()
+        assertNull(store().loadHistoryKeyringGeneration(USER).getOrThrow())
+        assertNotNull(store().loadHistoryKeyringCache(USER).getOrThrow())
     }
 
     // ------------------------------------------------------------------ phase 2
@@ -121,7 +121,7 @@ class E2EEResetProcessDeathTest {
             "a durable root must survive an ungraceful process kill",
             reopened.latest(CHAT)
         )
-        assertNotNull(store().loadHistoryKeyringGeneration().getOrThrow())
+        assertNotNull(store().loadHistoryKeyringGeneration(USER).getOrThrow())
     }
 
     /**
@@ -133,11 +133,11 @@ class E2EEResetProcessDeathTest {
     fun phase2_interruptedDiscardStillFailsClosed() = runBlocking {
         assertNull(
             "precondition: the marker really is gone",
-            store().loadHistoryKeyringGeneration().getOrThrow()
+            store().loadHistoryKeyringGeneration(USER).getOrThrow()
         )
         assertNotNull(
             "precondition: the retired copies really did survive the kill",
-            store().loadHistoryKeyringCache().getOrThrow()
+            store().loadHistoryKeyringCache(USER).getOrThrow()
         )
 
         // Read as the REPLACEMENT generation, which is the situation a reset
@@ -166,7 +166,7 @@ class E2EEResetProcessDeathTest {
     fun phase2_accountIsolationHoldsAcrossARealKill() = runBlocking {
         assertNotNull(
             "precondition: account A's durable keyring survived the kill",
-            store().loadHistoryKeyring().getOrThrow()
+            store().loadHistoryKeyring(USER).getOrThrow()
         )
 
         // A different account, same device, fresh process.
@@ -185,9 +185,9 @@ class E2EEResetProcessDeathTest {
     @Test
     fun phase2_cleanup() = runBlocking {
         val s = store()
-        s.deleteHistoryKeyring()
-        s.deleteHistoryKeyringCache()
-        s.deleteHistoryKeyringGeneration()
+        s.deleteHistoryKeyring(USER)
+        s.deleteHistoryKeyringCache(USER)
+        s.deleteHistoryKeyringGeneration(USER)
         Unit
     }
 
@@ -353,7 +353,7 @@ class E2EEResetProcessDeathTest {
     fun phase1_worldBCandidateKeyThenDie() = runBlocking {
         val ctx = InstrumentationRegistry.getInstrumentation().targetContext
         val t = TokenManagerImpl(ctx, KeyStoreManagerImpl(ctx))
-        t.deleteHistoryKeyring(); t.deleteHistoryKeyringCache(); t.deleteHistoryKeyringGeneration()
+        t.deleteHistoryKeyring(USER); t.deleteHistoryKeyringCache(USER); t.deleteHistoryKeyringGeneration(USER)
 
         val h = Gate8Harness(ctx, t)
         h.seed()
@@ -382,17 +382,17 @@ class E2EEResetProcessDeathTest {
         val ctx = InstrumentationRegistry.getInstrumentation().targetContext
         val t = TokenManagerImpl(ctx, KeyStoreManagerImpl(ctx))
 
-        val authoritative = t.loadHistoryKeyring().getOrThrow()
+        val authoritative = t.loadHistoryKeyring(USER).getOrThrow()
         assertNull(
             "no keyring may have been sealed under the unverified candidate key",
             authoritative
         )
         assertNull(
             "and no stamped cache may claim one exists",
-            t.loadHistoryKeyringCache().getOrThrow()
+            t.loadHistoryKeyringCache(USER).getOrThrow()
         )
         // Cleanup for other suites.
-        t.deleteHistoryKeyringGeneration()
+        t.deleteHistoryKeyringGeneration(USER)
         Unit
     }
 }

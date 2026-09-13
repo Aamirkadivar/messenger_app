@@ -27,6 +27,9 @@ import retrofit2.converter.kotlinx.serialization.asConverterFactory
  * inviteMissingDevices.
  */
 class SamsungRemoveSubmitTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "R2REMOVE"
@@ -86,7 +89,7 @@ class SamsungRemoveSubmitTest {
         p("local epoch   : $localEpoch")
         if (localEpoch != EXPECTED_EPOCH) { p("ABORT: local epoch != 8"); return@runBlocking }
 
-        val gidB64 = tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull()
+        val gidB64 = tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull()
         if (gidB64.isNullOrBlank()) { p("ABORT: no persisted GID"); return@runBlocking }
         val gid = Base64.decode(gidB64, Base64.NO_WRAP)
         if (gid.hex() != EXPECTED_GID) { p("ABORT: local GID mismatch"); return@runBlocking }

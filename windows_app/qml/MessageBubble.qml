@@ -53,6 +53,8 @@ Item {
     property string replyPreview: ""
     property bool replyAvailable: false
     signal replyQuoteClicked()
+    // Phase 71: the retry mark of a refused (sendStatus "failed") message was tapped.
+    signal retryRequested()
     /** Long text starts collapsed; user toggles Show more / Show less. */
     property bool textExpanded: false
     readonly property int collapsedMaxLines: 8
@@ -857,7 +859,7 @@ Item {
                     Canvas {
                         id: checkmarkCanvas
                         y: (parent.height - height) / 2
-                        width: bubbleRoot.sendStatus === "pending" ? 12 : 14
+                        width: bubbleRoot.sendStatus === "pending" || bubbleRoot.sendStatus === "failed" ? 12 : 14
                         height: 10
                         visible: bubbleRoot.isMine
                         onPaint: {
@@ -865,8 +867,23 @@ Item {
                             ctx.reset()
                             ctx.lineCap = "round"
                             ctx.lineJoin = "round"
+                            if (bubbleRoot.sendStatus === "failed") {
+                                // Refused by the server (or never sealed): a red "!" that
+                                // retries the same stored message when tapped.
+                                ctx.fillStyle = "#E74C3C"
+                                ctx.beginPath()
+                                ctx.arc(6, 5, 5, 0, Math.PI * 2)
+                                ctx.fill()
+                                ctx.strokeStyle = "#FFFFFF"
+                                ctx.lineWidth = 1.4
+                                ctx.beginPath()
+                                ctx.moveTo(6, 2.2); ctx.lineTo(6, 5.6)
+                                ctx.moveTo(6, 7.4); ctx.lineTo(6, 7.8)
+                                ctx.stroke()
+                                return
+                            }
                             if (bubbleRoot.sendStatus === "pending") {
-                                // Clock: waiting to reach the server.
+                                // Clock: in the durable outbox, not yet accepted by the server.
                                 ctx.strokeStyle = "rgba(255,255,255,0.75)"
                                 ctx.lineWidth = 1.3
                                 ctx.beginPath()
@@ -904,6 +921,15 @@ Item {
                             target: bubbleRoot
                             function onIsReadChanged() { checkmarkCanvas.requestPaint() }
                             function onSendStatusChanged() { checkmarkCanvas.requestPaint() }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -6
+                            enabled: bubbleRoot.sendStatus === "failed"
+                            visible: enabled
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: bubbleRoot.retryRequested()
                         }
                     }
                 }

@@ -35,6 +35,20 @@ android_logger = "0.14"
 [build-dependencies]
 cbindgen = "0.27"
 
+# OpenMLS 0.8.1 with one defect corrected - NOT an upgrade. The local copy is
+# byte-identical to the published crate (registry SHA-256 recorded in
+# third_party/openmls-0.8.1/PROVENANCE.md) apart from a single line in
+# Capabilities::contains_extensions().
+#
+# Upstream compares a used extension's type against capabilities by enum variant.
+# A GREASE value used as an extension is ExtensionType::Unknown(v), while the same
+# number declared in capabilities is ExtensionType::Grease(v), so a peer that
+# declares a GREASE extension and then uses it was rejected. RFC 9420 s7.3 requires
+# the check to be made by ID. Fixed here rather than worked around; the defect is
+# still present upstream through 0.9.0, so upgrading would not resolve it.
+[patch.crates-io]
+openmls = { path = "third_party/openmls-0.8.1" }
+
 [profile.release]
 # Keep panics unwinding: the FFI layer relies on catch_unwind to stop a Rust
 # panic crossing into Kotlin/C++ as undefined behaviour. panic=abort would turn

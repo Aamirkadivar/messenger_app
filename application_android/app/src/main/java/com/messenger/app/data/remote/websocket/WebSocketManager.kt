@@ -162,6 +162,17 @@ class WebSocketManager private constructor(
     private val _mlsCommits = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val mlsCommits = _mlsCommits.asSharedFlow()
 
+    /**
+     * A group appeared, or its membership/roles changed - carries the server's
+     * own event name (group_created, member_added, ...).
+     *
+     * These ride the hub's GLOBAL broadcast channel, so every connected client
+     * sees them whether or not it is a member. Treat one as a hint to re-read
+     * the authoritative chat list, never as proof of membership.
+     */
+    private val _groupLifecycle = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    val groupLifecycle = _groupLifecycle.asSharedFlow()
+
     private val _deletedMessages = MutableSharedFlow<DeletedMessage>(extraBufferCapacity = 16)
     val deletedMessages = _deletedMessages.asSharedFlow()
 
@@ -423,6 +434,17 @@ class WebSocketManager private constructor(
                     if (chatId.isNotBlank()) {
                         CoroutineScope(Dispatchers.Main).launch { _mlsCommits.emit(chatId) }
                     }
+                }
+                "group_created", "member_added", "member_removed",
+                "member_role_changed", "group_deleted", "user_left" -> {
+                    // Server already emits these so a member's list updates
+                    // without a manual refresh; nothing consumed them, so a
+                    // group created on another device stayed invisible until
+                    // the app was restarted. Only the event name is forwarded:
+                    // the receiver re-reads the chat list, and the server
+                    // decides what this account is actually a member of.
+                    val event = obj.optString("type")
+                    CoroutineScope(Dispatchers.Main).launch { _groupLifecycle.emit(event) }
                 }
                 "message:deleted" -> {
                     val data = obj.optJSONObject("data") ?: return

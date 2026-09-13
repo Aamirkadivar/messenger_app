@@ -50,7 +50,18 @@ data class RegisterUiState(
     val confirmPassword: String = "",
     val isLoading: Boolean = false,
     val error: String? = null,
-    val isRegistered: Boolean = false
+    val isRegistered: Boolean = false,
+    /**
+     * The account exists, but the sign-in that follows registration came back
+     * with a 2FA challenge, so there is still no session.
+     *
+     * Deliberately NOT [isRegistered]: that flag is what drives the UI into the
+     * authenticated area, and setting it here stranded the user on the chat
+     * list with no token - the 2FA prompt popped off the back stack and the
+     * socket reconnecting forever. The challenge lives in [LoginUiState], so
+     * the sign-in screen is where it has to be answered.
+     */
+    val needsTwoFactor: Boolean = false
 )
 
 /**
@@ -578,7 +589,7 @@ class AuthViewModel @Inject constructor(
                                 _registerState.update {
                                     it.copy(
                                         isLoading = false,
-                                        isRegistered = true,
+                                        needsTwoFactor = true,
                                         error = "Account created — enter the 2FA code on the sign-in screen"
                                     )
                                 }

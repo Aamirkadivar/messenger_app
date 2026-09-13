@@ -1,6 +1,8 @@
 package models
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,11 +23,11 @@ type User struct {
 	LastSeen      time.Time `json:"last_seen"`
 	FirebaseToken string    `json:"firebase_token" gorm:"size:512"`
 	// TotpSecret is RFC 6238 base32 (never in JSON). TotpEnabled is the login gate.
-	TotpSecret       string `json:"-" gorm:"size:64"`
-	TotpEnabled      bool   `json:"totp_enabled" gorm:"default:false"`
-	TotpBackupHashes string `json:"-" gorm:"type:text"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	TotpSecret       string    `json:"-" gorm:"size:64"`
+	TotpEnabled      bool      `json:"totp_enabled" gorm:"default:false"`
+	TotpBackupHashes string    `json:"-" gorm:"type:text"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // Message represents a chat message
@@ -48,7 +50,7 @@ type Message struct {
 	ThumbnailURL string `json:"thumbnail_url" gorm:"size:512"`
 	// SenderDeviceID is the installing device that sealed a direct v3 fan-out
 	// (FN1). Empty on historical rows; clients fall back to a shared session.
-	SenderDeviceID    string      `json:"sender_device_id" gorm:"size:128"`
+	SenderDeviceID string `json:"sender_device_id" gorm:"size:128"`
 	// KeyVersion identifies which of the sender's group Sender Key versions
 	// (see Chat.KeyEpoch) encrypted this message - meaningless/0 outside a
 	// group chat, where the pairwise crypto_box scheme needs no versioning.
@@ -71,6 +73,17 @@ type Message struct {
 	CreatedAt              time.Time  `json:"created_at"`
 	UpdatedAt              time.Time  `json:"updated_at"`
 	DeletedAt              *time.Time `json:"deleted_at" gorm:"index"`
+	// ClientMessageID is the sender's own logical id for this message, minted
+	// on the device before the first transmission and reused by every retry.
+	// (sender_id, client_message_id) is unique, so a retry after a lost ACK
+	// resolves to this row instead of creating a second one. Nil for senders
+	// that predate Phase 71. See migratePhase71 for the index.
+	ClientMessageID *string `json:"client_message_id,omitempty" gorm:"size:64"`
+	// Seq is this message's position in its chat: assigned by the database on
+	// INSERT, gap-free per chat, in commit order, and write-once. It is the
+	// sync cursor - random ids and client-chosen timestamps cannot be. Never
+	// written by the application; see migratePhase71.
+	Seq int64 `json:"seq" gorm:"->;-:migration"`
 }
 
 // UserBlock is a one-way block: BlockerID will not receive messages from
@@ -112,8 +125,13 @@ type Chat struct {
 	// this is what keeps a removed member from reading messages sent after
 	// they left, the same guarantee WhatsApp/Signal's Sender Keys give.
 	// Meaningless for a direct chat (always 0).
-	KeyEpoch      int        `json:"key_epoch" gorm:"default:0"`
-	LastMessage   *Message   `json:"last_message"`
+	KeyEpoch int `json:"key_epoch" gorm:"default:0"`
+	// LastMessage is never loaded or written - it only ever serialized as null.
+	// gorm:"-" keeps it out of the schema: left visible, GORM infers a has-one
+	// relation from it and emits fk_chats_last_message (messages.chat_id ->
+	// chats.id, ON DELETE NO ACTION), which makes every group that has messages
+	// impossible to delete. See MigrateDB, which drops the legacy constraint.
+	LastMessage   *Message   `json:"last_message" gorm:"-"`
 	LastMessageAt *time.Time `json:"last_message_at"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
@@ -241,13 +259,17 @@ type MessageCreateRequest struct {
 	KeyVersion int `json:"key_version"`
 	// EncryptionVersion: 1 = static pairwise crypto_box (legacy);
 	// 2 = ephemeral crypto_box (direct FS). Groups stay at 1.
-	EncryptionVersion int `json:"encryption_version"`
+	EncryptionVersion int         `json:"encryption_version"`
 	ReplyToID         *uuid.UUID  `json:"reply_to_id"`
 	MentionIDs        []uuid.UUID `json:"mention_ids"`
 	// Forward attribution (UI only; content is always re-encrypted for the target).
 	IsForwarded            bool       `json:"is_forwarded"`
 	ForwardedFromName      string     `json:"forwarded_from_name"`
 	ForwardedFromMessageID *uuid.UUID `json:"forwarded_from_message_id"`
+	// ClientMessageID makes the send idempotent: a UUID the sending device
+	// generated once for this logical message and repeats on every retry.
+	// Optional, so older clients keep working (without idempotency).
+	ClientMessageID string `json:"client_message_id"`
 }
 
 // CreateGroupRequest represents the request to create a group
@@ -323,30 +345,30 @@ type ErrorResponse struct {
 
 // MessageResponse represents a message in API responses
 type MessageResponse struct {
-	ID                uuid.UUID   `json:"id"`
-	SenderID          uuid.UUID   `json:"sender_id"`
-	Sender            UserInfo    `json:"sender"`
-	ChatID            string      `json:"chat_id"`
-	ChatType          string      `json:"chat_type"`
-	DecryptedContent  string      `json:"decrypted_content,omitempty"`
-	EncryptedContent  string      `json:"encrypted_content"`
-	ContentType       string      `json:"content_type"`
-	FileName          string      `json:"file_name"`
-	FileURL           string      `json:"file_url"`
-	FileSize          int64       `json:"file_size"`
-	IsEncrypted       bool        `json:"is_encrypted"`
-	EncryptionVersion int         `json:"encryption_version"`
-	DeliveredTo       []uuid.UUID `json:"delivered_to"`
-	ReadBy            []uuid.UUID `json:"read_by"`
-	ReplyToID         *uuid.UUID  `json:"reply_to_id"`
-	MentionIDs        []uuid.UUID `json:"mention_ids"`
-	IsForwarded            bool       `json:"is_forwarded"`
-	ForwardedFromName      string     `json:"forwarded_from_name"`
-	ForwardedFromMessageID *uuid.UUID `json:"forwarded_from_message_id"`
-	DeliveredAt       *time.Time  `json:"delivered_at"`
-	ReadAt            *time.Time  `json:"read_at"`
-	CreatedAt         time.Time   `json:"created_at"`
-	UpdatedAt         time.Time   `json:"updated_at"`
+	ID                     uuid.UUID   `json:"id"`
+	SenderID               uuid.UUID   `json:"sender_id"`
+	Sender                 UserInfo    `json:"sender"`
+	ChatID                 string      `json:"chat_id"`
+	ChatType               string      `json:"chat_type"`
+	DecryptedContent       string      `json:"decrypted_content,omitempty"`
+	EncryptedContent       string      `json:"encrypted_content"`
+	ContentType            string      `json:"content_type"`
+	FileName               string      `json:"file_name"`
+	FileURL                string      `json:"file_url"`
+	FileSize               int64       `json:"file_size"`
+	IsEncrypted            bool        `json:"is_encrypted"`
+	EncryptionVersion      int         `json:"encryption_version"`
+	DeliveredTo            []uuid.UUID `json:"delivered_to"`
+	ReadBy                 []uuid.UUID `json:"read_by"`
+	ReplyToID              *uuid.UUID  `json:"reply_to_id"`
+	MentionIDs             []uuid.UUID `json:"mention_ids"`
+	IsForwarded            bool        `json:"is_forwarded"`
+	ForwardedFromName      string      `json:"forwarded_from_name"`
+	ForwardedFromMessageID *uuid.UUID  `json:"forwarded_from_message_id"`
+	DeliveredAt            *time.Time  `json:"delivered_at"`
+	ReadAt                 *time.Time  `json:"read_at"`
+	CreatedAt              time.Time   `json:"created_at"`
+	UpdatedAt              time.Time   `json:"updated_at"`
 }
 
 // UserInfo represents minimal user info for API responses
@@ -390,26 +412,54 @@ func MigrateDB(db *gorm.DB) error {
 		&UserBlock{},
 		&E2EEVault{},
 		&E2EEDevice{},
+		&E2EEDeviceChallenge{},
+		&E2EEAccountAuthority{},
+		&E2EERetiredDeviceKey{},
 		&E2EEPairingSession{},
 		&MLSKeyPackage{},
 		&MLSGroup{},
 		&MLSHandshake{},
 		&MLSWelcome{},
 		&QRLoginSession{},
+		&Session{},
+		&ConsumedRefresh{},
 	); err != nil {
 		return err
 	}
 
 	// Legacy: Register used to store an unused server-side private key.
 	// Drop the column so a DB dump cannot expose leftover E2EE material.
-	db.Exec("ALTER TABLE users DROP COLUMN IF EXISTS private_key")
+	if err := db.Exec("ALTER TABLE users DROP COLUMN IF EXISTS private_key").Error; err != nil {
+		return fmt.Errorf("drop legacy users.private_key: %w", err)
+	}
+
+	// Legacy: fk_chats_last_message (messages.chat_id -> chats.id, ON DELETE NO
+	// ACTION) was never designed. GORM inferred it from Chat.LastMessage, a field
+	// nothing loads or writes - now tagged gorm:"-", so AutoMigrate above no
+	// longer creates it. DeleteGroup keeps a deleted group's messages as rows
+	// with deleted_at set and hard-deletes the chat row; this constraint refused
+	// that, so no group with messages could ever be deleted. Dropping it changes
+	// no row. On a fresh database, and on every run after the first, it is a
+	// no-op.
+	//
+	// Operator pre-check before this first reaches an existing deployment: while
+	// the constraint stood, no DeleteGroup on a group with messages could commit,
+	// so `SELECT count(*) FROM messages WHERE deleted_at IS NOT NULL` should read
+	// 0. Anything else means soft-deleted rows came from a path this change did
+	// not account for - stop and find it first. (GetMessages never serves such
+	// rows; see its visibility predicate.)
+	if err := db.Exec("ALTER TABLE messages DROP CONSTRAINT IF EXISTS fk_chats_last_message").Error; err != nil {
+		return fmt.Errorf("drop accidental fk_chats_last_message: %w", err)
+	}
 
 	// messages.deleted_for is abandoned in favour of MessageDeletion, and any
 	// value left in it has to go. []uuid.UUID is only scannable while the
 	// column is NULL: the driver returns "{uuid,...}" as a string, which GORM
 	// cannot map into the slice, so a single populated row makes EVERY read of
 	// the messages table fail. Clearing it is safe and idempotent.
-	db.Exec("UPDATE messages SET deleted_for = NULL WHERE deleted_for IS NOT NULL")
+	if err := db.Exec("UPDATE messages SET deleted_for = NULL WHERE deleted_for IS NOT NULL").Error; err != nil {
+		return fmt.Errorf("clear legacy messages.deleted_for: %w", err)
+	}
 
 	// Encrypted history archives are decryptable by any device holding the
 	// chat's history root, so unlike a message row - whose ciphertext is inert
@@ -434,22 +484,355 @@ func MigrateDB(db *gorm.DB) error {
 		{"fk_message_archives_chat", "FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE"},
 		{"fk_message_archives_user", "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"},
 	} {
-		db.Exec(`DO $$ BEGIN
+		if err := db.Exec(`DO $$ BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '` + fk.name + `') THEN
 				ALTER TABLE message_archives ADD CONSTRAINT ` + fk.name + ` ` + fk.spec + `;
 			END IF;
-		END $$;`)
+		END $$;`).Error; err != nil {
+			return fmt.Errorf("archive FK %s: %w", fk.name, err)
+		}
 	}
 
 	// The history keyring recovery blob is owned by its user and dies with them.
 	// Same reasoning as the archive cascades above: an orphaned blob is a live
 	// liability rather than dead weight, so its lifetime is enforced by the
 	// database rather than by remembering to clean up in a handler.
-	db.Exec(`DO $$ BEGIN
+	if err := db.Exec(`DO $$ BEGIN
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_history_keyring_user') THEN
 			ALTER TABLE history_keyring_recoveries ADD CONSTRAINT fk_history_keyring_user
 				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
 		END IF;
-	END $$;`)
+	END $$;`).Error; err != nil {
+		return fmt.Errorf("history keyring FK: %w", err)
+	}
+
+	// Phase 70 back-fill. Accounts that are ALREADY LEGACY_RETIRED when this
+	// remediation deploys have no durable retired-key evidence yet, so their
+	// K_account would still resurrect through the Phase 69 deleted-row gap.
+	// Reconstruct the deny-list for them from whatever legacy keys they still
+	// hold: every authority_kind='legacy' key, plus any device row whose key
+	// equals the account's published identity key (a K_account that landed in a
+	// 'device' row). Idempotent: ON CONFLICT DO NOTHING, and the retired_at is
+	// carried from the account's own legacy_retired_at.
+	//
+	// LIMITATION, reported not hidden: if an already-retired account had its last
+	// legacy row deleted BEFORE this deploy and the key never sat in a device row
+	// or users.public_key, the server has no record of that K_account and cannot
+	// reconstruct it. Such a key remains resurrectable. Nothing here invents
+	// cryptographic history; the gap is closed for every account retired from this
+	// deploy onward and for every already-retired account whose key still exists
+	// somewhere in its rows.
+	// (a) the account's own published identity key (K_account), which survives on
+	//     users.public_key even when every device row is gone;
+	if err := db.Exec(`
+		INSERT INTO e2ee_retired_device_keys (id, user_id, public_key, retired_at, created_at)
+		SELECT gen_random_uuid(), aa.user_id, lower(u.public_key), aa.legacy_retired_at, now()
+		FROM e2ee_account_authorities aa
+		JOIN users u ON u.id = aa.user_id
+		WHERE aa.legacy_retired_at IS NOT NULL AND COALESCE(u.public_key, '') <> ''
+		ON CONFLICT (user_id, public_key) DO NOTHING`).Error; err != nil {
+		return fmt.Errorf("backfill retired account keys: %w", err)
+	}
+	// (b) every legacy device-row key still present (and any device-provenance row
+	//     holding the account key).
+	if err := db.Exec(`
+		INSERT INTO e2ee_retired_device_keys (id, user_id, public_key, retired_at, created_at)
+		SELECT gen_random_uuid(), d.user_id, lower(d.public_key), aa.legacy_retired_at, now()
+		FROM e2_ee_devices d
+		JOIN e2ee_account_authorities aa ON aa.user_id = d.user_id
+		LEFT JOIN users u ON u.id = d.user_id
+		WHERE aa.legacy_retired_at IS NOT NULL
+		  AND d.public_key <> ''
+		  AND (d.authority_kind = 'legacy'
+		       OR (COALESCE(u.public_key, '') <> '' AND lower(d.public_key) = lower(u.public_key)))
+		ON CONFLICT (user_id, public_key) DO NOTHING`).Error; err != nil {
+		return fmt.Errorf("backfill retired legacy keys: %w", err)
+	}
+
+	if err := migratePhase71(db); err != nil {
+		return err
+	}
+
+	return migrateGate17(db)
+}
+
+// migrateGate17 installs the session layer's database-enforced invariants.
+//
+// Every statement here is checked, and every resulting object is then verified
+// against the PostgreSQL catalogs. That is not belt-and-braces: AutoMigrate
+// cannot emit foreign keys (the models declare no associations, deliberately),
+// partial indexes, CHECK constraints or triggers, so ALL of Gate 17's
+// database-level guarantees ride these raw statements. The historical pattern
+// in this file discarded their errors, which meant a server could boot with
+// none of them present and say nothing. A missing constraint here is a missing
+// security control, so it stops startup.
+func migrateGate17(db *gorm.DB) error {
+	// Constraints. Postgres has no ADD CONSTRAINT IF NOT EXISTS, hence the
+	// catalog guard; the same idempotent shape already used above.
+	constraints := []struct{ table, name, spec string }{
+		{"sessions", "fk_sessions_user",
+			"FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"},
+		// SET NULL, never CASCADE: Gate 14 made device revocation terminal, and a
+		// cascade here would let deleting a device silently erase the sessions
+		// that recorded its activity - along with the fork evidence hanging off
+		// them.
+		//
+		// SET NULL is safe here only because of the guard trigger below, which
+		// permits device_id -> NULL exclusively on an ALREADY-REVOKED session.
+		// The FK action is an ordinary UPDATE and is therefore subject to that
+		// trigger, so a device with even one LIVE session cannot be deleted: the
+		// trigger raises and the whole deletion rolls back. Detaching a live
+		// session is impossible by construction rather than by convention.
+		{"sessions", "fk_sessions_device",
+			"FOREIGN KEY (device_id) REFERENCES e2_ee_devices(id) ON DELETE SET NULL"},
+		{"sessions", "ck_sessions_refresh_hash_len",
+			"CHECK (refresh_hash IS NULL OR octet_length(refresh_hash) = 32)"},
+		// The pairing of terminal revocation with an unusable credential. Without
+		// it, a revoked row could still carry a hash that some future CAS matches.
+		{"sessions", "ck_sessions_revoked_implies_no_hash",
+			"CHECK (revoked_at IS NULL OR refresh_hash IS NULL)"},
+		{"sessions", "ck_sessions_absolute_after_created",
+			"CHECK (absolute_expires_at > created_at)"},
+		{"consumed_refresh", "fk_consumed_refresh_session",
+			"FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE RESTRICT"},
+		{"consumed_refresh", "ck_consumed_refresh_hash_len",
+			"CHECK (octet_length(consumed_hash) = 32)"},
+		{"consumed_refresh", "ck_consumed_refresh_next_hash_len",
+			"CHECK (octet_length(next_refresh_hash) = 32)"},
+		// Fork evidence must outlive the token it describes, or a consumed token
+		// could still be presented after its ledger row was purged.
+		{"consumed_refresh", "ck_consumed_refresh_window_order",
+			"CHECK (reuse_window_expires_at >= response_expires_at)"},
+	}
+	// Gate 18: fk_sessions_device changed action from RESTRICT to SET NULL. The
+	// guarded ADD below keys on the constraint NAME, so a database created
+	// before this change would keep the old action forever. Drop it whenever the
+	// catalog reports an action other than SET NULL ('n') and let the loop
+	// rebuild it. A no-op once converged.
+	if err := db.Exec(`DO $$ BEGIN
+		IF EXISTS (SELECT 1 FROM pg_constraint
+		            WHERE conname = 'fk_sessions_device' AND confdeltype <> 'n') THEN
+			ALTER TABLE sessions DROP CONSTRAINT fk_sessions_device;
+		END IF;
+	END $$;`).Error; err != nil {
+		return fmt.Errorf("gate18 fk_sessions_device action upgrade: %w", err)
+	}
+
+	for _, c := range constraints {
+		stmt := `DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '` + c.name + `') THEN
+				ALTER TABLE ` + c.table + ` ADD CONSTRAINT ` + c.name + ` ` + c.spec + `;
+			END IF;
+		END $$;`
+		if err := db.Exec(stmt).Error; err != nil {
+			return fmt.Errorf("gate17 constraint %s: %w", c.name, err)
+		}
+	}
+
+	// Partial indexes. CREATE INDEX IF NOT EXISTS is natively idempotent, so
+	// these need no catalog guard - and they live in pg_indexes, not
+	// pg_constraint, which is why they are not folded into the loop above.
+	//
+	// Deliberately absent: UNIQUE (user_id, device_id) WHERE revoked_at IS NULL.
+	// NULLs compare distinct in PostgreSQL, so it would silently fail to
+	// constrain exactly the device_id IS NULL sessions this design produces,
+	// while reading as though one-live-session-per-device were enforced.
+	indexes := []struct{ name, spec string }{
+		{"ix_sessions_user_live",
+			"ON sessions (user_id) WHERE revoked_at IS NULL"},
+		{"ix_sessions_absolute_live",
+			"ON sessions (absolute_expires_at) WHERE revoked_at IS NULL"},
+		{"ix_sessions_device_live",
+			"ON sessions (device_id) WHERE revoked_at IS NULL AND device_id IS NOT NULL"},
+		{"ix_consumed_refresh_session",
+			"ON consumed_refresh (session_id, consumed_at DESC)"},
+		{"ix_consumed_refresh_reuse_window",
+			"ON consumed_refresh (reuse_window_expires_at)"},
+		{"ix_consumed_refresh_response_live",
+			"ON consumed_refresh (response_expires_at) WHERE response_ciphertext IS NOT NULL"},
+	}
+	for _, ix := range indexes {
+		if err := db.Exec("CREATE INDEX IF NOT EXISTS " + ix.name + " " + ix.spec).Error; err != nil {
+			return fmt.Errorf("gate17 index %s: %w", ix.name, err)
+		}
+	}
+
+	// Resurrection prevention, and immutability of the columns that decide whose
+	// session this is. Application code could enforce both, but application code
+	// is exactly what a future handler forgets; a revoked session becoming live
+	// again, or a session quietly changing owner, must be unrepresentable rather
+	// than merely unwritten.
+	if err := db.Exec(`
+		CREATE OR REPLACE FUNCTION gate17_sessions_guard() RETURNS trigger AS $$
+		BEGIN
+			IF OLD.revoked_at IS NOT NULL AND
+			   (NEW.revoked_at IS NULL OR NEW.revoked_at <> OLD.revoked_at) THEN
+				RAISE EXCEPTION 'gate17: revoked_at is write-once (session %)', OLD.id
+					USING ERRCODE = 'check_violation';
+			END IF;
+			IF NEW.user_id <> OLD.user_id THEN
+				RAISE EXCEPTION 'gate17: session user_id is immutable (session %)', OLD.id
+					USING ERRCODE = 'check_violation';
+			END IF;
+			-- device_id is WRITE-ONCE, not immutable-from-birth.
+			--
+			-- Exactly two transitions are permitted.
+			--
+			-- (1) Gate 18: detaching a session that is ALREADY revoked, and only
+			-- to NULL. That is what fk_sessions_device's ON DELETE SET NULL
+			-- performs after DeleteDevice has revoked the device's sessions in the
+			-- same transaction, and it is what lets a revoked session survive as a
+			-- historical record (with its fork evidence) once its device row is
+			-- gone.
+			--
+			-- (2) Phase 44: the FIRST attachment of a live, still-unbound session,
+			-- NULL -> a device. No authentication path knows a device - login,
+			-- both 2FA branches and QR claim all mint credentials before any
+			-- device has proven anything - so a session that could only ever be
+			-- bound at INSERT could never be bound at all, and device
+			-- authorization would stay decorative. RegisterDevice performs this
+			-- write in the same transaction that verifies proof of possession.
+			--
+			-- Everything else still raises, and the property Gate 18 actually
+			-- protects is untouched: no session, live or revoked, can ever be
+			-- re-bound from one device to a DIFFERENT one, and a live session can
+			-- never be detached. Since the FK action is an ordinary UPDATE, a
+			-- device with even one LIVE session still cannot be deleted; the
+			-- deletion fails closed instead of orphaning a credential.
+			IF NEW.device_id IS DISTINCT FROM OLD.device_id THEN
+				IF NOT (
+					(OLD.revoked_at IS NOT NULL AND NEW.device_id IS NULL) OR
+					(OLD.revoked_at IS NULL AND OLD.device_id IS NULL AND NEW.device_id IS NOT NULL)
+				) THEN
+					RAISE EXCEPTION 'gate18: session device_id is immutable while live (session %)', OLD.id
+						USING ERRCODE = 'check_violation';
+				END IF;
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;`).Error; err != nil {
+		return fmt.Errorf("gate17 guard function: %w", err)
+	}
+	if err := db.Exec(`DROP TRIGGER IF EXISTS trg_gate17_sessions_guard ON sessions`).Error; err != nil {
+		return fmt.Errorf("gate17 guard trigger drop: %w", err)
+	}
+	if err := db.Exec(`CREATE TRIGGER trg_gate17_sessions_guard
+		BEFORE UPDATE ON sessions
+		FOR EACH ROW EXECUTE FUNCTION gate17_sessions_guard()`).Error; err != nil {
+		return fmt.Errorf("gate17 guard trigger: %w", err)
+	}
+
+	// Password replacement revokes every session for that account, enforced at
+	// the row that changes rather than in the handler that usually changes it.
+	//
+	// F4 requires the revocation to share a transaction with the event causing
+	// it, and a trigger is the strongest form of that: it holds for the HTTP
+	// handlers AND for a reset script, an admin console or a manual UPDATE. A
+	// handler-only implementation would leave "password changed by any other
+	// means" as a silent hole, which is exactly the shape of bug this gate
+	// exists to remove.
+	if err := db.Exec(`
+		CREATE OR REPLACE FUNCTION gate17_revoke_on_password_change() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.password_hash IS DISTINCT FROM OLD.password_hash THEN
+				UPDATE sessions
+				   SET revoked_at    = COALESCE(revoked_at, clock_timestamp()),
+				       revoke_reason = COALESCE(revoke_reason, 'password_change'),
+				       refresh_hash  = NULL,
+				       updated_at    = clock_timestamp()
+				 WHERE user_id = NEW.id AND revoked_at IS NULL;
+				UPDATE consumed_refresh
+				   SET response_ciphertext = NULL, response_nonce = NULL
+				 WHERE response_ciphertext IS NOT NULL
+				   AND session_id IN (SELECT id FROM sessions WHERE user_id = NEW.id);
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;`).Error; err != nil {
+		return fmt.Errorf("gate17 password-change function: %w", err)
+	}
+	if err := db.Exec(`DROP TRIGGER IF EXISTS trg_gate17_password_change ON users`).Error; err != nil {
+		return fmt.Errorf("gate17 password trigger drop: %w", err)
+	}
+	if err := db.Exec(`CREATE TRIGGER trg_gate17_password_change
+		AFTER UPDATE OF password_hash ON users
+		FOR EACH ROW EXECUTE FUNCTION gate17_revoke_on_password_change()`).Error; err != nil {
+		return fmt.Errorf("gate17 password trigger: %w", err)
+	}
+
+	return verifyGate17Schema(db)
+}
+
+// verifyGate17Schema refuses to start unless every declared object exists.
+//
+// The statements above are idempotent and guarded, which means a silent no-op
+// looks identical to success. Reading the catalogs back is the only way to know
+// the difference between "already present" and "never created".
+func verifyGate17Schema(db *gorm.DB) error {
+	var missing []string
+
+	for _, name := range []string{
+		"fk_sessions_user", "fk_sessions_device",
+		"ck_sessions_refresh_hash_len", "ck_sessions_revoked_implies_no_hash",
+		"ck_sessions_absolute_after_created",
+		"fk_consumed_refresh_session", "ck_consumed_refresh_hash_len",
+		"ck_consumed_refresh_next_hash_len", "ck_consumed_refresh_window_order",
+	} {
+		var n int64
+		if err := db.Raw(`SELECT count(*) FROM pg_constraint WHERE conname = ?`, name).
+			Scan(&n).Error; err != nil {
+			return fmt.Errorf("gate17 verify constraint %s: %w", name, err)
+		}
+		if n == 0 {
+			missing = append(missing, "constraint "+name)
+		}
+	}
+
+	for _, name := range []string{
+		"ix_sessions_user_live", "ix_sessions_absolute_live", "ix_sessions_device_live",
+		"ix_consumed_refresh_session", "ix_consumed_refresh_reuse_window",
+		"ix_consumed_refresh_response_live",
+	} {
+		var n int64
+		if err := db.Raw(`SELECT count(*) FROM pg_indexes WHERE indexname = ?`, name).
+			Scan(&n).Error; err != nil {
+			return fmt.Errorf("gate17 verify index %s: %w", name, err)
+		}
+		if n == 0 {
+			missing = append(missing, "index "+name)
+		}
+	}
+
+	// Gate 18: the ACTION matters, not merely the constraint's existence. Model C
+	// depends on the FK nulling a revoked session's device pointer rather than
+	// refusing the delete, and the trigger depends on that action being an
+	// ordinary UPDATE it can veto. Read the action back from the catalog: a
+	// database still carrying RESTRICT would make DeleteDevice fail on any device
+	// that ever held a session.
+	var fkAction string
+	if err := db.Raw(`SELECT confdeltype FROM pg_constraint WHERE conname = 'fk_sessions_device'`).
+		Scan(&fkAction).Error; err != nil {
+		return fmt.Errorf("gate18 verify fk_sessions_device action: %w", err)
+	}
+	if fkAction != "n" {
+		missing = append(missing,
+			fmt.Sprintf("fk_sessions_device ON DELETE action is %q, want \"n\" (SET NULL)", fkAction))
+	}
+
+	for _, tg := range []string{"trg_gate17_sessions_guard", "trg_gate17_password_change"} {
+		var trg int64
+		if err := db.Raw(`SELECT count(*) FROM pg_trigger WHERE tgname = ?`, tg).
+			Scan(&trg).Error; err != nil {
+			return fmt.Errorf("gate17 verify trigger %s: %w", tg, err)
+		}
+		if trg == 0 {
+			missing = append(missing, "trigger "+tg)
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("gate17 schema incomplete, refusing to start: %s",
+			strings.Join(missing, ", "))
+	}
 	return nil
 }

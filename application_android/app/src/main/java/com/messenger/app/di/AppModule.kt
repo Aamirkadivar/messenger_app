@@ -2,11 +2,13 @@ package com.messenger.app.di
 
 import android.content.Context
 import com.messenger.app.BuildConfig
-import com.messenger.app.data.local.AuthDatabase
-import com.messenger.app.data.local.dao.CachedChatDao
-import com.messenger.app.data.local.dao.ConversationDao
-import com.messenger.app.data.local.dao.MessageDao
-import com.messenger.app.data.local.dao.UserDao
+import com.messenger.app.data.local.AccountCacheHolder
+import com.messenger.app.data.local.dao.ScopedMessageDao
+import com.messenger.app.data.local.dao.ScopedConversationDao
+import com.messenger.app.data.local.dao.ScopedUserDao
+import com.messenger.app.data.local.dao.ScopedCachedChatDao
+import com.messenger.app.data.local.dao.ScopedChatSyncStateDao
+import com.messenger.app.data.local.dao.ScopedOutboxDao
 import com.messenger.app.data.remote.TokenRefreshAuthenticator
 import com.messenger.app.data.remote.api.AuthApiService
 import com.messenger.app.data.remote.api.ChatApiService
@@ -69,13 +71,21 @@ object AppModule {
         authenticator: TokenRefreshAuthenticator,
         tokenManager: TokenManager
     ): OkHttpClient {
-        val logging = HttpLoggingInterceptor().apply {
-            level = if (BuildConfig.DEBUG) {
-                HttpLoggingInterceptor.Level.BODY
-            } else {
-                HttpLoggingInterceptor.Level.NONE
-            }
-        }
+        // HEADERS, never BODY. At BODY this interceptor wrote every request and
+        // response body to logcat, which on a debug build put real secrets there:
+        // the account password in POST /auth/login, access/refresh tokens in the
+        // 2FA response, and pw_wrapped_master_b64 - the password-wrapped vault
+        // master key - in PUT /e2ee/vault. Anything with adb or READ_LOGS could
+        // harvest them.
+        //
+        // HEADERS keeps what diagnostics actually need (method, URL, status,
+        // elapsed time, content length) and drops bodies entirely. A per-endpoint
+        // body allowlist was rejected deliberately: it rots the moment someone
+        // adds a sensitive route and forgets to list it.
+        //
+        // Authorization and Cookie are redacted by name because HEADERS would
+        // otherwise print the bearer token on every authenticated call.
+        val logging = secretSafeHttpLogger(debug = BuildConfig.DEBUG)
         val deviceIdInterceptor = okhttp3.Interceptor { chain ->
             val deviceId = kotlinx.coroutines.runBlocking {
                 tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
@@ -174,22 +184,38 @@ object AppModule {
     @Singleton
     fun provideHistoryArchiveFeature(): HistoryArchiveFeature = HistoryArchiveFeature.Default
 
+    // Gate 19: AuthDatabase is deliberately NOT bindable.
+    //
+    // A @Singleton AuthDatabase would be one shared cache for every account that
+    // ever signs in on this device, which is exactly the isolation failure this
+    // gate closes. The only way to obtain a handle is through AccountCacheHolder,
+    // which resolves the authenticated account first and opens that account's
+    // namespace. The DAOs below are account-scoped facades over it, so
+    // repositories keep the same types and none of their call sites change.
+
     @Provides
     @Singleton
-    fun provideAuthDatabase(@ApplicationContext context: Context): AuthDatabase =
-        AuthDatabase.getDatabase(context)
+    fun provideMessageDao(holder: AccountCacheHolder): ScopedMessageDao = ScopedMessageDao(holder)
 
     @Provides
-    fun provideMessageDao(db: AuthDatabase): MessageDao = db.messageDao()
+    @Singleton
+    fun provideConversationDao(holder: AccountCacheHolder): ScopedConversationDao = ScopedConversationDao(holder)
 
     @Provides
-    fun provideConversationDao(db: AuthDatabase): ConversationDao = db.conversationDao()
+    @Singleton
+    fun provideUserDao(holder: AccountCacheHolder): ScopedUserDao = ScopedUserDao(holder)
 
     @Provides
-    fun provideUserDao(db: AuthDatabase): UserDao = db.userDao()
+    @Singleton
+    fun provideCachedChatDao(holder: AccountCacheHolder): ScopedCachedChatDao = ScopedCachedChatDao(holder)
 
     @Provides
-    fun provideCachedChatDao(db: AuthDatabase): CachedChatDao = db.cachedChatDao()
+    @Singleton
+    fun provideOutboxDao(holder: AccountCacheHolder): ScopedOutboxDao = ScopedOutboxDao(holder)
+
+    @Provides
+    @Singleton
+    fun provideChatSyncStateDao(holder: AccountCacheHolder): ScopedChatSyncStateDao = ScopedChatSyncStateDao(holder)
 
     @Provides
     @Singleton
@@ -210,10 +236,15 @@ object AppModule {
         authApiService: AuthApiService,
         tokenManager: TokenManager,
         keyStoreManager: KeyStoreManager,
-        userDao: UserDao,
-        e2eeSession: dagger.Lazy<E2EEVaultRepository>
+        userDao: ScopedUserDao,
+        e2eeSession: dagger.Lazy<E2EEVaultRepository>,
+        cacheHolder: AccountCacheHolder,
+        chatState: dagger.Lazy<ChatRepository>
     ): AuthRepository =
-        AuthRepository(authApiService, tokenManager, keyStoreManager, userDao, e2eeSession)
+        AuthRepository(
+            authApiService, tokenManager, keyStoreManager, userDao,
+            e2eeSession, cacheHolder, chatState
+        )
 
     /**
      * Scope for work that must outlive any one screen - notably the storage
@@ -280,9 +311,9 @@ object AppModule {
     @Singleton
     fun provideChatRepository(
         chatApiService: ChatApiService,
-        messageDao: MessageDao,
-        conversationDao: ConversationDao,
-        cachedChatDao: CachedChatDao,
+        messageDao: ScopedMessageDao,
+        conversationDao: ScopedConversationDao,
+        cachedChatDao: ScopedCachedChatDao,
         webSocketManager: WebSocketManager,
         tokenManager: TokenManager,
         groupRepository: GroupRepository,
@@ -293,7 +324,9 @@ object AppModule {
         messageArchiver: dagger.Lazy<MessageArchiver>,
         // Lazy for the same cycle reason: ArchiveSync reaches MessageArchiver and
         // the vault, both of which reach back to this repository.
-        archiveSync: dagger.Lazy<ArchiveSync>
+        archiveSync: dagger.Lazy<ArchiveSync>,
+        outboxDao: ScopedOutboxDao,
+        syncStateDao: ScopedChatSyncStateDao
     ): ChatRepository = ChatRepository(
         chatApiService, messageDao, conversationDao, cachedChatDao, webSocketManager, tokenManager,
         groupRepository, json,
@@ -305,7 +338,15 @@ object AppModule {
         onArchiveMessage = { userId, chatId, messageId, plaintext ->
             archiveSync.get().sealAndUpload(userId, chatId, messageId, plaintext)
         },
-        onArchiveFetch = { chatId -> archiveSync.get().downloadFor(chatId) }
+        onArchiveFetch = { chatId -> archiveSync.get().downloadFor(chatId) },
+        // The read half of Layer B. Opening is deliberately NOT gated on the archive
+        // feature flag: turning sealing off must never make already-archived history
+        // unreadable.
+        onArchiveOpen = { userId, chatId, messageId, rootVersion, ciphertextB64 ->
+            messageArchiver.get().open(userId, chatId, messageId, rootVersion, ciphertextB64)
+        },
+        outboxDao = outboxDao,
+        syncStateDao = syncStateDao
     )
 
     @Provides
@@ -316,4 +357,34 @@ object AppModule {
         chatRepository: ChatRepository,
         okHttpClient: OkHttpClient
     ): AttachmentRepository = AttachmentRepository(context, chatApiService, chatRepository, okHttpClient)
+}
+
+/**
+ * HTTP logger for the app's OkHttp client: HEADERS, never BODY.
+ *
+ * At [HttpLoggingInterceptor.Level.BODY] this wrote every request and response
+ * body to logcat, which on a debug build put real secrets there - the account
+ * password in `POST /auth/login`, access/refresh tokens in the 2FA response, and
+ * `pw_wrapped_master_b64` (the password-wrapped vault master key) in
+ * `PUT /e2ee/vault`. Anything holding adb or READ_LOGS could harvest them.
+ *
+ * HEADERS keeps what diagnostics actually need - method, URL, status, elapsed
+ * time, content length - and drops bodies entirely. A per-endpoint body
+ * allowlist was rejected deliberately: it rots the moment someone adds a
+ * sensitive route and forgets to list it.
+ *
+ * `Authorization` and `Cookie` are redacted by name, because HEADERS would
+ * otherwise print the bearer token on every authenticated call.
+ */
+internal fun secretSafeHttpLogger(
+    debug: Boolean,
+    logger: HttpLoggingInterceptor.Logger = HttpLoggingInterceptor.Logger.DEFAULT,
+): HttpLoggingInterceptor = HttpLoggingInterceptor(logger).apply {
+    redactHeader("Authorization")
+    redactHeader("Cookie")
+    level = if (debug) {
+        HttpLoggingInterceptor.Level.HEADERS
+    } else {
+        HttpLoggingInterceptor.Level.NONE
+    }
 }

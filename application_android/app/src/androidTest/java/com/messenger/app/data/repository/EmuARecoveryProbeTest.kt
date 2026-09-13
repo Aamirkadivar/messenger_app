@@ -5,11 +5,13 @@ import android.util.Log
 import androidx.test.platform.app.InstrumentationRegistry
 import com.messenger.app.BuildConfig
 import com.messenger.app.data.encryption.MlsClient
+import com.messenger.app.data.remote.SessionRefresher
 import com.messenger.app.data.remote.TokenRefreshAuthenticator
 import com.messenger.app.data.remote.api.AuthApiService
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.security.KeyStoreManagerImpl
 import com.messenger.app.security.TokenManagerImpl
+import javax.inject.Provider
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
@@ -29,6 +31,9 @@ import retrofit2.converter.kotlinx.serialization.asConverterFactory
  * syncHandshakes is deliberately NOT used because it persists on success.
  */
 class EmuARecoveryProbeTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "EMUAPROBE"
@@ -61,7 +66,7 @@ class EmuARecoveryProbeTest {
             .client(OkHttpClient()).addConverterFactory(json.asConverterFactory(ct))
             .build().create(AuthApiService::class.java)
         val client = OkHttpClient.Builder()
-            .authenticator(TokenRefreshAuthenticator(tm) { authApi }).build()
+            .authenticator(TokenRefreshAuthenticator(SessionRefresher(tm, Provider { authApi }))).build()
         val api: ChatApiService = Retrofit.Builder().baseUrl(BuildConfig.API_BASE_URL)
             .client(client).addConverterFactory(json.asConverterFactory(ct))
             .build().create(ChatApiService::class.java)
@@ -75,11 +80,11 @@ class EmuARecoveryProbeTest {
         p("identity : $user|$dev")
         if (dev != EMUA_DEV) { p("ABORT: not EMU-A"); return@runBlocking }
 
-        val gid = Base64.decode(tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
+        val gid = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
         p("local GID       : ${gid.hex()}")
         p("GID matches srv : ${gid.hex() == EXPECTED_GID}")
 
-        val blob = Base64.decode(tm.loadMlsBundle(SNAPSHOT_KEY).getOrNull(), Base64.NO_WRAP)
+        val blob = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, SNAPSHOT_KEY).getOrNull(), Base64.NO_WRAP)
         p("snapshot bytes  : ${blob.size}")
         p("storage entries : ${entries(blob)}")
 

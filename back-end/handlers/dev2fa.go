@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -101,7 +102,19 @@ func issueDev2FAChallenge(user models.User, cfg *config.Config) (challengeID str
 	return id, nil
 }
 
+// errPasswordResetUnavailable: there is no delivery mechanism for a reset code.
+var errPasswordResetUnavailable = errors.New("password reset code delivery unavailable")
+
+// issuePasswordResetChallenge creates a reset challenge and delivers its code.
+//
+// The DEV relay is the only delivery mechanism this server has, so a challenge
+// may exist only when that relay may run. Outside the explicit development
+// configuration nothing is created: a challenge whose code went nowhere is
+// useless to its owner, and anything else that "delivered" it would be a leak.
 func issuePasswordResetChallenge(user models.User, cfg *config.Config) (challengeID string, err error) {
+	if !Dev2FAEnabled(cfg) {
+		return "", errPasswordResetUnavailable
+	}
 	code, err := generateOTPCode()
 	if err != nil {
 		return "", err
@@ -128,21 +141,32 @@ func issuePasswordResetChallenge(user models.User, cfg *config.Config) (challeng
 	return id, nil
 }
 
+// relayDevOTPCode delivers an OTP to the configured DEV relay account as a
+// plaintext chat message. It is a development convenience and nothing else:
+//
+//   - It runs only when Dev2FAEnabled (ENV=development AND DEV_2FA_ENABLED=true).
+//     Every caller is expected to have checked already; this repeats the check so
+//     that no future caller can reach it by forgetting to.
+//   - It never logs the code, nor the target's email or username. A log line is
+//     readable by far more people than the relay account, lives far longer than
+//     the five-minute challenge, and a reset code in it is an account takeover.
 func relayDevOTPCode(cfg *config.Config, forUser models.User, code, challengeID, kind string) {
+	if !Dev2FAEnabled(cfg) {
+		return
+	}
 	relayUser := cfg.Dev2FARelayUsername
 	if relayUser == "" {
 		relayUser = "koueosh"
 	}
 
-	// Always log in development when 2FA is on — tester convenience.
-	log.Printf("[dev_2fa_relay] kind=%s challenge=%s account=%s (@%s) code=%s relay_to=@%s",
-		kind, challengeID, forUser.Email, forUser.Username, code, relayUser)
-
 	var dest models.User
 	if err := database.DB.Where("username = ?", relayUser).First(&dest).Error; err != nil {
-		log.Printf("[dev_2fa_relay] relay user @%s not found — code only in server log", relayUser)
+		log.Printf("[dev_2fa_relay] kind=%s challenge=%s user=%s: relay account not found, code not delivered",
+			kind, challengeID, forUser.ID)
 		return
 	}
+	log.Printf("[dev_2fa_relay] kind=%s challenge=%s user=%s: code relayed to the dev relay account",
+		kind, challengeID, forUser.ID)
 
 	bot := ensureDev2FABot()
 	if bot == nil {
@@ -293,7 +317,10 @@ func (h *AuthService) Verify2FA(c *fiber.Ctx) error {
 		otpMu.Lock()
 		delete(otpChallenges, input.ChallengeID)
 		otpMu.Unlock()
-		return issueLoginTokens(c, user, cfg)
+		// Password AND a verified TOTP code (or a backup code, which is the same
+		// enrolled factor spent a different way). This is the ONLY path in the
+		// codebase that grants ACCOUNT-RECOVERY AUTHORITY.
+		return issueLoginTokens(c, user, cfg, true)
 	}
 
 	if ch.Purpose != "2fa" {
@@ -314,5 +341,10 @@ func (h *AuthService) Verify2FA(c *fiber.Ctx) error {
 	if err := database.DB.First(&user, "id = ?", ch.UserID).Error; err != nil {
 		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid or expired code"})
 	}
-	return issueLoginTokens(c, user, cfg)
+	// The DEV relay factor. It authenticates, but it does NOT grant recovery
+	// authority: it exists only under ENV=development with DEV_2FA_ENABLED, and
+	// it relays a code to a chat username rather than proving possession of an
+	// enrolled authenticator. Treating it as equivalent to TOTP would make the
+	// policy satisfiable by a development convenience.
+	return issueLoginTokens(c, user, cfg, false)
 }

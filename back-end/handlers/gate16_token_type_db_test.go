@@ -16,6 +16,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"messenger-app/config"
 	"messenger-app/database"
@@ -54,6 +55,20 @@ type gate16Env struct {
 	app  *fiber.App
 	cfg  *config.Config
 	user models.User
+	// sessionID backs the access token. Gate 17 requires a live session behind
+	// every access credential, so the harness creates a real one rather than a
+	// placeholder - otherwise "access token is allowed" would pass for the wrong
+	// reason.
+	sessionID uuid.UUID
+	// refreshPlain is the session's real opaque refresh credential.
+	//
+	// RECORDED GATE 16 SCOPE MIGRATION: refresh credentials are no longer JWTs.
+	// The assertions below are unchanged - a refresh credential is accepted at
+	// /auth/refresh and refused everywhere else, an access token is refused at
+	// /auth/refresh - only the credential's representation changed, because
+	// Gate 17 replaced it. Keeping a session-less JWT working here would have
+	// preserved the exact defect Gate 17 exists to remove.
+	refreshPlain string
 }
 
 func gate16Setup(t *testing.T) *gate16Env {
@@ -88,6 +103,18 @@ func gate16Setup(t *testing.T) *gate16Env {
 	// /ws is mounted on the root app with only WebSocketAuth in front of it. A
 	// flat app.Group("") here would mount AuthMiddleware at "/" and wrongly
 	// capture /ws too, which is a harness artifact rather than real behaviour.
+	var (
+		sessionID    uuid.UUID
+		refreshPlain string
+	)
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		sessionID, refreshPlain, err = createSession(tx, cfg, u.ID, nil, nil)
+		return err
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
 	auth := NewAuthService()
 	app := fiber.New()
 	api := app.Group("/api/v1")
@@ -111,7 +138,7 @@ func gate16Setup(t *testing.T) *gate16Env {
 		return c.JSON(fiber.Map{"user_id": middleware.GetCurrentUserID(c)})
 	})
 
-	return &gate16Env{app: app, cfg: cfg, user: u}
+	return &gate16Env{app: app, cfg: cfg, user: u, sessionID: sessionID, refreshPlain: refreshPlain}
 }
 
 func (e *gate16Env) do(t *testing.T, method, path, body, bearer string) (int, string) {
@@ -152,7 +179,10 @@ func (e *gate16Env) wsWith(t *testing.T, token string) int {
 
 func (e *gate16Env) refreshWith(t *testing.T, token string) (int, string, string) {
 	t.Helper()
-	body, _ := json.Marshal(map[string]string{"refresh_token": token})
+	body, _ := json.Marshal(map[string]string{
+		"refresh_token": token,
+		"request_id":    uuid.New().String(),
+	})
 	code, raw := e.do(t, http.MethodPost, "/api/v1/auth/refresh", string(body), "")
 	var parsed struct {
 		Tokens struct {
@@ -189,14 +219,12 @@ func (e *gate16Env) mintRaw(t *testing.T, use interface{}, exp time.Time, secret
 // ------------------------------------------------------------ 1-4, 11-14
 func TestGate16_TokenTypeBoundary(t *testing.T) {
 	e := gate16Setup(t)
-	access, err := middleware.GenerateToken(e.user.ID, e.user.Email, e.user.DisplayName, e.cfg)
+	access, err := middleware.GenerateToken(e.user.ID, e.user.Email, e.user.DisplayName, e.sessionID, e.cfg)
 	if err != nil {
 		t.Fatalf("access: %v", err)
 	}
-	refresh, err := middleware.GenerateRefreshToken(e.user.ID, e.cfg)
-	if err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
+	// The session's genuine opaque refresh credential (see refreshPlain).
+	refresh := e.refreshPlain
 
 	t.Run("1 access to protected route is allowed", func(t *testing.T) {
 		if code := e.protectedWith(t, access); code != http.StatusOK {
@@ -312,7 +340,7 @@ func TestGate16_CrossAccountIsolationStillSafe(t *testing.T) {
 	if err := database.DB.Create(&other).Error; err != nil {
 		t.Fatalf("seed other: %v", err)
 	}
-	access, _ := middleware.GenerateToken(e.user.ID, e.user.Email, e.user.DisplayName, e.cfg)
+	access, _ := middleware.GenerateToken(e.user.ID, e.user.Email, e.user.DisplayName, e.sessionID, e.cfg)
 
 	code, raw := e.do(t, http.MethodGet, "/api/v1/protected", "", access)
 	if code != http.StatusOK {
@@ -355,7 +383,7 @@ func TestGate16_QRIssuedTokensObeyTheBoundary(t *testing.T) {
 
 	// Approval is authenticated: it needs a real ACCESS token, which itself
 	// exercises the new boundary on the approving side.
-	approver, _ := middleware.GenerateToken(e.user.ID, e.user.Email, e.user.DisplayName, e.cfg)
+	approver, _ := middleware.GenerateToken(e.user.ID, e.user.Email, e.user.DisplayName, e.sessionID, e.cfg)
 	appBody, _ := json.Marshal(map[string]string{
 		"session_id": start.SessionID, "scan_secret": start.ScanSecret,
 	})

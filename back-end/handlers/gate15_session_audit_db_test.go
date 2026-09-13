@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"messenger-app/config"
 	"messenger-app/database"
@@ -68,7 +70,21 @@ func gate15Setup(t *testing.T) *gate15Env {
 		return c.JSON(fiber.Map{"user_id": middleware.GetCurrentUserID(c)})
 	})
 
-	access, err := middleware.GenerateToken(u.ID, u.Email, u.DisplayName, cfg)
+	// Gate 17 mechanism migration (recorded scope change). The access token now
+	// carries a sid that must resolve to a live session, so the setup creates a
+	// real one. This STRENGTHENS the assertions below rather than relaxing them:
+	// "an existing access token still authenticates after the password was
+	// replaced" is only a meaningful test if the token genuinely worked to begin
+	// with. Every original assertion is unchanged.
+	var sessionID uuid.UUID
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		sessionID, _, err = createSession(tx, cfg, u.ID, nil, nil)
+		return err
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	access, err := middleware.GenerateToken(u.ID, u.Email, u.DisplayName, sessionID, cfg)
 	if err != nil {
 		t.Fatalf("generate access token: %v", err)
 	}
@@ -92,7 +108,10 @@ func (e *gate15Env) bearer(t *testing.T, token string) int {
 // freshly minted pair, if any.
 func (e *gate15Env) refresh(t *testing.T, token string) (int, string, string) {
 	t.Helper()
-	body, _ := json.Marshal(map[string]string{"refresh_token": token})
+	body, _ := json.Marshal(map[string]string{
+		"refresh_token": token,
+		"request_id":    uuid.New().String(),
+	})
 	req := httptest.NewRequest(http.MethodPost, "/auth/refresh", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := e.app.Test(req, -1)
@@ -110,14 +129,38 @@ func (e *gate15Env) refresh(t *testing.T, token string) (int, string, string) {
 	return resp.StatusCode, parsed.Tokens.AccessToken, parsed.Tokens.RefreshToken
 }
 
+// mintLegacyRefreshJWT is TEST-ONLY legacy infrastructure.
+//
+// Production no longer mints JWT refresh tokens: Gate 17 replaced them with
+// opaque, session-bound credentials, and middleware.GenerateRefreshToken was
+// deleted so no production path can mint one again. The proofs below still need
+// to BUILD such a token in order to assert it is REFUSED, so the minting lives
+// here in the test binary, out of reach of the server.
+//
+// It reproduces the removed function exactly - same claims, same signing method,
+// same secret - so the assertions below are unchanged in substance.
+func mintLegacyRefreshJWT(userID uuid.UUID, cfg *config.Config) (string, error) {
+	claims := &middleware.JWTClaims{
+		UserID:   userID,
+		TokenUse: middleware.TokenUseRefresh,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(
+				time.Now().Add(time.Duration(cfg.RefreshTokenExpiration) * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			NotBefore: jwt.NewNumericDate(time.Now()),
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(cfg.JWTSecret))
+}
+
 // ---------------------------------------------------------------- token confusion
 //
-// GenerateToken and GenerateRefreshToken emit the SAME JWTClaims type, signed
-// with the SAME secret and algorithm, and nothing in the claims marks which is
-// which. AuthMiddleware verifies only the signature and expiry.
+// GenerateToken and the legacy refresh mint emit the SAME JWTClaims type, signed
+// with the SAME secret and algorithm; only token_use distinguishes them.
+// AuthMiddleware verifies the signature, the expiry and that discriminator.
 func TestGate15_RefreshTokenIsAcceptedAsAnAccessToken(t *testing.T) {
 	e := gate15Setup(t)
-	refreshTok, err := middleware.GenerateRefreshToken(e.user.ID, e.cfg)
+	refreshTok, err := mintLegacyRefreshJWT(e.user.ID, e.cfg)
 	if err != nil {
 		t.Fatalf("generate refresh token: %v", err)
 	}
@@ -152,7 +195,7 @@ func TestGate15_AccessTokenIsAcceptedAsARefreshToken(t *testing.T) {
 // ---------------------------------------------------------------- replay matrix
 func TestGate15_RefreshReplayMatrix(t *testing.T) {
 	e := gate15Setup(t)
-	seed, err := middleware.GenerateRefreshToken(e.user.ID, e.cfg)
+	seed, err := mintLegacyRefreshJWT(e.user.ID, e.cfg)
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -224,7 +267,7 @@ func TestGate15_RevokedCredentialMintsAnUnboundedChain(t *testing.T) {
 	database.DB.Model(&models.User{}).Where("id = ?", e.user.ID).
 		Update("password_hash", "ROTATED-AFTER-COMPROMISE")
 
-	current, err := middleware.GenerateRefreshToken(e.user.ID, e.cfg)
+	current, err := mintLegacyRefreshJWT(e.user.ID, e.cfg)
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -279,7 +322,7 @@ func TestGate15_CrossAccountCredentialIsolation(t *testing.T) {
 	}
 
 	// A token signed with a different secret must not authenticate at all.
-	forged, err := middleware.GenerateToken(other.ID, other.Email, other.DisplayName,
+	forged, err := middleware.GenerateToken(other.ID, other.Email, other.DisplayName, uuid.New(),
 		&config.Config{JWTSecret: "a-different-signing-secret", JWTExpiration: 24})
 	if err != nil {
 		t.Fatalf("generate forged: %v", err)

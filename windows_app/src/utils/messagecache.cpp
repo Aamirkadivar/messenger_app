@@ -8,23 +8,90 @@
 #include <QJsonDocument>
 #include <QDateTime>
 #include <QFileInfo>
+#include <QFile>
+#include <QCryptographicHash>
 
 MessageCache::MessageCache(QObject* parent)
     : QObject(parent)
 {
+    // Deliberately empty. There is no account yet at construction time, and a
+    // cache opened before anyone has authenticated is by definition shared.
+    // openForAccount() is the only way in.
+}
+
+QString MessageCache::legacyQuarantinedFileName() {
+    return QStringLiteral("message_cache.db");
+}
+
+QString MessageCache::databaseNameForAccount(const QString& accountId) {
+    const QString canonical = accountId.trimmed();
+    if (canonical.isEmpty()) {
+        return QString();
+    }
+    const QByteArray digest = QCryptographicHash::hash(
+        canonical.toUtf8(), QCryptographicHash::Sha256);
+    // 16 bytes -> 32 hex chars. Hex only, so the account id can never influence
+    // the path: no separators, no traversal, no reserved device names.
+    return QStringLiteral("message_cache_") + QString::fromLatin1(digest.left(16).toHex()) +
+           QStringLiteral(".db");
+}
+
+void MessageCache::openForAccount(const QString& accountId) {
+    const QString fileName = databaseNameForAccount(accountId);
+    if (fileName.isEmpty()) {
+        qWarning() << "[MessageCache] refusing to open a cache for a blank account id";
+        close();
+        return;
+    }
+    if (m_db.isOpen() && m_accountId == accountId.trimmed()) {
+        return; // already bound to this account
+    }
+
+    // Close the previous account BEFORE touching the new one, so two namespaces
+    // are never open at once.
+    close();
+
     QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(dir);
 
-    // A named (non-default) connection, since QSqlDatabase's default
-    // connection is process-global and other code may open its own handles.
-    m_db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("message_cache"));
-    m_db.setDatabaseName(dir + QStringLiteral("/message_cache.db"));
+    // The connection name is per-account too: QSqlDatabase connection names are
+    // process-global, so reusing one name across accounts would hand the second
+    // account the first one's still-registered handle.
+    m_connectionName = QStringLiteral("message_cache_") +
+                       QString::fromLatin1(QCryptographicHash::hash(
+                           accountId.trimmed().toUtf8(), QCryptographicHash::Sha256)
+                           .left(16).toHex());
+    m_db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), m_connectionName);
+    m_db.setDatabaseName(dir + QStringLiteral("/") + fileName);
 
     if (!m_db.open()) {
         qWarning() << "[MessageCache] Failed to open cache database:" << m_db.lastError().text();
+        m_accountId.clear();
         return;
     }
+    m_accountId = accountId.trimmed();
     ensureSchema();
+}
+
+void MessageCache::close() {
+    const QString name = m_connectionName;
+    if (m_db.isOpen()) {
+        m_db.close();
+    }
+    m_db = QSqlDatabase();
+    m_accountId.clear();
+    m_connectionName.clear();
+    if (!name.isEmpty()) {
+        // Must happen after every QSqlDatabase copy is out of scope, or Qt warns
+        // and keeps the connection alive - which would leave the previous
+        // account's handle reachable.
+        QSqlDatabase::removeDatabase(name);
+    }
+}
+
+bool MessageCache::ownedBy(const QString& owner) const {
+    if (!m_db.isOpen() || m_accountId.isEmpty()) return false;
+    return owner.trimmed() == m_accountId;
 }
 
 void MessageCache::ensureSchema() {
@@ -71,10 +138,46 @@ void MessageCache::ensureSchema() {
         "  cached_at TEXT NOT NULL"
         ")"
     ));
+    // Phase 71: the durable outbox and the per-chat sync point. See the header.
+    query.exec(QStringLiteral(
+        "CREATE TABLE IF NOT EXISTS outbox ("
+        "  client_message_id TEXT PRIMARY KEY,"
+        "  chat_id TEXT NOT NULL,"
+        "  chat_type TEXT NOT NULL,"
+        "  request_json TEXT NOT NULL,"
+        "  state TEXT NOT NULL,"
+        "  created_at INTEGER NOT NULL,"
+        "  attempts INTEGER NOT NULL DEFAULT 0,"
+        "  next_attempt_at INTEGER NOT NULL DEFAULT 0,"
+        "  last_error TEXT,"
+        "  server_message_id TEXT,"
+        "  accepted_at INTEGER"
+        ")"
+    ));
+    query.exec(QStringLiteral(
+        "CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(state, next_attempt_at)"
+    ));
+    query.exec(QStringLiteral(
+        "CREATE TABLE IF NOT EXISTS sync_state ("
+        "  chat_id TEXT PRIMARY KEY,"
+        "  last_seq INTEGER NOT NULL,"
+        "  backfill_before INTEGER NOT NULL DEFAULT -1,"
+        "  updated_at INTEGER NOT NULL"
+        ")"
+    ));
 }
 
-void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entries) {
-    if (!m_db.isOpen() || entries.isEmpty()) return;
+void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entries,
+                                const QString& owner) {
+    if (entries.isEmpty()) return;
+    if (!ownedBy(owner)) {
+        // Either nobody is signed in, or this reply outlived the session that
+        // issued it. Dropping the rows loses a cache entry; writing them would
+        // put one account's history into another's database.
+        qWarning() << "[MessageCache] dropping" << entries.size()
+                   << "cached message(s): the owning session is no longer active";
+        return;
+    }
 
     QSqlQuery query(m_db);
     query.prepare(QStringLiteral(
@@ -130,6 +233,14 @@ void MessageCache::saveMessages(const QString& chatId, const QList<Entry>& entri
     m_db.commit();
 }
 
+MessageCache::Entry MessageCache::withRecoveredPlaintext(const Entry& source,
+                                                         const QString& plaintext) {
+    Entry e = source;
+    e.content = plaintext;
+    e.encrypted = false;
+    return e;
+}
+
 QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int limit) const {
     QList<Entry> result;
     if (!m_db.isOpen()) return result;
@@ -176,8 +287,12 @@ QList<MessageCache::Entry> MessageCache::loadMessages(const QString& chatId, int
     return result;
 }
 
-void MessageCache::saveChats(const QList<QJsonObject>& chats) {
-    if (!m_db.isOpen() || chats.isEmpty()) return;
+void MessageCache::saveChats(const QList<QJsonObject>& chats, const QString& owner) {
+    if (chats.isEmpty()) return;
+    if (!ownedBy(owner)) {
+        qWarning() << "[MessageCache] dropping cached chat list: the owning session is no longer active";
+        return;
+    }
 
     QSqlQuery query(m_db);
     query.prepare(QStringLiteral(
@@ -229,6 +344,12 @@ void MessageCache::deleteChat(const QString& chatId) {
     query.prepare(QStringLiteral("DELETE FROM chats WHERE id = ?"));
     query.addBindValue(chatId);
     query.exec();
+    // Its history is gone from this device, so its sync point is too: the next
+    // catch-up re-anchors at the head instead of believing everything up to the
+    // old point is still here. Unsent messages in the outbox are NOT touched.
+    query.prepare(QStringLiteral("DELETE FROM sync_state WHERE chat_id = ?"));
+    query.addBindValue(chatId);
+    query.exec();
     // No VACUUM, unlike clear() below: reclaiming pages rewrites the entire
     // database file, which is far too heavy for dropping one conversation.
 }
@@ -248,6 +369,9 @@ void MessageCache::clear() {
     QSqlQuery query(m_db);
     query.exec(QStringLiteral("DELETE FROM messages"));
     query.exec(QStringLiteral("DELETE FROM chats"));
+    // Sync points describe the history just deleted. The outbox is deliberately
+    // kept: clearing a cache must never lose a message that has not been sent.
+    query.exec(QStringLiteral("DELETE FROM sync_state"));
     // Reclaims the space the deleted rows occupied - without this, SQLite
     // keeps the file at its previous size until something else writes over
     // the freed pages, so "clear cache" wouldn't actually shrink anything.
@@ -256,4 +380,194 @@ void MessageCache::clear() {
 
 qint64 MessageCache::sizeBytes() const {
     return QFileInfo(m_db.databaseName()).size();
+}
+
+// ------------------------------------------------------------------ Phase 71
+
+namespace {
+const char* kOutboxColumns =
+    "client_message_id, chat_id, chat_type, request_json, state, created_at, attempts, "
+    "next_attempt_at, last_error, server_message_id, accepted_at";
+
+MessageCache::OutboxItem outboxRow(const QSqlQuery& q) {
+    MessageCache::OutboxItem it;
+    it.clientMessageId = q.value(0).toString();
+    it.chatId = q.value(1).toString();
+    it.chatType = q.value(2).toString();
+    it.requestJson = q.value(3).toString();
+    it.state = q.value(4).toString();
+    it.createdAt = q.value(5).toLongLong();
+    it.attempts = q.value(6).toInt();
+    it.nextAttemptAt = q.value(7).toLongLong();
+    it.lastError = q.value(8).toString();
+    it.serverMessageId = q.value(9).toString();
+    it.acceptedAt = q.value(10).toLongLong();
+    return it;
+}
+} // namespace
+
+bool MessageCache::insertOutbox(const OutboxItem& item, const QString& owner) {
+    if (!ownedBy(owner)) {
+        qWarning() << "[MessageCache] refusing an outbox write: the owning session is no longer active";
+        return false;
+    }
+    QSqlQuery q(m_db);
+    // Plain INSERT, never REPLACE: a client_message_id is minted once.
+    q.prepare(QStringLiteral("INSERT INTO outbox (%1) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                  .arg(QLatin1String(kOutboxColumns)));
+    q.addBindValue(item.clientMessageId);
+    q.addBindValue(item.chatId);
+    q.addBindValue(item.chatType);
+    q.addBindValue(item.requestJson);
+    q.addBindValue(item.state);
+    q.addBindValue(item.createdAt);
+    q.addBindValue(item.attempts);
+    q.addBindValue(item.nextAttemptAt);
+    q.addBindValue(item.lastError.isEmpty() ? QVariant() : QVariant(item.lastError));
+    q.addBindValue(item.serverMessageId.isEmpty() ? QVariant() : QVariant(item.serverMessageId));
+    q.addBindValue(item.acceptedAt > 0 ? QVariant(item.acceptedAt) : QVariant());
+    if (!q.exec()) {
+        qWarning() << "[MessageCache] outbox insert refused:" << q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+bool MessageCache::outboxItem(const QString& clientMessageId, OutboxItem* out) const {
+    if (!m_db.isOpen()) return false;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT %1 FROM outbox WHERE client_message_id = ?")
+                  .arg(QLatin1String(kOutboxColumns)));
+    q.addBindValue(clientMessageId);
+    if (!q.exec() || !q.next()) return false;
+    if (out) *out = outboxRow(q);
+    return true;
+}
+
+QList<MessageCache::OutboxItem> MessageCache::dueOutbox(qint64 now) const {
+    QList<OutboxItem> rows;
+    if (!m_db.isOpen()) return rows;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT %1 FROM outbox WHERE state = 'PENDING' AND next_attempt_at <= ? "
+                             "ORDER BY created_at, client_message_id").arg(QLatin1String(kOutboxColumns)));
+    q.addBindValue(now);
+    if (q.exec()) while (q.next()) rows << outboxRow(q);
+    return rows;
+}
+
+QList<MessageCache::OutboxItem> MessageCache::unacceptedOutbox(const QString& chatId) const {
+    QList<OutboxItem> rows;
+    if (!m_db.isOpen()) return rows;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT %1 FROM outbox WHERE chat_id = ? AND state != 'ACCEPTED' "
+                             "ORDER BY created_at, client_message_id").arg(QLatin1String(kOutboxColumns)));
+    q.addBindValue(chatId);
+    if (q.exec()) while (q.next()) rows << outboxRow(q);
+    return rows;
+}
+
+qint64 MessageCache::earliestPendingOutbox() const {
+    if (!m_db.isOpen()) return -1;
+    QSqlQuery q(m_db);
+    if (!q.exec(QStringLiteral("SELECT MIN(next_attempt_at) FROM outbox WHERE state = 'PENDING'"))
+        || !q.next() || q.value(0).isNull()) {
+        return -1;
+    }
+    return q.value(0).toLongLong();
+}
+
+void MessageCache::markOutboxAccepted(const QString& clientMessageId, const QString& serverId, qint64 at,
+                                      const QString& owner) {
+    if (!ownedBy(owner)) return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE outbox SET state = 'ACCEPTED', server_message_id = ?, accepted_at = ?, "
+                             "last_error = NULL WHERE client_message_id = ?"));
+    q.addBindValue(serverId);
+    q.addBindValue(at);
+    q.addBindValue(clientMessageId);
+    q.exec();
+}
+
+void MessageCache::markOutboxRetry(const QString& clientMessageId, int attempts, qint64 nextAttemptAt,
+                                   const QString& error, const QString& owner) {
+    if (!ownedBy(owner)) return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE outbox SET attempts = ?, next_attempt_at = ?, last_error = ? "
+                             "WHERE client_message_id = ? AND state = 'PENDING'"));
+    q.addBindValue(attempts);
+    q.addBindValue(nextAttemptAt);
+    q.addBindValue(error);
+    q.addBindValue(clientMessageId);
+    q.exec();
+}
+
+void MessageCache::markOutboxFailed(const QString& clientMessageId, int attempts, const QString& error,
+                                    const QString& owner) {
+    if (!ownedBy(owner)) return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE outbox SET state = 'FAILED', attempts = ?, last_error = ? "
+                             "WHERE client_message_id = ? AND state = 'PENDING'"));
+    q.addBindValue(attempts);
+    q.addBindValue(error);
+    q.addBindValue(clientMessageId);
+    q.exec();
+}
+
+bool MessageCache::resetOutboxForRetry(const QString& clientMessageId, qint64 now, const QString& owner) {
+    if (!ownedBy(owner)) return false;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE outbox SET state = 'PENDING', attempts = 0, next_attempt_at = ?, "
+                             "last_error = NULL WHERE client_message_id = ? AND state = 'FAILED'"));
+    q.addBindValue(now);
+    q.addBindValue(clientMessageId);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+void MessageCache::pruneAcceptedOutbox(qint64 olderThan, const QString& owner) {
+    if (!ownedBy(owner)) return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM outbox WHERE state = 'ACCEPTED' AND accepted_at < ?"));
+    q.addBindValue(olderThan);
+    q.exec();
+}
+
+bool MessageCache::loadSyncPoint(const QString& chatId, SyncPoint* out) const {
+    if (!m_db.isOpen()) return false;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT last_seq, backfill_before FROM sync_state WHERE chat_id = ?"));
+    q.addBindValue(chatId);
+    if (!q.exec() || !q.next()) return false;
+    if (out) {
+        out->lastSeq = q.value(0).toLongLong();
+        out->backfillBefore = q.value(1).toLongLong();
+    }
+    return true;
+}
+
+void MessageCache::saveSyncPoint(const QString& chatId, const SyncPoint& point, const QString& owner) {
+    if (!ownedBy(owner)) return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO sync_state (chat_id, last_seq, backfill_before, updated_at) "
+                             "VALUES (?, ?, ?, ?)"));
+    q.addBindValue(chatId);
+    q.addBindValue(point.lastSeq);
+    q.addBindValue(point.backfillBefore);
+    q.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    q.exec();
+}
+
+bool MessageCache::hasMessage(const QString& messageId) const {
+    if (!m_db.isOpen()) return false;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT 1 FROM messages WHERE id = ? LIMIT 1"));
+    q.addBindValue(messageId);
+    return q.exec() && q.next();
+}
+
+bool MessageCache::hasMessagesInChat(const QString& chatId) const {
+    if (!m_db.isOpen()) return false;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT 1 FROM messages WHERE chat_id = ? LIMIT 1"));
+    q.addBindValue(chatId);
+    return q.exec() && q.next();
 }

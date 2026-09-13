@@ -29,10 +29,23 @@ type passwordResetCompleteInput struct {
 // emails cannot be enumerated. The vault is never touched here — after the
 // account password changes, the client logs in and rewraps MK with the
 // recovery key (or loses history if they have neither old password nor key).
+//
+// The only way this server can deliver a reset code is the DEV relay. Outside
+// the explicit development configuration there is therefore no delivery
+// mechanism, and reset fails closed: before the body is read or any account is
+// looked up, so every caller - known email, unknown email, malformed request -
+// gets the identical answer in the same time, and no challenge, code, message
+// or log line is ever produced.
 func (h *AuthService) StartPasswordReset(c *fiber.Ctx) error {
 	cfg := config.LoadConfig()
+	if !Dev2FAEnabled(cfg) {
+		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":   "password_reset_unavailable",
+			"message": "Password reset is not available on this server.",
+		})
+	}
 	generic := fiber.Map{
-		"message": "If that account exists, a reset code was issued. Check the DEV 2FA bot / server log.",
+		"message": "If that account exists, a reset code was issued. Check the DEV 2FA bot.",
 	}
 
 	var input passwordResetStartInput
@@ -60,7 +73,7 @@ func (h *AuthService) StartPasswordReset(c *fiber.Ctx) error {
 		"message":       generic["message"],
 		"challenge_id":  challengeID,
 		"totp_required": user.TotpEnabled,
-		"relay_hint":    "DEV: code sent to @" + cfg.Dev2FARelayUsername + " and server log [dev_2fa_relay]",
+		"relay_hint":    "DEV: code sent to @" + cfg.Dev2FARelayUsername,
 	})
 }
 
@@ -103,18 +116,39 @@ func (h *AuthService) CompletePasswordReset(c *fiber.Ctx) error {
 		}
 	}
 
+	// Claim the challenge. It was read above in a separate critical section, so
+	// concurrent completions could all pass those checks; only the one that still
+	// finds it here - the same challenge, not a replacement - may reset. This is
+	// what keeps a challenge single-use under concurrency.
 	otpMu.Lock()
-	delete(otpChallenges, input.ChallengeID)
+	cur, still := otpChallenges[input.ChallengeID]
+	claimed := still && cur.CodeHash == ch.CodeHash
+	if claimed {
+		delete(otpChallenges, input.ChallengeID)
+	}
 	otpMu.Unlock()
+	if !claimed {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid or expired code"})
+	}
 
 	hashed, err := bcrypt.GenerateFromPassword([]byte(input.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to hash password"})
 	}
-	if err := database.DB.Model(&models.User{}).Where("id = ?", ch.UserID).
-		Update("password_hash", string(hashed)).Error; err != nil {
+	// Same reasoning as ChangePassword: a reset that leaves old refresh
+	// credentials alive defeats its own purpose. One transaction, sessions as the
+	// serialization point.
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.User{}).Where("id = ?", user.ID).
+			Update("password_hash", string(hashed)).Error; err != nil {
+			return err
+		}
+		_, err := revokeSessionsForUser(tx, user.ID, "password_reset")
+		return err
+	}); err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update password"})
 	}
+	kickSessionsOfUser(user.ID)
 
 	return c.JSON(fiber.Map{
 		"message": "Password updated. Sign in with the new password. Unlock history with your recovery key; without it, old messages stay undecryptable.",

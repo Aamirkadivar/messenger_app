@@ -10,6 +10,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"messenger-app/config"
+	"messenger-app/database"
 )
 
 const (
@@ -56,6 +57,16 @@ func AuthMiddleware(cfg *config.Config) fiber.Handler {
 			})
 		}
 
+		// The session lookup is what makes revocation reach an already-issued
+		// token. It runs HERE, before DeviceRevocationGuard, because that guard
+		// creates a device row for any authenticated caller - a revoked session
+		// must be rejected before it can leave that trace.
+		if !sessionIsLive(claims) {
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+				"error": "Invalid or expired token",
+			})
+		}
+
 		// Set user info in context
 		c.Locals(ContextKeyUser, claims)
 		return c.Next()
@@ -95,6 +106,16 @@ func WebSocketAuth(cfg *config.Config) fiber.Handler {
 			})
 		}
 
+		// /ws is registered on the root app, OUTSIDE the protected group, so it
+		// inherits nothing from the HTTP middleware chain. The session check has
+		// to be made here or WebSockets would be the one surface where a revoked
+		// session still works.
+		if !sessionIsLive(claims) {
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+				"error": "Invalid or expired token",
+			})
+		}
+
 		// Set user info in context for WebSocket
 		c.Locals(ContextKeyUser, claims)
 		return c.Next()
@@ -127,6 +148,15 @@ type JWTClaims struct {
 	Email    string    `json:"email"`
 	FullName string    `json:"full_name"`
 	TokenUse TokenUse  `json:"token_use"`
+
+	// SessionID binds this access token to a server-side session row. It is the
+	// mechanism that lets revocation reach a stateless credential: without it a
+	// signed token stays valid until expiry no matter what the server does.
+	//
+	// Only sid. No did - a device claim would be a claim nothing enforces, which
+	// is the exact anti-pattern Gate 16 corrected - and no jti, which sid plus
+	// the session's own refresh hash already subsume.
+	SessionID uuid.UUID `json:"sid"`
 	jwt.RegisteredClaims
 }
 
@@ -175,13 +205,42 @@ func CORS() fiber.Handler {
 	}
 }
 
+// sessionIsLive resolves an access token's sid against the session table.
+//
+// The lookup is CONJUNCTIVE on (id, user_id). Resolving by sid alone would let
+// a token naming another account's session authenticate as that account - a
+// silent account switch, and the single most dangerous way to get this wrong.
+//
+// Fails closed on every branch: a missing session, a revoked one, one past its
+// absolute lifetime, and any database error all deny. An outage must not become
+// an authentication bypass.
+func sessionIsLive(claims *JWTClaims) bool {
+	if claims == nil || claims.SessionID == uuid.Nil || claims.UserID == uuid.Nil {
+		return false
+	}
+	if database.DB == nil {
+		return false
+	}
+	var n int64
+	err := database.DB.Raw(`SELECT count(*) FROM sessions
+	                         WHERE id = ? AND user_id = ?
+	                           AND revoked_at IS NULL
+	                           AND absolute_expires_at > now()`,
+		claims.SessionID, claims.UserID).Scan(&n).Error
+	if err != nil {
+		return false
+	}
+	return n > 0
+}
+
 // GenerateToken generates a JWT token for a user
-func GenerateToken(userID uuid.UUID, email, fullName string, cfg *config.Config) (string, error) {
+func GenerateToken(userID uuid.UUID, email, fullName string, sessionID uuid.UUID, cfg *config.Config) (string, error) {
 	claims := &JWTClaims{
-		UserID:   userID,
-		Email:    email,
-		FullName: fullName,
-		TokenUse: TokenUseAccess,
+		UserID:    userID,
+		Email:     email,
+		FullName:  fullName,
+		TokenUse:  TokenUseAccess,
+		SessionID: sessionID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(cfg.JWTExpiration) * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -193,21 +252,19 @@ func GenerateToken(userID uuid.UUID, email, fullName string, cfg *config.Config)
 	return token.SignedString([]byte(cfg.JWTSecret))
 }
 
-// GenerateRefreshToken generates a refresh JWT token
-func GenerateRefreshToken(userID uuid.UUID, cfg *config.Config) (string, error) {
-	claims := &JWTClaims{
-		UserID:   userID,
-		TokenUse: TokenUseRefresh,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(cfg.RefreshTokenExpiration) * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			NotBefore: jwt.NewNumericDate(time.Now()),
-		},
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(cfg.JWTSecret))
-}
+// Refresh credentials are NOT JWTs.
+//
+// Gate 17 replaced them with opaque, session-bound tokens stored only as HMAC
+// hashes and rotated through a compare-and-swap. GenerateRefreshToken was
+// removed with that change: a self-contained bearer JWT cannot be withdrawn
+// before its own expiry, which is precisely the property the session layer
+// exists to provide. Nothing in production mints one.
+//
+// TokenUseRefresh is deliberately RETAINED: the discriminator must still
+// recognise the value in order to REFUSE it, and Gate 16 asserts that refusal.
+// The Gate 15 proofs build such a token from a test-only helper
+// (handlers.mintLegacyRefreshJWT) so the minting cannot leak back into the
+// server.
 
 // VerifyTokenWithSecret verifies a JWT token and returns the claims
 func VerifyTokenWithSecret(tokenString, secret string) (*JWTClaims, error) {
@@ -226,6 +283,20 @@ func VerifyTokenWithSecret(tokenString, secret string) (*JWTClaims, error) {
 }
 
 // GetCurrentUserID extracts the user ID from the context
+// GetCurrentSessionID returns the sid of the access token authenticating this
+// request, or uuid.Nil.
+//
+// Device authorization resolves through this. The session row is server-side
+// state the caller cannot edit, which is exactly what X-Device-Id is not.
+func GetCurrentSessionID(c *fiber.Ctx) uuid.UUID {
+	user := c.Locals(ContextKeyUser)
+	claims, ok := user.(*JWTClaims)
+	if !ok || claims == nil {
+		return uuid.Nil
+	}
+	return claims.SessionID
+}
+
 func GetCurrentUserID(c *fiber.Ctx) uuid.UUID {
 	user := c.Locals(ContextKeyUser)
 	if user == nil {

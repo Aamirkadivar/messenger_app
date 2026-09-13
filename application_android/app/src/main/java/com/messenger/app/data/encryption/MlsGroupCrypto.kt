@@ -1,5 +1,6 @@
 package com.messenger.app.data.encryption
 
+import com.messenger.app.security.MlsOwner
 import android.util.Log
 import java.security.MessageDigest
 import java.util.LinkedHashMap
@@ -369,29 +370,55 @@ object MlsGroupCrypto {
             size > OPEN_CACHE_LIMIT
     }
 
-    private fun openCacheKey(payload: ByteArray): String =
-        E2ECrypto.toHex(MessageDigest.getInstance("SHA-256").digest(payload))
+    /**
+     * The cache key binds the OWNER as well as the ciphertext.
+     *
+     * Keyed by ciphertext alone, this cache answered on possession: anyone
+     * holding the bytes got the plaintext back without the group state being
+     * consulted at all, so a second account on the device could read the first
+     * account's messages straight out of it. Two accounts can legitimately be in
+     * the same group and see the same ciphertext, which is exactly when that
+     * matters.
+     *
+     * The owner tag also makes the pre-ownership entries unreachable: their keys
+     * carried no tag, so nothing can address them again.
+     */
+    private fun openCacheKey(owner: MlsOwner, payload: ByteArray): String =
+        owner.tag + ":" + E2ECrypto.toHex(MessageDigest.getInstance("SHA-256").digest(payload))
 
-    private fun rememberOpen(ciphertext: ByteArray, plaintext: ByteArray) {
-        synchronized(openCacheLock) { openCache[openCacheKey(ciphertext)] = plaintext }
+    private fun rememberOpen(owner: MlsOwner, ciphertext: ByteArray, plaintext: ByteArray) {
+        synchronized(openCacheLock) { openCache[openCacheKey(owner, ciphertext)] = plaintext }
     }
 
-    private fun lookupOpen(ciphertext: ByteArray): ByteArray? =
-        synchronized(openCacheLock) { openCache[openCacheKey(ciphertext)] }
+    private fun lookupOpen(owner: MlsOwner, ciphertext: ByteArray): ByteArray? =
+        synchronized(openCacheLock) { openCache[openCacheKey(owner, ciphertext)] }
+
+    /** Drops one owner's cached plaintext. Hygiene; the key is the boundary. */
+    fun forgetOpenCache(owner: MlsOwner) {
+        synchronized(openCacheLock) {
+            val mine = openCache.keys.filter { it.startsWith(owner.tag + ":") }
+            for (k in mine) openCache.remove(k)
+        }
+    }
 
     /** Encrypts an application message for the group. */
-    fun protect(group: Group, plaintext: ByteArray, aad: ByteArray = ByteArray(0)): ByteArray {
+    fun protect(
+        owner: MlsOwner,
+        group: Group,
+        plaintext: ByteArray,
+        aad: ByteArray = ByteArray(0)
+    ): ByteArray {
         val sealed = encode(group.protect(aad, plaintext, 0))
-        rememberOpen(sealed, plaintext)
+        rememberOpen(owner, sealed, plaintext)
         return sealed
     }
 
     /** Decrypts an application message. Returns null if it does not open. */
-    fun unprotect(group: Group, payload: ByteArray): ByteArray? {
-        lookupOpen(payload)?.let { return it }
+    fun unprotect(owner: MlsOwner, group: Group, payload: ByteArray): ByteArray? {
+        lookupOpen(owner, payload)?.let { return it }
         return try {
             val msg = decode(payload)
-            group.unprotect(msg)?.getOrNull(1)?.also { rememberOpen(payload, it) }
+            group.unprotect(msg)?.getOrNull(1)?.also { rememberOpen(owner, payload, it) }
         } catch (e: Exception) {
             Log.w(TAG, "unprotect failed: ${e.message}")
             null

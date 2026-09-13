@@ -14,13 +14,18 @@
 #include <functional>
 #include "../utils/config.h"
 #include "../utils/messagecache.h"
+#include "messageoutbox.h"
+#include "messagesyncpager.h"
 #include "../crypto/doubleratchet.h"
 #include "../crypto/doubleratchetv4.h"
 #ifdef HAVE_MLSPP
 #include "../crypto/mlsgroupcrypto.h"
 #endif
 #include "../crypto/encryption.h"
+#include <memory>
 #include "authservice.h"
+#include "../crypto/decryptedmessagearchiver.h"
+#include "../crypto/archiverestorer.h"
 #include "groupservice.h"
 
 class MlsV2Engine;
@@ -43,7 +48,26 @@ public:
 
     QNetworkAccessManager* networkManager() { return m_networkManager; }
 
+    /**
+     * Which encryption_version values decryptDirect() knows how to open.
+     *
+     * Direct threads use 1 (pairwise box), 2 (ephemeral box), 3 and 4 (ratchet).
+     * The group schemes - 5 (mlspp) and 6 (mls-core) - are routed earlier, in
+     * decryptToBytes(), and never reach the direct dispatch; a group scheme
+     * arriving on a direct thread is not something to reinterpret.
+     *
+     * Exists as a named predicate so the "unknown version" rule is one testable
+     * fact rather than the shape of an if-chain. The chain previously ended in
+     * ">= 2", which silently decrypted any future version as v2 ephemeral box.
+     */
+    static bool isSupportedDirectVersion(int encryptionVersion) {
+        return encryptionVersion >= 1 && encryptionVersion <= 4;
+    }
+
     Q_INVOKABLE void fetchChats();
+    // Reacts to a server group lifecycle event by re-reading the chat list.
+    // Coalesced, because creating a group emits one event per new member.
+    void onGroupLifecycleEvent(const QString& event, const QString& chatId);
     Q_INVOKABLE void searchUsers(const QString& query);
     Q_INVOKABLE void startDirectChat(const QString& userId, const QString& userName);
     Q_INVOKABLE void fetchMessages(const QString& chatId);
@@ -56,6 +80,25 @@ public:
                                   bool isForwarded = false,
                                   const QString& forwardedFromName = QString(),
                                   const QString& forwardedFromMessageId = QString());
+
+    // ---- Phase 71: durable delivery ----
+    //
+    // The composer's send. Mints the client_message_id, seals the text ONCE,
+    // stores it in the durable outbox (this account's SQLite) and POSTs it over
+    // HTTP whatever the WebSocket is doing. Returns the id immediately; QML uses
+    // "outbox:<id>" as the bubble identity until the server accepts it.
+    Q_INVOKABLE QString sendTextMessage(const QString& chatId, const QString& text,
+                                        const QString& chatType, const QString& replyToId);
+    // Queued (PENDING) and refused (FAILED) outgoing messages of one chat,
+    // oldest first: {clientMessageId, text, failed, createdAt, replyToId}.
+    // Lives in the outbox, not in QML, so it survives the view and a restart.
+    Q_INVOKABLE QVariantList pendingOutgoing(const QString& chatId) const;
+    // Explicit retry of a FAILED message: same row, id and ciphertext.
+    Q_INVOKABLE bool retryOutgoing(const QString& clientMessageId);
+    // Non-blocking outbox pass (app start, reconnect, chat opened).
+    Q_INVOKABLE void processOutbox();
+    // Reconnect catch-up for every known chat, not just the open one.
+    Q_INVOKABLE void syncAllChats();
     Q_INVOKABLE void markAsRead(const QString& chatId);
 
     // Removes a chat from THIS user's list only - the other participant keeps
@@ -297,8 +340,14 @@ signals:
     void searchError(const QString& error);
     void directChatReady(const QString& chatId, const QString& chatName);
     void messagesFetched(const QString& chatId, const QVariantList& messages);
+    // message["clientMessageId"] identifies the outbox bubble it settles.
     void messageSent(const QString& chatId, const QVariantMap& message);
     void messageError(const QString& error);
+    // Phase 71 outbox lifecycle of one outgoing message.
+    void outgoingQueued(const QString& chatId, const QString& clientMessageId);
+    void outgoingFailed(const QString& chatId, const QString& clientMessageId, const QString& error);
+    // Catch-up ingested new messages for this chat.
+    void chatCaughtUp(const QString& chatId);
     void chatRead(const QString& chatId);
     void chatDeleted(const QString& chatId);
     void chatDeleteError(const QString& error);
@@ -391,9 +440,22 @@ private:
     // Used for group text and binary media (voice / attachment / round video).
     // Direct chats stay on pairwise crypto_box.
     void sendGroupTextMessage(const QString& chatId, const QString& text,
-                               bool isForwarded = false,
-                               const QString& forwardedFromName = QString(),
-                               const QString& forwardedFromMessageId = QString());
+                               bool isForwarded, const QString& forwardedFromName,
+                               const QString& forwardedFromMessageId, const QString& replyToId,
+                               const QString& clientMessageId);
+
+    // ---- Phase 71 ----
+    void sealAndQueueText(const QString& chatId, const QString& text, const QString& chatType,
+                          bool isForwarded, const QString& forwardedFromName,
+                          const QString& forwardedFromMessageId, const QString& replyToId,
+                          const QString& clientMessageId);
+    void queueSealed(const QString& chatId, const QString& chatType, QJsonObject body,
+                     const QString& clientMessageId);
+    void failOutgoing(const QString& chatId, const QString& clientMessageId, const QString& reason);
+    void onOutboxAccepted(const QString& chatId, const QString& clientMessageId, const QJsonObject& data);
+    QVariantMap ingestServerRow(const QString& chatId, const QJsonObject& m, MessageCache::Entry* cacheOut);
+    void setupDurableDelivery();
+    QString cacheOwnerNow() const;
     // Ensures my current Sender Key is generated and distributed to every
     // current member before calling onReady() - a no-op straight to
     // onReady() if it's already current for this group's key_epoch.
@@ -410,6 +472,16 @@ private:
     void loadPeerSenderKeysFromDisk(const QString& chatId);
 
     AuthService* m_authService = nullptr;
+
+    // Layer B: the archive caller invoked from the successful-decrypt gate in fetchMessages.
+    // Built lazily and only when archiving is enabled; owns no crypto and no HTTP of its own.
+    std::unique_ptr<DecryptedMessageArchiver> m_archiveCaller;
+    DecryptedMessageArchiver* archiveCaller();
+
+    // Layer B read side: recovers plaintext for cached messages whose key material is gone.
+    // Consulted only after normal decryption has already failed for those messages.
+    std::unique_ptr<ArchiveRestorer> m_archiveRestorer;
+    ArchiveRestorer* archiveRestorer();
     GroupService* m_groupService = nullptr;
     QNetworkAccessManager* m_networkManager = nullptr;
     QNetworkReply* m_currentReply = nullptr;
@@ -418,11 +490,47 @@ private:
     MessageCache* m_messageCache = nullptr;
     QString m_pendingReplyToId;
 
+    // Phase 71. The outbox and the catch-up pager both persist in m_messageCache
+    // (this account's database). m_pendingText is the display copy of each
+    // queued message's text - MEMORY ONLY, by design: the durable outbox never
+    // stores plaintext. It outlives any QML view but not the process.
+    MessageOutbox* m_outbox = nullptr;
+    MessageSyncPager* m_syncPager = nullptr;
+    struct PendingText {
+        QString text;
+        QString forwardedFromName;
+        QString replyToId;
+        QString owner;
+    };
+    QHash<QString, PendingText> m_pendingText;
+
     // chatId -> the other participant's public key (hex), learned from the
     // chat list. For a direct chat this key both encrypts our outgoing
     // messages and decrypts everything in the thread (box is symmetric in the
     // shared-secret sense), so one key per chat is all we need.
     QHash<QString, QString> m_chatOtherPub;
+
+    // chatId -> the other participant's user id, so the peer's key can be
+    // re-read from /crypto/public-key/{user_id} on its own. The chat list used
+    // to be the only place a peer key ever came from, which made a thread
+    // permanently undecryptable if the peer published after our last fetch.
+    QHash<QString, QString> m_chatOtherUserId;
+    // chatId -> that participant's display name, so a key change discovered by
+    // a refresh names the contact in the security notice exactly as one
+    // discovered through the chat list does.
+    QHash<QString, QString> m_chatOtherName;
+    // Chats whose peer key is being fetched right now, and chats already
+    // refreshed once this session. Together these bound the retry: one fetch in
+    // flight per chat, and one automatic attempt per chat, so a peer who really
+    // has no key cannot turn every arriving message into a request.
+    mutable QSet<QString> m_peerKeyInFlight;
+    mutable QSet<QString> m_peerKeyRefreshed;
+    // A chat-list re-read is already scheduled; further group events fold into
+    // it. Creating a group emits one event per member, and every client on the
+    // hub sees all of them, so without this a group of ten would trigger ten
+    // identical requests.
+    bool m_groupRefreshPending = false;
+
     mutable QHash<QString, DoubleRatchet::State> m_dr;
     mutable QHash<QString, DoubleRatchetV4::Session> m_drV4;
 #ifdef HAVE_MLSPP
@@ -566,6 +674,22 @@ private:
 
     void applyPeerIdentity(const QString& chatId, const QString& serverPub, const QString& contactName);
 
+    // Re-read this chat's peer public key from the server and feed it through
+    // applyPeerIdentity, so rotation, the pending-key prompt and safety-number
+    // verification all behave exactly as they do for a key learned from the
+    // chat list. Authenticated like every other call; never trusts a key
+    // carried in a message. onDone runs on completion whether or not the key
+    // changed, so a caller can resume what it was doing.
+    // Arms the coalesced chat-list re-read, re-arming while a fetch is already
+    // in flight (that one may predate the group and so cannot show it).
+    void scheduleGroupChatRefresh();
+
+    void ensurePeerKey(const QString& chatId, std::function<void()> onDone = {});
+    // Const-callable trigger for the decrypt path: schedules ensurePeerKey once
+    // per chat per session and returns immediately. Decryption is const and
+    // runs from a QML binding, so it cannot block or mutate state itself.
+    void requestPeerKeyRefresh(const QString& chatId) const;
+
     // Forward queue state - see forwardMessages().
     QList<ForwardItem> m_forwardQueue;
     QString m_forwardSourceChatId;
@@ -575,6 +699,10 @@ private:
     int m_forwardSuccess = 0;
     int m_forwardFail = 0;
     QString m_forwardAwaitingMessageId;
+    // Phase 71: the client_message_id of the forwarded text in flight, so only
+    // ITS outbox progress advances the queue - not some other queued message
+    // retrying in the background.
+    QString m_forwardClientMessageId;
 
     // Helper: parse a single chat from JSON into a QML-friendly QVariantMap
     QVariantMap parseChatItem(const QJsonObject& obj);

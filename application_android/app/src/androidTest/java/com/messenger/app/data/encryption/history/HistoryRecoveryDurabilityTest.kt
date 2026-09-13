@@ -77,8 +77,8 @@ class HistoryRecoveryDurabilityTest {
     @After
     fun cleanUp() = runBlocking {
         val s = store()
-        s.deleteHistoryKeyring()
-        s.deleteHistoryKeyringCache()
+        s.deleteHistoryKeyring(USER)
+        s.deleteHistoryKeyringCache(USER)
         Unit
     }
 
@@ -140,8 +140,8 @@ class HistoryRecoveryDurabilityTest {
         val exported = process().exportForRecovery().getOrThrow()
 
         // Wipe both Keystore copies: this is a fresh install of the same account.
-        store().deleteHistoryKeyring()
-        store().deleteHistoryKeyringCache()
+        store().deleteHistoryKeyring(USER)
+        store().deleteHistoryKeyringCache(USER)
         assertNull("precondition: the device really is empty", process().load().getOrThrow().latest(CHAT_A))
 
         process().importFromRecovery(exported).getOrThrow()
@@ -158,8 +158,8 @@ class HistoryRecoveryDurabilityTest {
         process().ensureRoot(CHAT_A).getOrThrow()
         val exported = process().exportForRecovery().getOrThrow()
 
-        store().deleteHistoryKeyring()
-        store().deleteHistoryKeyringCache()
+        store().deleteHistoryKeyring(USER)
+        store().deleteHistoryKeyringCache(USER)
         val local = process().ensureRoot(CHAT_B).getOrThrow()
 
         process().importFromRecovery(exported).getOrThrow()
@@ -181,8 +181,8 @@ class HistoryRecoveryDurabilityTest {
         // returned before the authoritative copy is ever read (the ratified
         // cold-start behaviour), so leaving it in place would test nothing.
         val s = store()
-        s.deleteHistoryKeyringCache()
-        assertTrue(s.saveHistoryKeyring(recoveryBlob).isSuccess)
+        s.deleteHistoryKeyringCache(USER)
+        assertTrue(s.saveHistoryKeyring(USER, recoveryBlob).isSuccess)
 
         val reopened = process().load()
 
@@ -201,8 +201,8 @@ class HistoryRecoveryDurabilityTest {
         val recoveryBlob = process().exportForRecovery().getOrThrow()
 
         val s = store()
-        s.deleteHistoryKeyringCache()
-        s.saveHistoryKeyring(recoveryBlob)
+        s.deleteHistoryKeyringCache(USER)
+        s.saveHistoryKeyring(USER, recoveryBlob)
 
         val reopened = process().load()
         assertTrue(reopened.isFailure)
@@ -247,9 +247,9 @@ class HistoryRecoveryDurabilityTest {
 
         // --- the replacement: every device-local trace goes
         val wiped = store()
-        wiped.deleteHistoryKeyring()
-        wiped.deleteHistoryKeyringCache()
-        wiped.deleteHistoryKeyringGeneration()
+        wiped.deleteHistoryKeyring(USER)
+        wiped.deleteHistoryKeyringCache(USER)
+        wiped.deleteHistoryKeyringGeneration(USER)
         assertNull(
             "precondition: the replacement device knows nothing",
             process().load().getOrThrow().latest(CHAT_A)
@@ -268,7 +268,7 @@ class HistoryRecoveryDurabilityTest {
         assertArrayEquals(plaintext, opened)
 
         // And the recovered material is re-bound to this account at rest.
-        val cache = wiped.loadHistoryKeyringCache().getOrThrow()
+        val cache = wiped.loadHistoryKeyringCache(USER).getOrThrow()
         assertNotNull(cache)
         assertTrue(
             "imported roots must be stored account-bound, not trusted as they arrived",
@@ -289,9 +289,9 @@ class HistoryRecoveryDurabilityTest {
         val blob = process().exportForRecovery().getOrThrow()
 
         val wiped = store()
-        wiped.deleteHistoryKeyring()
-        wiped.deleteHistoryKeyringCache()
-        wiped.deleteHistoryKeyringGeneration()
+        wiped.deleteHistoryKeyring(USER)
+        wiped.deleteHistoryKeyringCache(USER)
+        wiped.deleteHistoryKeyringGeneration(USER)
 
         process().importFromRecovery(blob).getOrThrow()
 
@@ -309,14 +309,14 @@ class HistoryRecoveryDurabilityTest {
     @Test
     fun theGenerationMarkerRoundTripsThroughRealKeystore() = runBlocking {
         process().ensureRoot(CHAT_A).getOrThrow()
-        val marker = store().loadHistoryKeyringGeneration().getOrThrow()
+        val marker = store().loadHistoryKeyringGeneration(USER).getOrThrow()
         assertNotNull("a durable mutation must have stamped a marker", marker)
 
         // A fresh store instance must read back exactly what was written.
-        assertEquals(marker, store().loadHistoryKeyringGeneration().getOrThrow())
+        assertEquals(marker, store().loadHistoryKeyringGeneration(USER).getOrThrow())
 
         // And the cache written alongside it must carry the same stamp.
-        val cacheBytes = store().loadHistoryKeyringCache().getOrThrow()
+        val cacheBytes = store().loadHistoryKeyringCache(USER).getOrThrow()
         assertNotNull(cacheBytes)
         val decoded = HistoryKeyringCacheFormat.decode(cacheBytes!!, USER)
         assertTrue(decoded is HistoryKeyringCacheFormat.Decoded.Owned)

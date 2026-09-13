@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -90,9 +91,19 @@ func (iv *interleaver) resume() { close(iv.release) }
 // keeps its own device lookups and auto-registration out of the interleaving
 // under test here.
 func gate13App(userID uuid.UUID) (*fiber.App, *E2EEHandler) {
+	gate13CurrentUser = userID
 	app := fiber.New()
 	app.Use(func(c *fiber.Ctx) error {
-		c.Locals(middleware.ContextKeyUser, &middleware.JWTClaims{UserID: userID})
+		// Phase 44: registration binds the CALLING session to the proven device,
+		// and one session may prove only one device. These suites enrol many
+		// devices under one identity, so the session is taken from a test-only
+		// header - each enrolment supplies its own, exactly as separate logins
+		// would in production.
+		claims := &middleware.JWTClaims{UserID: userID}
+		if sid, err := uuid.Parse(c.Get("X-Test-Session")); err == nil {
+			claims.SessionID = sid
+		}
+		c.Locals(middleware.ContextKeyUser, claims)
 		return c.Next()
 	})
 	return app, NewE2EEHandler(nil)
@@ -108,6 +119,23 @@ func gate13Req(t *testing.T, app *fiber.App, method, path, body string) (int, st
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("X-Device-Id", "probe-device")
+	// Phase 44: a bare registration body no longer registers anything. Complete
+	// the proof-of-possession flow here so these suites keep testing the real
+	// endpoint, and report a failed challenge as the outcome of the attempt.
+	if method == http.MethodPost && path == "/devices" {
+		enrolled, sid, chCode := enrolBodyFor(t, app, gate13CurrentUser, body)
+		if chCode != 0 {
+			return chCode, ""
+		}
+		if enrolled != body {
+			req = httptest.NewRequest(method, path, bytes.NewBufferString(enrolled))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Device-Id", "probe-device")
+		}
+		if sid != uuid.Nil {
+			req.Header.Set("X-Test-Session", sid.String())
+		}
+	}
 	resp, err := app.Test(req, -1)
 	if err != nil {
 		t.Errorf("request: %v", err)
@@ -265,6 +293,7 @@ func TestGate13_I9_PairingCompletedAtMostOnce(t *testing.T) {
 func TestGate13_I10_RegistrationCannotResurrectARevokedDevice(t *testing.T) {
 	e := gate11Setup(t)
 	app, h := gate13App(e.userA)
+	app.Post("/devices/challenge", h.CreateDeviceChallenge)
 	app.Post("/devices", h.RegisterDevice)
 	app.Post("/devices/:device_id/revoke", h.RevokeDevice)
 
@@ -323,6 +352,7 @@ func TestGate13_I10_RegistrationCannotResurrectARevokedDevice(t *testing.T) {
 func TestGate13_NoDeadlockAcrossMutatingHandlers(t *testing.T) {
 	e := gate11Setup(t)
 	app, h := gate13App(e.userA)
+	app.Post("/devices/challenge", h.CreateDeviceChallenge)
 	app.Post("/devices", h.RegisterDevice)
 	app.Post("/devices/:device_id/revoke", h.RevokeDevice)
 	app.Delete("/devices/:device_id", h.DeleteDevice)
@@ -503,6 +533,7 @@ func TestGate13_CrossAccountPairingMatrix(t *testing.T) {
 func TestGate13_RegisterDeviceSemanticsPreserved(t *testing.T) {
 	e := gate11Setup(t)
 	app, h := gate13App(e.userA)
+	app.Post("/devices/challenge", h.CreateDeviceChallenge)
 	app.Post("/devices", h.RegisterDevice)
 	app.Post("/devices/:device_id/revoke", h.RevokeDevice)
 
@@ -528,11 +559,17 @@ func TestGate13_RegisterDeviceSemanticsPreserved(t *testing.T) {
 	})
 
 	t.Run("empty public key does not clear the stored key", func(t *testing.T) {
-		hit(t, app, http.MethodPost, "/devices", `{"device_id":"sem-pk","public_key":"KEY-1"}`)
+		// Phase 44 made public_key real key material, so the literal this used
+		// to pin is no longer registrable. The property is unchanged and now
+		// stronger: the key that was PROVED survives a later registration that
+		// names no key.
+		hit(t, app, http.MethodPost, "/devices", `{"device_id":"sem-pk"}`)
+		pub, _ := gateDeviceKey(e.userA, "sem-pk")
+		proved := hex.EncodeToString(pub[:])
 		hit(t, app, http.MethodPost, "/devices", `{"device_id":"sem-pk"}`)
 		var d models.E2EEDevice
 		database.DB.Where("user_id = ? AND device_id = ?", e.userA, "sem-pk").First(&d)
-		if d.PublicKey != "KEY-1" {
+		if d.PublicKey != proved {
 			t.Errorf("public key was clobbered by an empty value: %q", d.PublicKey)
 		}
 	})

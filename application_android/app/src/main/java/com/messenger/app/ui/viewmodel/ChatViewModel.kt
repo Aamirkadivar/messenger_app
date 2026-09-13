@@ -10,6 +10,7 @@ import com.messenger.app.data.model.MessageDto
 import com.messenger.app.data.model.UserSearchResult
 import com.messenger.app.data.repository.AttachmentRepository
 import com.messenger.app.data.repository.ChatRepository
+import com.messenger.app.data.repository.MessageOutbox
 import com.messenger.app.data.repository.MlsRepository
 import com.messenger.app.data.repository.MlsV2Repository
 import com.messenger.app.data.repository.SessionExpiredException
@@ -58,9 +59,10 @@ data class ChatMessageUi(
     val isMine: Boolean,
     val isRead: Boolean = false,
     /**
-     * Outgoing delivery. PENDING shows a clock (not yet on the server);
-     * SENT shows a single tick; READ is [isRead] with double ticks.
-     * Incoming / history rows are always SENT.
+     * Outgoing delivery. PENDING shows a clock (in the durable outbox, not yet
+     * accepted by the server); SENT shows a single tick (server acceptance -
+     * NOT delivery); FAILED shows a retry mark; READ is [isRead] with double
+     * ticks. Incoming / history rows are always SENT.
      */
     val deliveryStatus: DeliveryStatus = DeliveryStatus.SENT,
     /** Incoming read receipt timestamp; null means still unread for us. */
@@ -100,8 +102,16 @@ data class ChatMessageUi(
     val isUnreadIncoming: Boolean get() = !isMine && !isSystem && readAt.isNullOrBlank()
 }
 
-/** Wire status for an outgoing bubble: clock while pending, ticks after ACK. */
-enum class DeliveryStatus { PENDING, SENT }
+/** Outgoing bubble status: clock while queued, tick once the server accepted it, retry mark if refused. */
+enum class DeliveryStatus { PENDING, SENT, FAILED }
+
+/** Bubble id of a message still in the outbox; replaced by the server id once accepted. */
+internal fun outboxBubbleId(clientMessageId: String) = OUTBOX_BUBBLE_PREFIX + clientMessageId
+internal const val OUTBOX_BUBBLE_PREFIX = "outbox:"
+
+/** Shown for a queued message whose text this process never held (queued before a restart). */
+internal const val QUEUED_TEXT_PLACEHOLDER = "Queued on this device"
+
 
 data class ChatUiState(
     val chatId: String? = null,
@@ -314,13 +324,20 @@ class ChatViewModel @Inject constructor(
             val cached = chatRepository.loadCachedChats()
             if (cached.isNotEmpty()) {
                 val cachedUiChats = cached.map { dto ->
-                    val preview = chatRepository.decryptFor(
+                    val preview = chatRepository.previewFor(
                         dto.id,
+                        // Resolves the row we already hold before any decrypt is
+                        // attempted; an MLS message opens exactly once.
+                        dto.lastMessage?.id ?: "",
                         dto.lastMessage?.content ?: "",
                         dto.lastMessage?.encrypted ?: false,
                         dto.lastMessage?.senderId ?: "",
                         dto.lastMessage?.keyVersion ?: 0,
-                        dto.lastMessage?.encryptionVersion ?: 1
+                        dto.lastMessage?.encryptionVersion ?: 1,
+                        // Lets the own-device guard in decryptToBytes recognise this
+                        // account's own MLS row and serve it from the local cache
+                        // instead of asking OpenMLS to open its own ciphertext.
+                        dto.lastMessage?.senderDeviceId ?: ""
                     )
                     toChatListItemUi(dto, preview, mutedIds)
                 }
@@ -374,13 +391,20 @@ class ChatViewModel @Inject constructor(
             chatRepository.getChats(token)
                 .onSuccess { chats ->
                     val uiChats = chats.map { dto ->
-                        val preview = chatRepository.decryptFor(
+                        val preview = chatRepository.previewFor(
                             dto.id,
+                            // Resolves the row we already hold before any decrypt is
+                            // attempted; an MLS message opens exactly once.
+                            dto.lastMessage?.id ?: "",
                             dto.lastMessage?.content ?: "",
                             dto.lastMessage?.encrypted ?: false,
                             dto.lastMessage?.senderId ?: "",
                             dto.lastMessage?.keyVersion ?: 0,
-                            dto.lastMessage?.encryptionVersion ?: 1
+                            dto.lastMessage?.encryptionVersion ?: 1,
+                            // Lets the own-device guard in decryptToBytes recognise this
+                            // account's own MLS row and serve it from the local cache
+                            // instead of asking OpenMLS to open its own ciphertext.
+                            dto.lastMessage?.senderDeviceId ?: ""
                         )
                         toChatListItemUi(dto, preview, mutedIds)
                     }
@@ -390,6 +414,10 @@ class ChatViewModel @Inject constructor(
                     // currently open - joining only happens on-demand otherwise
                     // (see openChat()).
                     chats.forEach { chatRepository.joinChatRoom(it.id) }
+                    // Every chat, not only the open one: messages that arrived while this device
+                    // was offline are fetched however many there are (see ChatSyncPager).
+                    chatRepository.kickOutbox()
+                    catchUpAllChats(chats.map { it.id })
                 }
                 .onFailure { e ->
                     Log.e(TAG, "getChats failed", e)
@@ -448,11 +476,13 @@ class ChatViewModel @Inject constructor(
     // Declared ABOVE the init block below, and it has to stay there.
     // Kotlin runs property initialisers and init blocks in declaration order,
     // and that block starts a connectionState collector that reaches
-    // flushPendingOutgoing immediately - with these declared further down the
-    // class the list was still null when it first ran, and synchronized() on a
-    // null lock crashed the app on every launch.
-    private val pendingOutgoing = mutableListOf<OutgoingText>()
-    private var flushingOutgoing = false
+    // catchUpAllChats immediately - declared further down the class, the lock
+    // would still be null when it first ran, and synchronized() on a null lock
+    // crashes. (The volatile outbox list that used to live here had exactly
+    // that bug; outgoing messages now live in the durable outbox instead.)
+    private val catchUpLock = Any()
+    private var catchUpJob: Job? = null
+    private var catchUpAgain = false
 
     init {
         viewModelScope.launch {
@@ -464,6 +494,20 @@ class ChatViewModel @Inject constructor(
         // Establish (or reuse) the real-time connection and listen for messages
         // pushed to whichever chat room is currently joined.
         chatRepository.connectRealtime()
+
+        // A group appeared, or its membership changed. The server already
+        // announces this so a member's list updates without a manual refresh;
+        // nothing listened, so a group created on another device only showed up
+        // after a restart. Re-read the list and let the server decide what this
+        // account is a member of - the event itself reaches every client, and
+        // reloading (rather than inserting locally) is also what keeps a
+        // repeated event from duplicating a chat.
+        chatRepository.groupLifecycle
+            .onEach { event ->
+                Log.d(TAG, "group lifecycle event $event - refreshing chat list")
+                loadChats()
+            }
+            .launchIn(viewModelScope)
 
         // A message retracted for everyone must vanish here too, rather than
         // sitting on screen until the next refetch - and the chat-list preview
@@ -603,6 +647,9 @@ class ChatViewModel @Inject constructor(
                 ) {
                     runCatching {
                         chatRepository.archiveRealtimeMessage(
+                            // Owner of the delivery, resolved as this event is
+                            // accepted - not when the archive finally commits.
+                            owner = myId,
                             chatId = incoming.chatId,
                             messageId = incoming.messageId,
                             senderId = incoming.senderId,
@@ -692,14 +739,31 @@ class ChatViewModel @Inject constructor(
             }
             .launchIn(viewModelScope)
 
-        // Flush text that was queued while the socket / network was down.
+        // A (re)connected socket is a good moment to retry the outbox and to catch up on
+        // everything that arrived while this device was away. It is a hint, never a gate: the
+        // outbox POSTs over HTTP whatever the socket is doing, and catch-up is HTTP as well.
         connectionState
             .onEach { state ->
                 if (state == com.messenger.app.data.remote.websocket.WebSocketManager.ConnectionState.CONNECTED) {
-                    flushPendingOutgoing()
+                    chatRepository.kickOutbox()
+                    catchUpAllChats()
                 }
             }
             .launchIn(viewModelScope)
+
+        // Queued messages settling in the background - accepted or refused - update their bubbles.
+        chatRepository.outboxEvents
+            .onEach { event ->
+                when (event) {
+                    is MessageOutbox.Event.Accepted ->
+                        markOutgoingAccepted(event.clientMessageId, event.data.id, event.data.createdAt)
+                    is MessageOutbox.Event.Failed -> markOutgoingFailed(event.clientMessageId)
+                }
+            }
+            .launchIn(viewModelScope)
+
+        // Anything left in the outbox from before this ViewModel - or this process - existed.
+        chatRepository.kickOutbox()
 
         // Live online/offline dot - without this it only ever reflected reality
         // after the next full chat-list reload.
@@ -771,8 +835,35 @@ class ChatViewModel @Inject constructor(
                 }
             }
 
+            // Paint the local cache BEFORE anything that can fail or return.
+            //
+            // This block used to sit below the token gate and below the group
+            // key/MLS setup, so any early return left the screen empty even
+            // though a complete local history was sitting in Room. Cached rows
+            // are stored already decrypted (cacheMessages decrypts on store,
+            // because ratchet and MLS message keys are single-use), so painting
+            // them needs neither a token nor a key exchange: the reason MLS setup
+            // must precede decryption does not apply to rows already in plaintext.
+            //
+            // This is what "cache-first, then synchronise" actually means, and it
+            // is what keeps a reopened conversation populated when the credential
+            // is missing or the Keystore entry cannot be read.
+            val cachedAtOpen = chatRepository.loadCachedMessages(chatId)
+            if (cachedAtOpen.isNotEmpty() && _chatState.value.chatId == chatId) {
+                val cachedHistory = cachedAtOpen.asReversed().map { dto ->
+                    toChatMessageUi(chatId, dto, myId)
+                }
+                _chatState.update {
+                    it.copy(messages = cachedHistory, historySettled = false)
+                        .withUnreadAnchor(cachedHistory)
+                }
+            }
+
             val token = tokenManager.getAccessToken().getOrNull()
             if (token.isNullOrEmpty()) {
+                // Keep what was just painted from the cache rather than blanking
+                // the screen. historySettled stays false, so the UI still knows
+                // this view has not been synchronised.
                 _chatState.update { it.copy(error = "Not signed in") }
                 return@launch
             }
@@ -848,34 +939,89 @@ class ChatViewModel @Inject constructor(
             // would otherwise wipe readAt before we could find the divider.
             chatRepository.markAsRead(token, chatId)
 
-            // Re-show any still-queued outgoing text for this chat (history
-            // replace would otherwise hide them until reconnect flush).
+            // Catch-up past the newest page: everything since this chat's sync point, however
+            // much arrived while this device was away. Runs before the rehydrate below, whose
+            // bubbles a history repaint would otherwise drop.
+            val caughtUp = runCatching { chatRepository.syncChats(token, listOf(chatId)) }
+                .getOrDefault(emptyList())
+            if (caughtUp.any { it.messages > 0 }) refreshOpenChatFromCache(chatId)
+
+            // Re-show this chat's queued and refused outgoing messages. They live in the durable
+            // outbox, not in this ViewModel, so they survive it, navigation and a process restart.
             rehydratePendingForChat(chatId)
-            flushPendingOutgoing()
+            chatRepository.kickOutbox()
         }
     }
 
-    private fun rehydratePendingForChat(chatId: String) {
-        val pending = synchronized(pendingOutgoing) {
-            pendingOutgoing.filter { it.chatId == chatId }
-        }
+    private suspend fun rehydratePendingForChat(chatId: String) {
+        val pending = runCatching { chatRepository.pendingOutbox(chatId) }.getOrDefault(emptyList())
         if (pending.isEmpty()) return
-        val existing = _chatState.value.messages.map { it.id }.toSet()
         val myId = _currentUserId.value ?: return
-        val extras = pending.filter { it.localId !in existing }.map { o ->
-            ChatMessageUi(
-                id = o.localId,
-                senderId = myId,
-                senderName = "Me",
-                content = o.content,
-                timestamp = System.currentTimeMillis(),
-                isMine = true,
-                deliveryStatus = DeliveryStatus.PENDING,
-                replyToId = o.replyToId
-            )
+        _chatState.update { st ->
+            if (st.chatId != chatId) return@update st
+            val existing = st.messages.map { it.id }.toSet()
+            val extras = pending.filter { outboxBubbleId(it.clientMessageId) !in existing }.map { p ->
+                ChatMessageUi(
+                    id = outboxBubbleId(p.clientMessageId),
+                    senderId = myId,
+                    senderName = "Me",
+                    content = p.text ?: QUEUED_TEXT_PLACEHOLDER,
+                    timestamp = p.createdAt,
+                    isMine = true,
+                    deliveryStatus = if (p.failed) DeliveryStatus.FAILED else DeliveryStatus.PENDING,
+                    replyToId = p.replyToId
+                )
+            }
+            if (extras.isEmpty()) st else st.copy(messages = st.messages + extras)
         }
-        if (extras.isEmpty()) return
-        _chatState.update { it.copy(messages = it.messages + extras) }
+    }
+
+    /** Repaints the open chat from the local cache, keeping its outbox bubbles. */
+    private suspend fun refreshOpenChatFromCache(chatId: String) {
+        val myId = resolveCurrentUserId()
+        val cached = chatRepository.loadCachedMessages(chatId)
+        if (cached.isEmpty() || _chatState.value.chatId != chatId) return
+        val history = cached.asReversed().map { dto -> toChatMessageUi(chatId, dto, myId) }
+        _chatState.update { st ->
+            if (st.chatId != chatId) return@update st
+            val ids = history.map { it.id }.toSet()
+            val queued = st.messages.filter { it.id.startsWith(OUTBOX_BUBBLE_PREFIX) && it.id !in ids }
+            st.copy(messages = history + queued)
+        }
+    }
+
+    /**
+     * Reconnect catch-up for every known chat (not just the open one). One pass at a time; a request
+     * that arrives while one runs is folded into a single follow-up pass, so nothing is dropped.
+     */
+    private fun catchUpAllChats(chatIds: List<String>? = null) {
+        synchronized(catchUpLock) {
+            if (catchUpJob?.isActive == true) {
+                catchUpAgain = true
+                return
+            }
+            catchUpJob = viewModelScope.launch {
+                do {
+                    synchronized(catchUpLock) { catchUpAgain = false }
+                    val token = tokenManager.getAccessToken().getOrNull()
+                    if (token.isNullOrEmpty()) break
+                    val ids = chatIds
+                        ?: _chatListState.value.chats.map { it.id }
+                            .ifEmpty { runCatching { chatRepository.loadCachedChats().map { it.id } }.getOrDefault(emptyList()) }
+                    if (ids.isEmpty()) break
+                    val outcomes = runCatching { chatRepository.syncChats(token, ids) }.getOrElse { e ->
+                        if (e is SessionExpiredException) _sessionExpired.value = true
+                        Log.w(TAG, "catch-up failed: ${e.javaClass.simpleName}")
+                        emptyList()
+                    }
+                    val openId = _chatState.value.chatId
+                    if (openId != null && outcomes.any { it.chatId == openId && it.messages > 0 }) {
+                        refreshOpenChatFromCache(openId)
+                        rehydratePendingForChat(openId)
+                    }
+                } while (synchronized(catchUpLock) { catchUpAgain })
+            }
+        }
     }
 
     private fun ChatUiState.withUnreadAnchor(history: List<ChatMessageUi>): ChatUiState {
@@ -979,19 +1125,29 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Sends [content] through the durable outbox: sealed once, stored, then POSTed over HTTP.
+     *
+     * No WebSocket check: a disconnected socket used to leave the message sitting on a clock with
+     * no attempt made at all. The clock now means exactly "stored on this device, not yet accepted
+     * by the server", and the outbox keeps retrying in the background until it is.
+     */
     fun sendMessage(content: String) {
         val chatId = _chatState.value.chatId ?: return
         if (content.isBlank()) return
+
+        // Minted once, here; every retry of this message reuses it.
+        val clientMessageId = java.util.UUID.randomUUID().toString()
+        val bubbleId = outboxBubbleId(clientMessageId)
 
         viewModelScope.launch {
             val myId = resolveCurrentUserId()
             val replyToId = _pendingReply.value?.id.orEmpty()
             val chatType = _chatState.value.chatType
-            val localId = "local-${System.currentTimeMillis()}-${pendingOutgoing.size}"
 
-            // Shown immediately with a clock; ticks only after the server ACKs.
+            // Shown immediately with a clock; a tick only once the server has accepted it.
             val optimistic = ChatMessageUi(
-                id = localId,
+                id = bubbleId,
                 senderId = myId,
                 senderName = "Me",
                 content = content,
@@ -1003,90 +1159,84 @@ class ChatViewModel @Inject constructor(
             _chatState.update { it.copy(messages = it.messages + optimistic, isSending = true) }
             clearReply()
 
-            val outgoing = OutgoingText(localId, chatId, chatType, content, replyToId)
-            synchronized(pendingOutgoing) { pendingOutgoing.add(outgoing) }
-
-            if (connectionState.value !=
-                com.messenger.app.data.remote.websocket.WebSocketManager.ConnectionState.CONNECTED
-            ) {
-                _chatState.update { it.copy(isSending = false) }
+            val token = tokenManager.getAccessToken().getOrNull()
+            if (token.isNullOrEmpty()) {
+                markOutgoingFailed(clientMessageId)
+                _chatState.update { it.copy(isSending = false, error = "Not signed in") }
                 return@launch
             }
-            dispatchOutgoing(outgoing)
-        }
-    }
-
-    private data class OutgoingText(
-        val localId: String,
-        val chatId: String,
-        val chatType: String,
-        val content: String,
-        val replyToId: String
-    )
-
-
-    private suspend fun dispatchOutgoing(outgoing: OutgoingText) {
-        val token = tokenManager.getAccessToken().getOrNull()
-        if (token.isNullOrEmpty()) {
-            _chatState.update { it.copy(isSending = false, error = "Not signed in") }
-            return
-        }
-        chatRepository.sendMessage(
-            token = token,
-            chatId = outgoing.chatId,
-            chatType = outgoing.chatType,
-            plaintext = outgoing.content,
-            replyToId = outgoing.replyToId
-        )
-            .onSuccess { sent ->
-                synchronized(pendingOutgoing) {
-                    pendingOutgoing.removeAll { it.localId == outgoing.localId }
+            when (val outcome = chatRepository.sendText(
+                token = token,
+                chatId = chatId,
+                chatType = chatType,
+                plaintext = content,
+                replyToId = replyToId,
+                clientMessageId = clientMessageId
+            )) {
+                is ChatRepository.SendOutcome.Accepted -> {
+                    markOutgoingAccepted(clientMessageId, outcome.serverId, outcome.createdAt)
+                    _chatState.update { it.copy(isSending = false) }
                 }
-                _chatState.update { state ->
-                    state.copy(
-                        isSending = false,
-                        messages = state.messages.map { m ->
-                            if (m.id == outgoing.localId) {
-                                m.copy(
-                                    id = sent.id,
-                                    deliveryStatus = DeliveryStatus.SENT,
-                                    isRead = false,
-                                    timestamp = parseMessageTimestamp(sent.createdAt)
-                                )
-                            } else m
-                        }
-                    )
-                }
-            }
-            .onFailure { e ->
-                Log.e(TAG, "sendMessage failed", e)
-                // Leave PENDING + keep queued so reconnect can retry.
-                _chatState.update {
-                    it.copy(isSending = false, error = e.message ?: "Failed to send")
-                }
-            }
-    }
-
-    private fun flushPendingOutgoing() {
-        if (flushingOutgoing) return
-        viewModelScope.launch {
-            flushingOutgoing = true
-            try {
-                while (true) {
-                    val next = synchronized(pendingOutgoing) { pendingOutgoing.firstOrNull() } ?: break
-                    if (connectionState.value !=
-                        com.messenger.app.data.remote.websocket.WebSocketManager.ConnectionState.CONNECTED
-                    ) break
-                    dispatchOutgoing(next)
-                    // If still pending after dispatch, stop to avoid a tight fail loop.
-                    val stillThere = synchronized(pendingOutgoing) {
-                        pendingOutgoing.any { it.localId == next.localId }
+                // Durably queued; the outbox retries it and reports back through outboxEvents.
+                is ChatRepository.SendOutcome.Queued -> _chatState.update { it.copy(isSending = false) }
+                is ChatRepository.SendOutcome.Failed -> {
+                    Log.e(TAG, "sendMessage failed", outcome.error)
+                    if (outcome.error is SessionExpiredException) _sessionExpired.value = true
+                    markOutgoingFailed(clientMessageId)
+                    _chatState.update {
+                        it.copy(isSending = false, error = outcome.error.message ?: "Failed to send")
                     }
-                    if (stillThere) break
                 }
-            } finally {
-                flushingOutgoing = false
             }
+        }
+    }
+
+    /**
+     * Retries a refused message: the same outbox row, client_message_id and ciphertext, so a message
+     * the server did in fact store resolves to that message instead of being sent twice.
+     */
+    fun retryOutgoing(bubbleId: String) {
+        if (!bubbleId.startsWith(OUTBOX_BUBBLE_PREFIX)) return
+        val clientMessageId = bubbleId.removePrefix(OUTBOX_BUBBLE_PREFIX)
+        viewModelScope.launch {
+            if (chatRepository.retryOutbox(clientMessageId)) {
+                _chatState.update { st ->
+                    st.copy(messages = st.messages.map { m ->
+                        if (m.id == bubbleId) m.copy(deliveryStatus = DeliveryStatus.PENDING) else m
+                    })
+                }
+            }
+        }
+    }
+
+    private fun markOutgoingAccepted(clientMessageId: String, serverId: String, createdAt: String?) {
+        val bubbleId = outboxBubbleId(clientMessageId)
+        _chatState.update { st ->
+            if (st.messages.none { it.id == bubbleId }) return@update st
+            st.copy(
+                messages = st.messages.map { m ->
+                    if (m.id == bubbleId) {
+                        m.copy(
+                            id = serverId.ifBlank { bubbleId },
+                            deliveryStatus = DeliveryStatus.SENT,
+                            isRead = false,
+                            timestamp = if (createdAt.isNullOrBlank()) m.timestamp else parseMessageTimestamp(createdAt)
+                        )
+                    } else m
+                }
+                    // A history repaint may already hold the accepted row under its server id; one
+                    // bubble per message (LazyColumn keys must be unique).
+                    .distinctBy { it.id }
+            )
+        }
+    }
+
+    private fun markOutgoingFailed(clientMessageId: String) {
+        val bubbleId = outboxBubbleId(clientMessageId)
+        _chatState.update { st ->
+            st.copy(messages = st.messages.map { m ->
+                if (m.id == bubbleId) m.copy(deliveryStatus = DeliveryStatus.FAILED) else m
+            })
         }
     }
 
@@ -1834,13 +1984,18 @@ class ChatViewModel @Inject constructor(
                         message.isAttachment -> forwardAttachment(
                             token, sourceChatId, targetChatId, targetChatType, message, forward
                         )
-                        else -> chatRepository.sendMessage(
+                        else -> when (val sent = chatRepository.sendText(
                             token = token,
                             chatId = targetChatId,
                             chatType = targetChatType,
                             plaintext = message.content,
                             forward = forward
-                        ).getOrThrow()
+                        )) {
+                            // Accepted, or durably queued - either way it will arrive.
+                            is ChatRepository.SendOutcome.Accepted,
+                            is ChatRepository.SendOutcome.Queued -> Unit
+                            is ChatRepository.SendOutcome.Failed -> throw sent.error
+                        }
                     }
                 }
                 if (result.isFailure) {

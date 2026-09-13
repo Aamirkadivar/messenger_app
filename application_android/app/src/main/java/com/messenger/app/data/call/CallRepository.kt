@@ -7,7 +7,7 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
 import android.util.Log
-import com.messenger.app.data.local.dao.UserDao
+import com.messenger.app.data.local.dao.ScopedUserDao
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.data.remote.websocket.IncomingCallSignal
 import com.messenger.app.data.remote.websocket.WebSocketManager
@@ -118,7 +118,7 @@ class CallRepository @Inject constructor(
     private val chatApiService: ChatApiService,
     private val webSocketManager: WebSocketManager,
     private val tokenManager: TokenManager,
-    private val userDao: UserDao
+    private val userDao: ScopedUserDao
 ) {
     companion object {
         private const val TAG = "CallRepository"

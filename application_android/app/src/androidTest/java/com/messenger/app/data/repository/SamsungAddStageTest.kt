@@ -5,11 +5,13 @@ import android.util.Log
 import androidx.test.platform.app.InstrumentationRegistry
 import com.messenger.app.BuildConfig
 import com.messenger.app.data.model.MlsClaimKeyPackageRequest
+import com.messenger.app.data.remote.SessionRefresher
 import com.messenger.app.data.remote.TokenRefreshAuthenticator
 import com.messenger.app.data.remote.api.AuthApiService
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.security.KeyStoreManagerImpl
 import com.messenger.app.security.TokenManagerImpl
+import javax.inject.Provider
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -30,6 +32,9 @@ import java.security.MessageDigest
  * inviteMissingDevices or evictPhantomMembers, does not touch Samsung.
  */
 class SamsungAddStageTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "R2ADD"
@@ -65,7 +70,7 @@ class SamsungAddStageTest {
             .create(AuthApiService::class.java)
 
         val client = OkHttpClient.Builder()
-            .authenticator(TokenRefreshAuthenticator(tm) { authApi })
+            .authenticator(TokenRefreshAuthenticator(SessionRefresher(tm, Provider { authApi })))
             .build()
 
         val api: ChatApiService = Retrofit.Builder()
@@ -120,7 +125,7 @@ class SamsungAddStageTest {
         p("adder local epoch AFTER sync  : $localAfter")
         if (localAfter != EXPECTED_EPOCH) { p("ABORT: local epoch != 9 after sync"); return@runBlocking }
 
-        val gid = Base64.decode(tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
+        val gid = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
 
         // ---- 3. Samsung must be absent from the local epoch-9 roster
         val rosterBefore = repo.roster(CHAT)

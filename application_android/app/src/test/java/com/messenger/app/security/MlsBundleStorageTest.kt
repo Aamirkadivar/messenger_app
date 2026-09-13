@@ -28,8 +28,14 @@ import org.junit.Test
 class MlsBundleStorageTest {
 
     private companion object {
+        const val OWNER = "mls-bundle-storage-test-account"
+        val MLS_OWNER = MlsOwner(OWNER, "test-device")
+        val OWNER_A = MlsOwner("account-a", "test-device")
+        val OWNER_B = MlsOwner("account-b", "test-device")
         const val KEY = "mls2_snapshot"
-        const val PREF = "mls1_mls2_snapshot"
+        /** The owner-scoped slot. The pre-ownership name was "mls1_mls2_snapshot". */
+        val PREF = "mls2_" + MLS_OWNER.tag + "_" + KEY
+        const val LEGACY_PREF = "mls1_mls2_snapshot"
         const val WRAP_PREFIX = "ks1:"
         const val SNAPSHOT = "MLS1-base64-snapshot-payload"
     }
@@ -49,24 +55,24 @@ class MlsBundleStorageTest {
 
     @Test
     fun `absent bundle reads as null`() = runBlocking {
-        val result = tokenManager.loadMlsBundle(KEY)
+        val result = tokenManager.loadMlsBundle(MLS_OWNER, KEY)
 
         assertTrue("absence is not an error", result.isSuccess)
         assertNull(result.getOrNull())
-        assertFalse(tokenManager.hasMlsBundle(KEY).getOrThrow())
+        assertFalse(tokenManager.hasMlsBundle(MLS_OWNER, KEY).getOrThrow())
     }
 
     @Test
     fun `stored bundle round-trips`() = runBlocking {
-        tokenManager.saveMlsBundle(KEY, SNAPSHOT)
+        tokenManager.saveMlsBundle(MLS_OWNER, KEY, SNAPSHOT)
 
-        assertEquals(SNAPSHOT, tokenManager.loadMlsBundle(KEY).getOrNull())
-        assertTrue(tokenManager.hasMlsBundle(KEY).getOrThrow())
+        assertEquals(SNAPSHOT, tokenManager.loadMlsBundle(MLS_OWNER, KEY).getOrNull())
+        assertTrue(tokenManager.hasMlsBundle(MLS_OWNER, KEY).getOrThrow())
     }
 
     @Test
     fun `stored bundle is written wrapped, not in the clear`() = runBlocking {
-        tokenManager.saveMlsBundle(KEY, SNAPSHOT)
+        tokenManager.saveMlsBundle(MLS_OWNER, KEY, SNAPSHOT)
 
         val raw = prefs.getString(PREF, null)
         assertTrue("must be Keystore-wrapped", raw!!.startsWith(WRAP_PREFIX))
@@ -76,10 +82,10 @@ class MlsBundleStorageTest {
     /** The core regression. */
     @Test
     fun `unreadable bundle fails instead of reporting absence`() = runBlocking {
-        tokenManager.saveMlsBundle(KEY, SNAPSHOT)
+        tokenManager.saveMlsBundle(MLS_OWNER, KEY, SNAPSHOT)
         keyStore.failDecrypt = true
 
-        val result = tokenManager.loadMlsBundle(KEY)
+        val result = tokenManager.loadMlsBundle(MLS_OWNER, KEY)
 
         assertTrue(
             "a stored-but-unreadable bundle must be a failure - reporting absence " +
@@ -90,10 +96,10 @@ class MlsBundleStorageTest {
 
     @Test
     fun `unreadable bundle never returns the ciphertext as plaintext`() = runBlocking {
-        tokenManager.saveMlsBundle(KEY, SNAPSHOT)
+        tokenManager.saveMlsBundle(MLS_OWNER, KEY, SNAPSHOT)
         keyStore.failDecrypt = true
 
-        val value = tokenManager.loadMlsBundle(KEY).getOrNull()
+        val value = tokenManager.loadMlsBundle(MLS_OWNER, KEY).getOrNull()
 
         assertNull("no value may be produced when the unwrap failed", value)
         val stored = prefs.getString(PREF, null)!!
@@ -105,39 +111,50 @@ class MlsBundleStorageTest {
 
     @Test
     fun `failed read leaves the stored bundle intact`() = runBlocking {
-        tokenManager.saveMlsBundle(KEY, SNAPSHOT)
+        tokenManager.saveMlsBundle(MLS_OWNER, KEY, SNAPSHOT)
         val before = prefs.getString(PREF, null)
 
         keyStore.failDecrypt = true
-        tokenManager.loadMlsBundle(KEY)
+        tokenManager.loadMlsBundle(MLS_OWNER, KEY)
 
         assertEquals("recovery depends on the blob surviving", before, prefs.getString(PREF, null))
         keyStore.failDecrypt = false
         assertEquals("and on it still being readable once the Keystore recovers",
-            SNAPSHOT, tokenManager.loadMlsBundle(KEY).getOrNull())
+            SNAPSHOT, tokenManager.loadMlsBundle(MLS_OWNER, KEY).getOrNull())
     }
 
     @Test
     fun `presence is reported even when the bundle cannot be unwrapped`() = runBlocking {
-        tokenManager.saveMlsBundle(KEY, SNAPSHOT)
+        tokenManager.saveMlsBundle(MLS_OWNER, KEY, SNAPSHOT)
         keyStore.failDecrypt = true
 
         assertTrue(
             "presence must not depend on readability - that is how a caller tells " +
                 "'no state yet' from 'state exists but is unreadable'",
-            tokenManager.hasMlsBundle(KEY).getOrThrow()
+            tokenManager.hasMlsBundle(MLS_OWNER, KEY).getOrThrow()
         )
     }
 
     @Test
-    fun `legacy unwrapped bundle remains readable`() = runBlocking {
-        // Written before Keystore wrapping existed: no prefix, stored as-is.
-        prefs.seed(PREF, SNAPSHOT)
+    fun `legacy account-less bundle is quarantined, never adopted`() = runBlocking {
+        // Written before MLS state had an owner: keyed "mls1_", no account and no
+        // device. Its owner cannot be established now, and login order is not
+        // provenance - so no owner may claim it, and it must be left as found.
+        prefs.seed(LEGACY_PREF, SNAPSHOT)
 
-        val result = tokenManager.loadMlsBundle(KEY)
-
-        assertTrue("a legacy plain bundle is readable, not an error", result.isSuccess)
-        assertEquals(SNAPSHOT, result.getOrNull())
+        for (owner in listOf(MLS_OWNER, OWNER_A, OWNER_B)) {
+            val result = tokenManager.loadMlsBundle(owner, KEY)
+            assertTrue("absence is not an error", result.isSuccess)
+            assertNull(
+                "PROVEN BROKEN: ${owner.accountId} adopted legacy account-less MLS state",
+                result.getOrNull()
+            )
+            assertFalse(tokenManager.hasMlsBundle(owner, KEY).getOrThrow())
+        }
+        assertEquals(
+            "the legacy blob must survive untouched, not be migrated",
+            SNAPSHOT, prefs.getString(LEGACY_PREF, null)
+        )
     }
     // ---------------------------------------------- account-switch lifecycle
     //
@@ -148,24 +165,30 @@ class MlsBundleStorageTest {
     // to the same group, and which broke a live JOIN.
 
     @Test
-    fun `logout destroys every MLS bundle`() = runBlocking {
-        tokenManager.saveMlsBundle(KEY, SNAPSHOT).getOrThrow()
-        tokenManager.saveMlsBundle("mls2_gid_chat-1", "gid-bytes").getOrThrow()
-        assertTrue(tokenManager.hasMlsBundle(KEY).getOrThrow())
+    fun `logout keeps an owner's MLS state and still hides it from everyone else`() =
+        runBlocking {
+            tokenManager.saveMlsBundle(OWNER_A, KEY, SNAPSHOT).getOrThrow()
+            tokenManager.saveMlsBundle(OWNER_A, "mls2_gid_chat-1", "gid-bytes").getOrThrow()
+            assertTrue(tokenManager.hasMlsBundle(OWNER_A, KEY).getOrThrow())
 
-        tokenManager.clearTokens().getOrThrow()
+            tokenManager.clearTokens().getOrThrow()
 
-        assertFalse(
-            "the snapshot must not survive logout - the next account would restore it",
-            tokenManager.hasMlsBundle(KEY).getOrThrow()
-        )
-        assertNull(tokenManager.loadMlsBundle(KEY).getOrThrow())
-        assertNull(tokenManager.loadMlsBundle("mls2_gid_chat-1").getOrThrow())
-        assertTrue(
-            "no mls1_ key may remain",
-            prefs.all.keys.none { it.startsWith("mls1_") }
-        )
-    }
+            // The namespace is the boundary, so the wipe is no longer what keeps
+            // accounts apart - and deleting A's store on any logout would cost A
+            // its groups for no security gain.
+            assertEquals(
+                "an owner's own MLS state must survive its logout",
+                SNAPSHOT, tokenManager.loadMlsBundle(OWNER_A, KEY).getOrThrow()
+            )
+            assertFalse(
+                "PROVEN BROKEN: another owner can see it",
+                tokenManager.hasMlsBundle(OWNER_B, KEY).getOrThrow()
+            )
+            assertTrue(
+                "the legacy account-less prefix is still cleared",
+                prefs.all.keys.none { it.startsWith("mls1_") }
+            )
+        }
 
     @Test
     fun `logout clears the auth session`() = runBlocking {
@@ -180,19 +203,19 @@ class MlsBundleStorageTest {
 
     @Test
     fun `logout leaves unrelated application data alone`() = runBlocking {
-        tokenManager.saveMlsBundle(KEY, SNAPSHOT).getOrThrow()
-        tokenManager.saveGroupSenderKey("chat-1", "3:deadbeef").getOrThrow()
-        tokenManager.saveKnownPublicKey("chat-1", "cafebabe").getOrThrow()
+        tokenManager.saveMlsBundle(MLS_OWNER, KEY, SNAPSHOT).getOrThrow()
+        tokenManager.saveGroupSenderKey(OWNER, "chat-1", "3:deadbeef").getOrThrow()
+        tokenManager.saveKnownPublicKey(OWNER, "chat-1", "cafebabe").getOrThrow()
 
         tokenManager.clearTokens().getOrThrow()
 
         assertEquals(
             "sender keys are not MLS state and must survive",
-            "3:deadbeef", tokenManager.getGroupSenderKey("chat-1").getOrThrow()
+            "3:deadbeef", tokenManager.getGroupSenderKey(OWNER, "chat-1").getOrThrow()
         )
         assertEquals(
             "cached peer keys must survive",
-            "cafebabe", tokenManager.getKnownPublicKey("chat-1").getOrThrow()
+            "cafebabe", tokenManager.getKnownPublicKey(OWNER, "chat-1").getOrThrow()
         )
     }
 
@@ -200,7 +223,7 @@ class MlsBundleStorageTest {
     fun `a second account cannot restore the first account's MLS store`() = runBlocking {
         // Account A signs in and builds MLS state.
         tokenManager.saveCurrentUserId("account-a").getOrThrow()
-        tokenManager.saveMlsBundle(KEY, SNAPSHOT).getOrThrow()
+        tokenManager.saveMlsBundle(OWNER_A, KEY, SNAPSHOT).getOrThrow()
 
         // A signs out; B signs in on the same install.
         tokenManager.clearTokens().getOrThrow()
@@ -209,25 +232,42 @@ class MlsBundleStorageTest {
         assertFalse(
             "B must not find A's snapshot; restoring it is how B came to publish " +
                 "packages under A's MLS identity",
-            tokenManager.hasMlsBundle(KEY).getOrThrow()
+            tokenManager.hasMlsBundle(OWNER_B, KEY).getOrThrow()
         )
-        assertNull(tokenManager.loadMlsBundle(KEY).getOrThrow())
+        assertNull(tokenManager.loadMlsBundle(OWNER_B, KEY).getOrThrow())
+        assertEquals(
+            "...and A's own store is still A's",
+            SNAPSHOT, tokenManager.loadMlsBundle(OWNER_A, KEY).getOrThrow()
+        )
         assertEquals("account-b", tokenManager.getCurrentUserId().getOrThrow())
     }
 
     @Test
-    fun `switching A to B and back leaves no MLS state to inherit`() = runBlocking {
-        for (account in listOf("account-a", "account-b", "account-a")) {
-            tokenManager.saveCurrentUserId(account).getOrThrow()
-            assertFalse(
-                "$account must start with no inherited MLS store",
-                tokenManager.hasMlsBundle(KEY).getOrThrow()
-            )
-            tokenManager.saveMlsBundle(KEY, "$SNAPSHOT-$account").getOrThrow()
+    fun `switching A to B and back gives each account only its own MLS store`() =
+        runBlocking {
+            tokenManager.saveCurrentUserId("account-a").getOrThrow()
+            tokenManager.saveMlsBundle(OWNER_A, KEY, "$SNAPSHOT-a").getOrThrow()
             tokenManager.clearTokens().getOrThrow()
+
+            tokenManager.saveCurrentUserId("account-b").getOrThrow()
+            assertFalse(
+                "B must start with no inherited MLS store",
+                tokenManager.hasMlsBundle(OWNER_B, KEY).getOrThrow()
+            )
+            tokenManager.saveMlsBundle(OWNER_B, KEY, "$SNAPSHOT-b").getOrThrow()
+            tokenManager.clearTokens().getOrThrow()
+
+            // Back to A. Its own store is intact, and B's is untouched - isolation
+            // that works by destroying the outgoing account's data is not isolation.
+            tokenManager.saveCurrentUserId("account-a").getOrThrow()
+            assertEquals(
+                "$SNAPSHOT-a", tokenManager.loadMlsBundle(OWNER_A, KEY).getOrThrow()
+            )
+            assertEquals(
+                "$SNAPSHOT-b", tokenManager.loadMlsBundle(OWNER_B, KEY).getOrThrow()
+            )
+            assertTrue(prefs.all.keys.none { it.startsWith("mls1_") })
         }
-        assertTrue(prefs.all.keys.none { it.startsWith("mls1_") })
-    }
 
 }
 

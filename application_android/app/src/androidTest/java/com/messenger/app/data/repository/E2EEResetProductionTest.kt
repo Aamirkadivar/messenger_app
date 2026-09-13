@@ -238,17 +238,17 @@ class E2EEResetProductionTest {
         /** Storage outlives the process; only the death flag clears. */
         fun revive() { dead = false }
 
-        override suspend fun deleteHistoryKeyringGeneration(): Result<Unit> =
+        override suspend fun deleteHistoryKeyringGeneration(owner: String): Result<Unit> =
             if (boom("gen")) Result.failure(IllegalStateException("injected: marker delete"))
-            else real.deleteHistoryKeyringGeneration()
+            else real.deleteHistoryKeyringGeneration(USER)
 
-        override suspend fun deleteHistoryKeyringCache(): Result<Unit> =
+        override suspend fun deleteHistoryKeyringCache(owner: String): Result<Unit> =
             if (boom("cache")) Result.failure(IllegalStateException("injected: cache delete"))
-            else real.deleteHistoryKeyringCache()
+            else real.deleteHistoryKeyringCache(USER)
 
-        override suspend fun deleteHistoryKeyring(): Result<Unit> =
+        override suspend fun deleteHistoryKeyring(owner: String): Result<Unit> =
             if (boom("auth")) Result.failure(IllegalStateException("injected: authoritative delete"))
-            else real.deleteHistoryKeyring()
+            else real.deleteHistoryKeyring(USER)
     }
 
     private var faultingStore: FaultingStore? = null
@@ -359,18 +359,18 @@ class E2EEResetProductionTest {
         // Several tests here deliberately leave the keyring in a fail-closed
         // state, and the Keystore is real device storage shared across the run.
         // Starting clean keeps each test independent of its predecessors.
-        tokens.deleteHistoryKeyring()
-        tokens.deleteHistoryKeyringCache()
-        tokens.deleteHistoryKeyringGeneration()
+        tokens.deleteHistoryKeyring(USER)
+        tokens.deleteHistoryKeyringCache(USER)
+        tokens.deleteHistoryKeyringGeneration(USER)
         repo.acknowledgeResetOutcome()
         Unit
     }
 
     @After
     fun tearDown() = runBlocking {
-        tokens.deleteHistoryKeyring()
-        tokens.deleteHistoryKeyringCache()
-        tokens.deleteHistoryKeyringGeneration()
+        tokens.deleteHistoryKeyring(USER)
+        tokens.deleteHistoryKeyringCache(USER)
+        tokens.deleteHistoryKeyringGeneration(USER)
         repo.acknowledgeResetOutcome()
         Unit
     }
@@ -924,9 +924,9 @@ class E2EEResetProductionTest {
             // Each iteration deliberately leaves the keyring fail-closed, which is
             // the point - but the next must start from a clean device or it
             // measures the previous iteration's wreckage instead of its own.
-            tokens.deleteHistoryKeyring()
-            tokens.deleteHistoryKeyringCache()
-            tokens.deleteHistoryKeyringGeneration()
+            tokens.deleteHistoryKeyring(USER)
+            tokens.deleteHistoryKeyringCache(USER)
+            tokens.deleteHistoryKeyringGeneration(USER)
             seedAccountWithVault()
             keyring.ensureRoot(CHAT).getOrThrow()
             sync.uploadIfChanged().getOrThrow()
@@ -952,9 +952,9 @@ class E2EEResetProductionTest {
             // is a PARTIAL teardown that leaves the retired generation trusted -
             // which is precisely what deleting the authoritative copy first used
             // to produce, because cache and marker were left agreeing.
-            val nothingLanded = tokens.loadHistoryKeyringGeneration().getOrThrow() != null &&
-                tokens.loadHistoryKeyringCache().getOrThrow() != null &&
-                tokens.loadHistoryKeyring().getOrThrow() != null
+            val nothingLanded = tokens.loadHistoryKeyringGeneration(USER).getOrThrow() != null &&
+                tokens.loadHistoryKeyringCache(USER).getOrThrow() != null &&
+                tokens.loadHistoryKeyring(USER).getOrThrow() != null
             if (!nothingLanded) {
                 assertNull(
                     "stage " + stage + " resurrected the old generation",
@@ -1025,12 +1025,12 @@ class E2EEResetProductionTest {
         // A plain load can be answered from the plaintext, owner-bound CACHE
         // without ever touching the authoritative blob, so it proves nothing about
         // which key that blob is sealed under. Ask the authoritative copy directly.
-        val stored = tokens.loadHistoryKeyring().getOrThrow()
+        val stored = tokens.loadHistoryKeyring(USER).getOrThrow()
         val authoritativeOpens = stored != null && repo.openHistoryKeyring(stored).isSuccess
 
         // And the cache is not durable ground truth: any marker mismatch, account
         // change, or reset drops it and forces the authoritative read.
-        tokens.deleteHistoryKeyringCache()
+        tokens.deleteHistoryKeyringCache(USER)
         val readBackWithoutCache = keyring.load()
 
         android.util.Log.w(
@@ -1096,7 +1096,7 @@ class E2EEResetProductionTest {
             afterVerification.isSuccess
         )
         // And what it wrote is openable by the account's authoritative key.
-        val stored = tokens.loadHistoryKeyring().getOrThrow()
+        val stored = tokens.loadHistoryKeyring(USER).getOrThrow()
         assertNotNull(stored)
         assertTrue(repo.openHistoryKeyring(stored!!).isSuccess)
     }
@@ -1144,7 +1144,7 @@ class E2EEResetProductionTest {
         assertTrue("and the real recovery key still works", unlocksVaultWithRecoveryKey(oldKey))
 
         // No phantom durable state exists, with or without the cache.
-        tokens.deleteHistoryKeyringCache()
+        tokens.deleteHistoryKeyringCache(USER)
         assertTrue(
             "no unopenable keyring may have been left behind",
             keyring.load().isSuccess
@@ -1170,7 +1170,7 @@ class E2EEResetProductionTest {
                 minted.exceptionOrNull()?.message,
             minted.isSuccess
         )
-        val stored = tokens.loadHistoryKeyring().getOrThrow()
+        val stored = tokens.loadHistoryKeyring(USER).getOrThrow()
         assertTrue(repo.openHistoryKeyring(stored!!).isSuccess)
     }
 

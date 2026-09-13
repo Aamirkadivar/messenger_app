@@ -1,5 +1,6 @@
 package com.messenger.app.ui.viewmodel
 
+import com.messenger.app.security.MlsOwner
 import com.messenger.app.data.encryption.history.HistoryArchiveFeature
 import com.messenger.app.data.repository.ChatRepository
 import com.messenger.app.security.TokenManager
@@ -156,42 +157,54 @@ private class FakeTokenManager : TokenManager {
     override suspend fun saveRefreshToken(token: String) = Result.success(Unit)
     override suspend fun getRefreshToken(): Result<String?> = Result.success(null)
     override suspend fun saveAccessTokenExpiresAt(expiresAt: Long) = Result.success(Unit)
+    // Gate 17 mechanism migration: the interface gained pending-refresh
+    // persistence. This fake only needs to satisfy it; no assertion here depends
+    // on refresh behaviour.
+    override suspend fun savePendingRefresh(userId: String, refreshToken: String, requestId: String) = Result.success(Unit)
+    override suspend fun getPendingRefresh(): Result<com.messenger.app.security.PendingRefresh?> = Result.success(null)
+    override suspend fun clearPendingRefresh() = Result.success(Unit)
+    override suspend fun installRefreshedTokens(accessToken: String, refreshToken: String, expiresAt: Long) = Result.success(Unit)
     override suspend fun getAccessTokenExpiresAt(): Result<Long?> = Result.success(null)
     override suspend fun saveCurrentUserId(userId: String) = Result.success(Unit)
     override suspend fun getCurrentUserId(): Result<String?> = Result.success("me")
     override suspend fun saveE2EEKeys(userId: String, publicHex: String, privateHex: String) = Result.success(Unit)
     override suspend fun getE2EEPrivateKey(userId: String): Result<String?> = Result.success(null)
     override suspend fun getE2EEPublicKey(userId: String): Result<String?> = Result.success(null)
-    override suspend fun saveGroupSenderKey(chatId: String, versionAndKey: String) = Result.success(Unit)
-    override suspend fun getGroupSenderKey(chatId: String): Result<String?> = Result.success(null)
-    override suspend fun loadGroupSenderKeys(chatId: String) = Result.success(emptyMap<Int, String>())
-    override suspend fun savePeerSenderKey(chatId: String, senderId: String, version: Int, keyHex: String) = Result.success(Unit)
-    override suspend fun loadPeerSenderKeys(chatId: String) = Result.success(emptyMap<String, String>())
-    override suspend fun saveKnownPublicKey(chatId: String, publicKeyHex: String) = Result.success(Unit)
-    override suspend fun getKnownPublicKey(chatId: String): Result<String?> = Result.success(null)
-    override suspend fun savePendingPublicKey(chatId: String, publicKeyHex: String) = Result.success(Unit)
-    override suspend fun getPendingPublicKey(chatId: String): Result<String?> = Result.success(null)
-    override suspend fun clearPendingPublicKey(chatId: String) = Result.success(Unit)
-    override suspend fun deleteDirectRatchet(chatId: String) = Result.success(Unit)
-    override suspend fun markSafetyVerified(chatId: String, pubHex: String) = Result.success(Unit)
-    override suspend fun clearSafetyVerified(chatId: String) = Result.success(Unit)
-    override suspend fun isSafetyVerified(chatId: String) = Result.success(false)
+    // Phase 67 added the K_device slot to the interface. This fake only needs to
+    // satisfy it; nothing here enrols a device.
+    override suspend fun saveDeviceKeys(userId: String, publicHex: String, privateHex: String) = Result.success(Unit)
+    override suspend fun getDeviceKeyPrivate(userId: String): Result<String?> = Result.success(null)
+    override suspend fun getDeviceKeyPublic(userId: String): Result<String?> = Result.success(null)
+    override suspend fun saveGroupSenderKey(owner: String, chatId: String, versionAndKey: String) = Result.success(Unit)
+    override suspend fun getGroupSenderKey(owner: String, chatId: String): Result<String?> = Result.success(null)
+    override suspend fun loadGroupSenderKeys(owner: String, chatId: String) = Result.success(emptyMap<Int, String>())
+    override suspend fun savePeerSenderKey(owner: String, chatId: String, senderId: String, version: Int, keyHex: String) = Result.success(Unit)
+    override suspend fun loadPeerSenderKeys(owner: String, chatId: String) = Result.success(emptyMap<String, String>())
+    override suspend fun saveKnownPublicKey(owner: String, chatId: String, publicKeyHex: String) = Result.success(Unit)
+    override suspend fun getKnownPublicKey(owner: String, chatId: String): Result<String?> = Result.success(null)
+    override suspend fun savePendingPublicKey(owner: String, chatId: String, publicKeyHex: String) = Result.success(Unit)
+    override suspend fun getPendingPublicKey(owner: String, chatId: String): Result<String?> = Result.success(null)
+    override suspend fun clearPendingPublicKey(owner: String, chatId: String) = Result.success(Unit)
+    override suspend fun deleteDirectRatchet(owner: String, chatId: String) = Result.success(Unit)
+    override suspend fun markSafetyVerified(owner: String, chatId: String, pubHex: String) = Result.success(Unit)
+    override suspend fun clearSafetyVerified(owner: String, chatId: String) = Result.success(Unit)
+    override suspend fun isSafetyVerified(owner: String, chatId: String) = Result.success(false)
     override suspend fun getOrCreateDeviceId() = Result.success("test-device")
-    override suspend fun exportVaultSenderKeys() = Result.success(emptyMap<String, String>())
-    override suspend fun exportVaultPeerPubs() = Result.success(emptyMap<String, String>())
-    override suspend fun restoreVaultSenderKeys(keys: Map<String, String>) = Result.success(Unit)
-    override suspend fun restoreVaultPeerPubs(pubs: Map<String, String>) = Result.success(Unit)
-    override suspend fun exportVaultPeerSenderKeys() = Result.success(emptyMap<String, String>())
-    override suspend fun restoreVaultPeerSenderKeys(keys: Map<String, String>) = Result.success(Unit)
-    override suspend fun saveMlsBundle(key: String, json: String) = Result.success(Unit)
-    override suspend fun loadMlsBundle(key: String): Result<String?> = Result.success(null)
-    override suspend fun hasMlsBundle(key: String) = Result.success(false)
-    override suspend fun listMlsBundles(prefix: String) = Result.success(emptyMap<String, String>())
-    override suspend fun deleteMlsBundle(key: String) = Result.success(Unit)
-    override suspend fun saveDirectRatchet(chatId: String, json: String) = Result.success(Unit)
-    override suspend fun loadDirectRatchet(chatId: String): Result<String?> = Result.success(null)
-    override suspend fun exportVaultDirectRatchets() = Result.success(emptyMap<String, String>())
-    override suspend fun restoreVaultDirectRatchets(sessions: Map<String, String>) = Result.success(Unit)
+    override suspend fun exportVaultSenderKeys(owner: String) = Result.success(emptyMap<String, String>())
+    override suspend fun exportVaultPeerPubs(owner: String) = Result.success(emptyMap<String, String>())
+    override suspend fun restoreVaultSenderKeys(owner: String, keys: Map<String, String>) = Result.success(Unit)
+    override suspend fun restoreVaultPeerPubs(owner: String, pubs: Map<String, String>) = Result.success(Unit)
+    override suspend fun exportVaultPeerSenderKeys(owner: String) = Result.success(emptyMap<String, String>())
+    override suspend fun restoreVaultPeerSenderKeys(owner: String, keys: Map<String, String>) = Result.success(Unit)
+    override suspend fun saveMlsBundle(owner: MlsOwner, key: String, json: String) = Result.success(Unit)
+    override suspend fun loadMlsBundle(owner: MlsOwner, key: String): Result<String?> = Result.success(null)
+    override suspend fun hasMlsBundle(owner: MlsOwner, key: String) = Result.success(false)
+    override suspend fun listMlsBundles(owner: MlsOwner, prefix: String) = Result.success(emptyMap<String, String>())
+    override suspend fun deleteMlsBundle(owner: MlsOwner, key: String) = Result.success(Unit)
+    override suspend fun saveDirectRatchet(owner: String, chatId: String, json: String) = Result.success(Unit)
+    override suspend fun loadDirectRatchet(owner: String, chatId: String): Result<String?> = Result.success(null)
+    override suspend fun exportVaultDirectRatchets(owner: String) = Result.success(emptyMap<String, String>())
+    override suspend fun restoreVaultDirectRatchets(owner: String, sessions: Map<String, String>) = Result.success(Unit)
     override suspend fun clearTokens() = Result.success(Unit)
     override suspend fun isAccessTokenExpired() = Result.success(false)
     override fun isAuthenticated() = true
@@ -210,18 +223,18 @@ private class NoopKeyringVault : com.messenger.app.data.encryption.history.Histo
 private class NoopKeyringStore : com.messenger.app.data.encryption.history.HistoryKeyringStore {
     private var blob: ByteArray? = null
     private var cache: ByteArray? = null
-    override suspend fun saveHistoryKeyring(sealed: ByteArray) =
+    override suspend fun saveHistoryKeyring(owner: String, sealed: ByteArray) =
         Result.success(Unit).also { blob = sealed.copyOf() }
-    override suspend fun loadHistoryKeyring() = Result.success(blob?.copyOf())
-    override suspend fun deleteHistoryKeyring() = Result.success(Unit).also { blob = null }
-    override suspend fun saveHistoryKeyringCache(plain: ByteArray) =
+    override suspend fun loadHistoryKeyring(owner: String) = Result.success(blob?.copyOf())
+    override suspend fun deleteHistoryKeyring(owner: String) = Result.success(Unit).also { blob = null }
+    override suspend fun saveHistoryKeyringCache(owner: String, plain: ByteArray) =
         Result.success(Unit).also { cache = plain.copyOf() }
-    override suspend fun loadHistoryKeyringCache() = Result.success(cache?.copyOf())
-    override suspend fun deleteHistoryKeyringCache() = Result.success(Unit).also { cache = null }
+    override suspend fun loadHistoryKeyringCache(owner: String) = Result.success(cache?.copyOf())
+    override suspend fun deleteHistoryKeyringCache(owner: String) = Result.success(Unit).also { cache = null }
     private var generation: Long? = null
-    override suspend fun saveHistoryKeyringGeneration(generation: Long) =
+    override suspend fun saveHistoryKeyringGeneration(owner: String, generation: Long) =
         Result.success(Unit).also { this.generation = generation }
-    override suspend fun loadHistoryKeyringGeneration() = Result.success(generation)
-    override suspend fun deleteHistoryKeyringGeneration() =
+    override suspend fun loadHistoryKeyringGeneration(owner: String) = Result.success(generation)
+    override suspend fun deleteHistoryKeyringGeneration(owner: String) =
         Result.success(Unit).also { generation = null }
 }

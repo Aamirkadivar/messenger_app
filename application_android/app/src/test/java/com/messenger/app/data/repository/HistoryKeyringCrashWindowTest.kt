@@ -86,41 +86,41 @@ class HistoryKeyringCrashWindowTest {
          */
         fun restartProcess() { dead = false }
 
-        override suspend fun saveHistoryKeyring(sealed: ByteArray): Result<Unit> {
+        override suspend fun saveHistoryKeyring(owner: String, sealed: ByteArray): Result<Unit> {
             if (crash("authoritative")) return Result.failure(SimulatedProcessDeath())
             authoritative = sealed.copyOf()
             return Result.success(Unit)
         }
-        override suspend fun loadHistoryKeyring() = Result.success(authoritative?.copyOf())
-        override suspend fun deleteHistoryKeyring(): Result<Unit> {
+        override suspend fun loadHistoryKeyring(owner: String) = Result.success(authoritative?.copyOf())
+        override suspend fun deleteHistoryKeyring(owner: String): Result<Unit> {
             if (crash("del-auth")) return Result.failure(SimulatedProcessDeath())
             authoritative = null
             return Result.success(Unit)
         }
 
-        override suspend fun saveHistoryKeyringCache(plain: ByteArray): Result<Unit> {
+        override suspend fun saveHistoryKeyringCache(owner: String, plain: ByteArray): Result<Unit> {
             if (crash("cache")) return Result.failure(SimulatedProcessDeath())
             cache = plain.copyOf()
             return Result.success(Unit)
         }
-        override suspend fun loadHistoryKeyringCache() = Result.success(cache?.copyOf())
+        override suspend fun loadHistoryKeyringCache(owner: String) = Result.success(cache?.copyOf())
         // A delete is a durable write too. It matters here specifically because
         // `writeCache` compensates for an observed save failure by deleting the
         // cache - and in a dead process that compensation never runs either,
         // which is precisely how a stale cache is left behind.
-        override suspend fun deleteHistoryKeyringCache(): Result<Unit> {
+        override suspend fun deleteHistoryKeyringCache(owner: String): Result<Unit> {
             if (crash("del-cache")) return Result.failure(SimulatedProcessDeath())
             cache = null
             return Result.success(Unit)
         }
 
-        override suspend fun saveHistoryKeyringGeneration(generation: Long): Result<Unit> {
+        override suspend fun saveHistoryKeyringGeneration(owner: String, generation: Long): Result<Unit> {
             if (crash("gen")) return Result.failure(SimulatedProcessDeath())
             this.generation = generation
             return Result.success(Unit)
         }
-        override suspend fun loadHistoryKeyringGeneration() = Result.success(generation)
-        override suspend fun deleteHistoryKeyringGeneration(): Result<Unit> {
+        override suspend fun loadHistoryKeyringGeneration(owner: String) = Result.success(generation)
+        override suspend fun deleteHistoryKeyringGeneration(owner: String): Result<Unit> {
             if (crash("del-gen")) return Result.failure(SimulatedProcessDeath())
             generation = null
             return Result.success(Unit)
@@ -239,7 +239,7 @@ class HistoryKeyringCrashWindowTest {
         restart(store).rotate(CHAT)
 
         // Re-importing the published keyring must merge, not conflict.
-        val merged = restart(store).importFromRecovery(published).getOrThrow()
+        val merged = restart(store).importFromRecovery(published, USER).getOrThrow()
         assertNotNull(merged.find(CHAT, 1))
         assertNotNull(merged.find(CHAT, 2))
     }
@@ -401,7 +401,7 @@ class HistoryKeyringCrashWindowTest {
         val exported = restart(store).exportForRecovery().getOrThrow()
         val g = store.generation
 
-        restart(store).importFromRecovery(exported).getOrThrow()
+        restart(store).importFromRecovery(exported, USER).getOrThrow()
         assertEquals("importing what we already have changes nothing", g, store.generation)
         assertFalse(store.cache == null)
     }

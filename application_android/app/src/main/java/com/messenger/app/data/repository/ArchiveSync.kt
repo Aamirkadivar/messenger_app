@@ -2,6 +2,7 @@ package com.messenger.app.data.repository
 
 import android.util.Log
 import com.messenger.app.data.encryption.history.HistoryArchiveFeature
+import com.messenger.app.data.encryption.history.HistoryArchiveDisabledException
 import com.messenger.app.data.model.ArchiveUploadRequest
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.security.TokenManager
@@ -49,6 +50,13 @@ class ArchiveSync @Inject constructor(
      * reaches ChatRepository, which owns this class's lambda seam.
      */
     private val recovery: dagger.Lazy<HistoryKeyringRecoverySync>,
+    /**
+     * The local keyring, consulted only when server recovery could not run.
+     *
+     * Not lazy: MessageArchiver above already depends on it directly, so it is
+     * constructed before this class either way and no cycle is introduced.
+     */
+    private val keyring: HistoryKeyringRepository,
 ) {
 
     private companion object {
@@ -79,7 +87,24 @@ class ArchiveSync @Inject constructor(
         messageId: String,
         plaintext: String,
     ): SealedArchive? {
-        val sealed = archiver.seal(userId, chatId, messageId, plaintext).getOrNull() ?: return null
+        val attempt = archiver.seal(userId, chatId, messageId, plaintext)
+        val sealed = attempt.getOrNull() ?: run {
+            // Report why, at the boundary where the reason was previously destroyed.
+            // A locked vault silently stopped every seal, so archiving looked enabled
+            // while nothing was ever stored - the one failure mode that is invisible
+            // from both the UI and the backend. Disabled-by-flag is a policy state, not
+            // a fault, so it is reported separately and quietly.
+            //
+            // Only the exception message is logged. It carries no key material, no root,
+            // no plaintext and no token; the archive payload never reaches this line.
+            val cause = attempt.exceptionOrNull()
+            if (cause is HistoryArchiveDisabledException) {
+                Log.d(TAG, "archive skipped for this message: archiving is disabled by flag")
+            } else {
+                Log.w(TAG, "archive NOT stored for this message: ${cause?.message}")
+            }
+            return null
+        }
         runCatching { upload(messageId, sealed) }
             .onFailure { Log.w(TAG, "archive upload deferred: ${it.message}") }
         // Sealing may have minted this chat's first root. Publishing happens here,
@@ -154,7 +179,7 @@ class ArchiveSync @Inject constructor(
         // or hostile record accepted now can never be replaced by the correct one.
         val recovered = runCatching { recovery.get().ensureRecovered() }
             .getOrElse { Result.failure(it) }
-        if (recovered.isFailure) {
+        if (recovered.isFailure && !holdsRootFor(chatId)) {
             // A cryptographic or conflicting-root failure must not be papered
             // over by downloading ciphertext we may not be able to open.
             Log.w(TAG, "skipping archive download: keyring recovery did not succeed")
@@ -209,6 +234,42 @@ class ArchiveSync @Inject constructor(
         // Safety bound reached. Explicitly incomplete - never silently truncated.
         Log.w(TAG, "archive download hit the page safety bound; sync is incomplete")
         return ArchivePage(collected, complete = false)
+    }
+
+    /**
+     * Whether this device already holds a root for [chatId] without needing the vault.
+     *
+     * WHY THIS EXISTS. Server-side keyring recovery opens an MK-sealed blob, so it cannot run while
+     * the vault is locked - and the download above used to be gated on it alone. That gate is
+     * broader than what the download actually consumes: opening an archive needs the per-chat root,
+     * not the whole recovered keyring, and the root is readable while locked from the Keystore
+     * cache that exists for exactly this purpose (HistoryKeyringRepository.loadLocked: "the cache is
+     * the only copy readable without MK, so a cold start reads it first").
+     *
+     * WHY IT IS SAFE TO PROCEED ON THIS ALONE. The gate protects a first-writer-wins slot:
+     * applyRemoteArchives pins a record and never overwrites one that is not NONE. But it pins
+     * WITHOUT opening anything, so recovery success never validated the record either - and a
+     * server archive is immutable for the life of its message (one INSERT ... ON CONFLICT DO
+     * NOTHING, no UPDATE, no DELETE route), so the record pinned now is byte-identical to the one a
+     * later pass would pin. Proceeding earlier therefore commits nothing a recovered keyring would
+     * have committed differently.
+     *
+     * WHAT THIS IS NOT. It is not authorization. The download still passes the server's full
+     * check - live session, verified non-revoked device bound to that session, chat membership -
+     * none of which knows or cares whether the vault is locked. A cached root buys the ability to
+     * DECRYPT ciphertext this device was already entitled to fetch, and nothing else. A revoked
+     * device holding this root still cannot obtain a single new byte.
+     *
+     * Chat-specific on purpose: a keyring that merely exists says nothing about this conversation.
+     * A wrong or stale root cannot produce wrong plaintext either way, because the AEAD refuses it
+     * rather than returning anything.
+     */
+    private suspend fun holdsRootFor(chatId: String): Boolean {
+        val held = runCatching { keyring.load() }.getOrNull()?.getOrNull()?.latest(chatId) != null
+        if (held) {
+            Log.d(TAG, "keyring recovery unavailable, but a local root covers this chat; proceeding")
+        }
+        return held
     }
 
     /**

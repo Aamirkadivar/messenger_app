@@ -14,6 +14,7 @@ import com.messenger.app.data.model.MlsPublishKeyPackagesRequest
 import com.messenger.app.data.model.MlsPutGroupInfoRequest
 import com.messenger.app.data.model.MlsWelcomeItem
 import com.messenger.app.data.remote.api.ChatApiService
+import com.messenger.app.security.MlsOwner
 import com.messenger.app.security.TokenManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -53,30 +54,73 @@ class MlsRepository(
     private fun b64(b: ByteArray): String = Base64.encodeToString(b, Base64.NO_WRAP)
     private fun unb64(s: String): ByteArray = Base64.decode(s, Base64.NO_WRAP)
 
-    /** Live MLS state per chat. Serialized into the vault by [groupStateJson]. */
-    private val groups = mutableMapOf<String, Group>()
+    /**
+     * Everything MLS state that belongs to one (account, device) pair.
+     *
+     * These used to be five bare maps on the repository, keyed by chat id or by
+     * KeyPackage reference hash. Neither says anything about ownership, so two
+     * accounts on one device shared them - Gate 26 proved account B observing
+     * the group and epoch account A had established, and it would have committed
+     * to that group under account A's credential.
+     *
+     * Holding one instance per owner makes the isolation structural rather than
+     * a check: a stale continuation belonging to account A writes into account
+     * A's holder because that is the only holder it can name, so it cannot
+     * contaminate account B's state even when it resumes long after the switch.
+     */
+    private class OwnerMlsState {
+        /** Live MLS state per chat. Serialized into the vault by [groupStateJson]. */
+        val groups = mutableMapOf<String, Group>()
 
-    /** Our identity per chat (leaf + signature keys). */
-    private val identities = mutableMapOf<String, MlsGroupCrypto.Identity>()
+        /** Our identity per chat (leaf + signature keys). */
+        val identities = mutableMapOf<String, MlsGroupCrypto.Identity>()
+
+        /**
+         * KeyPackages we published, keyed by their ref hash, so a Welcome naming
+         * one can be opened with the matching init private key.
+         */
+        val publishedKeyPackages = mutableMapOf<String, MlsGroupCrypto.PublishedKeyPackage>()
+
+        /** chatIds this owner has already attempted an external rejoin for. */
+        val rejoinAttempted = mutableSetOf<String>()
+
+        /** The group incarnation this owner last saw the DS advertise. */
+        val groupInstanceIds = mutableMapOf<String, String>()
+    }
+
+    /** ownerTag -> that owner's MLS state. Never keyed by chat. */
+    private val statesByOwner = mutableMapOf<String, OwnerMlsState>()
 
     /**
-     * KeyPackages we published, keyed by their ref hash, so a Welcome naming one
-     * can be opened with the matching init private key.
+     * The only way to reach MLS state. Requires a real owner, so an ownerless
+     * access cannot be written by accident - the maps no longer exist as fields.
+     *
+     * Callers hold [mutex] around this, exactly as they did around the bare maps
+     * before; the lock is serialization, and the owner argument is the ownership
+     * boundary. They are different things and neither substitutes for the other.
      */
-    private val publishedKeyPackages = mutableMapOf<String, MlsGroupCrypto.PublishedKeyPackage>()
+    private fun stateOf(owner: MlsOwner): OwnerMlsState =
+        statesByOwner.getOrPut(owner.tag) { OwnerMlsState() }
+
+    /**
+     * The owner of the operation starting now, or null when the account or the
+     * device cannot be named - in which case the caller must do nothing.
+     *
+     * Resolve this ONCE, at the operation boundary, before any suspending work.
+     * Re-reading it after a network call would attribute the result to whoever
+     * happens to be signed in when it lands.
+     */
+    private suspend fun currentOwner(): MlsOwner? = MlsOwner.of(
+        tokenManager.getCurrentUserId().getOrNull(),
+        tokenManager.getOrCreateDeviceId().getOrNull()
+    )
+
+    /** Drops one owner's in-memory MLS state. Hygiene: the namespace is the boundary. */
+    fun forgetOwner(owner: MlsOwner) {
+        statesByOwner.remove(owner.tag)
+    }
 
     private val mutex = Mutex()
-
-    /**
-     * chatIds we have already attempted an external rejoin for this process.
-     *
-     * externalRejoin() submits a commit, and every commit advances the epoch and
-     * issues a fresh Welcome. Running it on each chat open drove the group to
-     * epoch 9 with five unconsumed Welcomes and still no members. At most one
-     * attempt per chat per process makes opening a chat idempotent; a genuine
-     * retry can happen on the next launch.
-     */
-    private val rejoinAttempted = mutableSetOf<String>()
 
     /**
      * Leaf credential format, shared byte-for-byte with the Windows client.
@@ -100,6 +144,10 @@ class MlsRepository(
     suspend fun publishKeyPackages(count: Int = KEY_PACKAGE_TARGET): Result<Int> =
         withContext(Dispatchers.IO) {
             runCatching {
+                // Owner captured at the operation boundary, before any
+                // suspending work. Re-reading it after the network call would
+                // file the result under whoever is signed in when it lands.
+                val owner = currentOwner() ?: error("no MLS owner")
                 val token = tokenManager.getAccessToken().getOrNull()
                     ?: return@runCatching 0
                 val userId = tokenManager.getCurrentUserId().getOrNull().orEmpty()
@@ -114,12 +162,12 @@ class MlsRepository(
                         val hash = refHash(wire)
                         // Retain the init key: it is what opens a Welcome sent
                         // to this KeyPackage. Losing it means we cannot join.
-                        publishedKeyPackages[hash] = published
-                        identities[hash] = identity
+                        stateOf(owner).publishedKeyPackages[hash] = published
+                        stateOf(owner).identities[hash] = identity
                         // Persist immediately: if the app dies before the
                         // Welcome arrives, the init key must survive or the
                         // invite can never be opened.
-                        persistKeyPackage(hash, published, identity)
+                        persistKeyPackage(owner, hash, published, identity)
                         items.add(
                             MlsKeyPackageItem(
                                 deviceId = deviceId,
@@ -169,6 +217,10 @@ class MlsRepository(
      */
     suspend fun createGroup(chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
+            // Owner captured at the operation boundary, before any
+            // suspending work. Re-reading it after the network call would
+            // file the result under whoever is signed in when it lands.
+            val owner = currentOwner() ?: error("no MLS owner")
             val token = tokenManager.getAccessToken().getOrNull()
                 ?: error("no access token")
             val userId = tokenManager.getCurrentUserId().getOrNull().orEmpty()
@@ -178,9 +230,9 @@ class MlsRepository(
             mutex.withLock {
                 val identity = MlsGroupCrypto.newIdentity(mlsCredential(userId, myDev))
                 val group = MlsGroupCrypto.createGroup(groupId, identity)
-                identities[chatId] = identity
-                groups[chatId] = group
-                persistGroupBundle(chatId, identity, welcome = null)
+                stateOf(owner).identities[chatId] = identity
+                stateOf(owner).groups[chatId] = group
+                persistGroupBundle(owner, chatId, identity, welcome = null)
             }
 
             val resp = api.createMlsGroup(
@@ -196,11 +248,11 @@ class MlsRepository(
             // the other device could never read those sends.
             if (resp.code() == 409) {
                 Log.i(TAG, "createGroup 409 for $chatId — dropping local orphan")
-                forgetGroup(chatId)
+                forgetGroup(owner, chatId)
                 error("mls group already exists")
             }
             if (!resp.isSuccessful) {
-                forgetGroup(chatId)
+                forgetGroup(owner, chatId)
                 error("createMlsGroup failed: ${resp.code()}")
             }
             // Add this device a second time so we hold a Welcome. The creator
@@ -226,6 +278,10 @@ class MlsRepository(
     ): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
+                // Owner captured at the operation boundary, before any
+                // suspending work. Re-reading it after the network call would
+                // file the result under whoever is signed in when it lands.
+                val owner = currentOwner() ?: error("no MLS owner")
                 val token = tokenManager.getAccessToken().getOrNull()
                     ?: error("no access token")
                 val deviceId = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
@@ -242,12 +298,12 @@ class MlsRepository(
                 val kpWire = unb64(claimed.keyPackageB64)
 
                 val (commitBytes, welcomeBytes, observedEpoch) = mutex.withLock {
-                    val group = groups[chatId] ?: error("no local MLS group for $chatId")
+                    val group = stateOf(owner).groups[chatId] ?: error("no local MLS group for $chatId")
                     val before = group.epoch
                     val result = MlsGroupCrypto.addMember(
                         group, MlsGroupCrypto.decodeKeyPackage(kpWire)
                     )
-                    groups[chatId] = result.group
+                    stateOf(owner).groups[chatId] = result.group
                     Triple(result.commit, result.welcome, before)
                 }
 
@@ -271,8 +327,8 @@ class MlsRepository(
                     // top of that fork skips the winning commit (its epoch is
                     // "behind" us). Rebuild from the persisted Welcome first.
                     Log.w(TAG, "commit rejected (stale epoch) for $chatId — rebuilding from Welcome")
-                    if (!rebuildFromBundle(chatId)) {
-                        mutex.withLock { groups.remove(chatId) }
+                    if (!rebuildFromBundle(owner, chatId)) {
+                        mutex.withLock { stateOf(owner).groups.remove(chatId) }
                     }
                     syncHandshakes(chatId)
                     error("stale epoch; retry the add")
@@ -284,10 +340,10 @@ class MlsRepository(
                 // what lets this device rebuild after a restart.
                 val hash = refHash(kpWire)
                 mutex.withLock {
-                    val published = publishedKeyPackages[hash]
-                    val id = identities[hash]
+                    val published = stateOf(owner).publishedKeyPackages[hash]
+                    val id = stateOf(owner).identities[hash]
                     if (published != null && id != null) {
-                        persistGroupBundle(chatId, id, welcomeBytes, published)
+                        persistGroupBundle(owner, chatId, id, welcomeBytes, published)
                     }
                 }
 
@@ -316,6 +372,10 @@ class MlsRepository(
     suspend fun ensureGroupEstablished(chatId: String): Result<Boolean> =
         withContext(Dispatchers.IO) {
             runCatching {
+                // Owner captured at the operation boundary, before any
+                // suspending work. Re-reading it after the network call would
+                // file the result under whoever is signed in when it lands.
+                val owner = currentOwner() ?: error("no MLS owner")
                 val token = tokenManager.getAccessToken().getOrNull() ?: return@runCatching false
 
                 // Ask the server FIRST, even when we hold local state. If the
@@ -326,7 +386,7 @@ class MlsRepository(
                 val existing = api.getMlsGroup(bearer(token), chatId)
                 if (existing.code() == 404 && hasGroup(chatId)) {
                     Log.i(TAG, "MLS $chatId: server has no group; dropping stale local state")
-                    forgetGroup(chatId)
+                    forgetGroup(owner, chatId)
                 }
 
                 // Existence is not enough: a group that was deleted and
@@ -336,7 +396,7 @@ class MlsRepository(
                 // ("mac check in GCM failed") with no other symptom.
                 val serverInstance = existing.body()?.instanceId.orEmpty()
                 if (existing.isSuccessful && serverInstance.isNotBlank()) {
-                    val knownInstance = loadGroupInstanceId(chatId)
+                    val knownInstance = loadGroupInstanceId(owner, chatId)
                     if (hasGroup(chatId) && knownInstance != serverInstance) {
                         // Blank counts as a mismatch. A bundle written before
                         // instance stamping existed has unknown provenance, and
@@ -346,16 +406,16 @@ class MlsRepository(
                         val from = knownInstance.ifBlank { "unstamped" }
                         Log.i(TAG, "MLS $chatId: group instance mismatch " +
                             "($from -> ${serverInstance.take(8)}); dropping stale state")
-                        forgetGroup(chatId)
+                        forgetGroup(owner, chatId)
                     }
-                    mutex.withLock { groupInstanceIds[chatId] = serverInstance }
+                    mutex.withLock { stateOf(owner).groupInstanceIds[chatId] = serverInstance }
                 }
 
                 if (hasGroup(chatId)) {
                     syncHandshakes(chatId)
-                    if (!bundleHasWelcome(chatId)) persistSelfWelcome(chatId)
+                    if (!bundleHasWelcome(owner, chatId)) persistSelfWelcome(chatId)
                     inviteMissingDevices(chatId)
-                    logState(chatId, "ensure-has-group")
+                    logState(owner, chatId, "ensure-has-group")
                     return@runCatching true
                 }
                 if (existing.isSuccessful) {
@@ -363,7 +423,7 @@ class MlsRepository(
                     if (hasGroup(chatId)) {
                         syncHandshakes(chatId)
                         inviteMissingDevices(chatId)
-                        logState(chatId, "ensure-joined-welcome")
+                        logState(owner, chatId, "ensure-joined-welcome")
                         return@runCatching true
                     }
                     // Not a member yet. We deliberately do NOT external-join
@@ -378,7 +438,7 @@ class MlsRepository(
                     // persistable, so the join survives restarts (see
                     // docs/mls-multi-device.md, "The invariant").
                     ensureKeyPackagesAvailable()
-                    logState(chatId, "ensure-awaiting-welcome")
+                    logState(owner, chatId, "ensure-awaiting-welcome")
                     Log.i(TAG, "MLS $chatId: not a member; awaiting Welcome (KeyPackages published)")
                     return@runCatching false
                 }
@@ -392,7 +452,7 @@ class MlsRepository(
                 // published KeyPackage wins.
                 if (!isElectedCreator(chatId)) {
                     ensureKeyPackagesAvailable()
-                    logState(chatId, "ensure-not-creator")
+                    logState(owner, chatId, "ensure-not-creator")
                     Log.i(TAG, "MLS $chatId: not the elected creator; awaiting Welcome")
                     return@runCatching false
                 }
@@ -402,16 +462,16 @@ class MlsRepository(
                     if (hasGroup(chatId)) {
                         syncHandshakes(chatId)
                         inviteMissingDevices(chatId)
-                        logState(chatId, "ensure-create-409-joined")
+                        logState(owner, chatId, "ensure-create-409-joined")
                         return@runCatching true
                     }
                     ensureKeyPackagesAvailable()
-                    logState(chatId, "ensure-create-failed")
+                    logState(owner, chatId, "ensure-create-failed")
                     return@runCatching false
                 }
                 publishGroupInfo(chatId)
                 inviteMissingDevices(chatId)
-                logState(chatId, "ensure-created")
+                logState(owner, chatId, "ensure-created")
                 hasGroup(chatId)
             }
         }
@@ -431,8 +491,8 @@ class MlsRepository(
         }
     }
 
-    private suspend fun bundleHasWelcome(chatId: String): Boolean {
-        val json = tokenManager.loadMlsBundle(groupKey(chatId)).getOrNull() ?: return false
+    private suspend fun bundleHasWelcome(owner: MlsOwner, chatId: String): Boolean {
+        val json = tokenManager.loadMlsBundle(owner, groupKey(chatId)).getOrNull() ?: return false
         return runCatching {
             org.json.JSONObject(json).optString("welcome").isNotBlank()
         }.getOrDefault(false)
@@ -471,11 +531,11 @@ class MlsRepository(
     }
 
     /** Only the lowest-ordered current leaf invites; everyone else waits. */
-    private suspend fun isElectedAdder(chatId: String): Boolean {
+    private suspend fun isElectedAdder(owner: MlsOwner, chatId: String): Boolean {
         val me = tokenManager.getCurrentUserId().getOrNull().orEmpty()
         val meDev = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
         val roster = mutex.withLock {
-            groups[chatId]?.let { MlsGroupCrypto.memberIdentities(it) }.orEmpty()
+            stateOf(owner).groups[chatId]?.let { MlsGroupCrypto.memberIdentities(it) }.orEmpty()
         }
         val meCred = mlsCredential(me, meDev)
         val win = MlsPolicy.isElectedAdder(meCred, roster)
@@ -489,12 +549,16 @@ class MlsRepository(
 
     suspend fun inviteMissingDevices(chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
+            // Owner captured at the operation boundary, before any
+            // suspending work. Re-reading it after the network call would
+            // file the result under whoever is signed in when it lands.
+            val owner = currentOwner() ?: error("no MLS owner")
             if (!hasGroup(chatId)) return@runCatching
-            if (!isElectedAdder(chatId)) return@runCatching
+            if (!isElectedAdder(owner, chatId)) return@runCatching
             val token = tokenManager.getAccessToken().getOrNull() ?: return@runCatching
             val meDev = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
             val roster = mutex.withLock {
-                groups[chatId]?.let { MlsGroupCrypto.memberIdentities(it) }.orEmpty()
+                stateOf(owner).groups[chatId]?.let { MlsGroupCrypto.memberIdentities(it) }.orEmpty()
             }
             val devices = api.listChatE2EEDevices(bearer(token), chatId)
                 .body()?.devices.orEmpty()
@@ -513,16 +577,16 @@ class MlsRepository(
         }
     }
 
-    private suspend fun loadInvitedDevices(chatId: String): Set<String> =
-        tokenManager.loadMlsBundle("invited/$chatId").getOrNull()
+    private suspend fun loadInvitedDevices(owner: MlsOwner, chatId: String): Set<String> =
+        tokenManager.loadMlsBundle(owner, "invited/$chatId").getOrNull()
             ?.split(',')
             ?.map { it.trim() }
             ?.filter { it.isNotEmpty() }
             ?.toSet()
             .orEmpty()
 
-    private suspend fun persistInvitedDevices(chatId: String, ids: Set<String>) {
-        tokenManager.saveMlsBundle("invited/$chatId", ids.joinToString(","))
+    private suspend fun persistInvitedDevices(owner: MlsOwner, chatId: String, ids: Set<String>) {
+        tokenManager.saveMlsBundle(owner, "invited/$chatId", ids.joinToString(","))
     }
 
     // ---- Inbound: welcomes and commits ----
@@ -533,6 +597,10 @@ class MlsRepository(
      */
     suspend fun processWelcomes(): Result<List<String>> = withContext(Dispatchers.IO) {
         runCatching {
+            // Owner captured at the operation boundary, before any
+            // suspending work. Re-reading it after the network call would
+            // file the result under whoever is signed in when it lands.
+            val owner = currentOwner() ?: error("no MLS owner")
             val token = tokenManager.getAccessToken().getOrNull()
                 ?: return@runCatching emptyList()
             val deviceId = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
@@ -555,16 +623,16 @@ class MlsRepository(
                 val ok = mutex.withLock {
                     // Try each retained KeyPackage: only the one the inviter
                     // claimed can open this Welcome.
-                    publishedKeyPackages.entries.firstNotNullOfOrNull { (hash, published) ->
-                        val identity = identities[hash] ?: return@firstNotNullOfOrNull null
+                    stateOf(owner).publishedKeyPackages.entries.firstNotNullOfOrNull { (hash, published) ->
+                        val identity = stateOf(owner).identities[hash] ?: return@firstNotNullOfOrNull null
                         runCatching {
                             MlsGroupCrypto.joinFromWelcome(published, identity, welcomeBytes)
                         }.getOrNull()?.also { group ->
-                            groups[w.chatId] = group
-                            identities[w.chatId] = identity
+                            stateOf(owner).groups[w.chatId] = group
+                            stateOf(owner).identities[w.chatId] = identity
                             // The Welcome is what lets us rebuild this group
                             // after a restart, so keep it with the identity.
-                            persistGroupBundle(w.chatId, identity, welcomeBytes, published)
+                            persistGroupBundle(owner, w.chatId, identity, welcomeBytes, published)
                         }
                     } != null
                 }
@@ -592,14 +660,18 @@ class MlsRepository(
     /** Applies any commits this client has not yet seen, advancing the epoch. */
     suspend fun syncHandshakes(chatId: String): Result<Long> = withContext(Dispatchers.IO) {
         runCatching {
+            // Owner captured at the operation boundary, before any
+            // suspending work. Re-reading it after the network call would
+            // file the result under whoever is signed in when it lands.
+            val owner = currentOwner() ?: error("no MLS owner")
             val token = tokenManager.getAccessToken().getOrNull()
                 ?: return@runCatching 0L
-            val since = mutex.withLock { groups[chatId]?.epoch ?: 0L }
+            val since = mutex.withLock { stateOf(owner).groups[chatId]?.epoch ?: 0L }
             val resp = api.getMlsHandshakes(bearer(token), chatId, since)
             val handshakes = resp.body()?.handshakes.orEmpty()
 
             mutex.withLock {
-                val group = groups[chatId] ?: return@withLock since
+                val group = stateOf(owner).groups[chatId] ?: return@withLock since
                 var current = group
                 for (h in handshakes) {
                     // Our own commit is already applied locally.
@@ -615,7 +687,7 @@ class MlsRepository(
                     }
                     current = next
                 }
-                groups[chatId] = current
+                stateOf(owner).groups[chatId] = current
                 current.epoch
             }
         }
@@ -624,15 +696,21 @@ class MlsRepository(
     // ---- Application messages ----
 
     /** Encrypts a group message. Null when this chat has no MLS group yet. */
-    suspend fun protect(chatId: String, plaintext: ByteArray): ByteArray? = mutex.withLock {
-        val group = groups[chatId] ?: return null
-        runCatching { MlsGroupCrypto.protect(group, plaintext) }.getOrNull()
+    suspend fun protect(chatId: String, plaintext: ByteArray): ByteArray? {
+        val owner = currentOwner() ?: return null
+        return mutex.withLock {
+            val group = stateOf(owner).groups[chatId] ?: return null
+            runCatching { MlsGroupCrypto.protect(owner, group, plaintext) }.getOrNull()
+        }
     }
 
     /** Decrypts a group message. Null when it does not open. */
-    suspend fun unprotect(chatId: String, payload: ByteArray): ByteArray? = mutex.withLock {
-        val group = groups[chatId] ?: return null
-        MlsGroupCrypto.unprotect(group, payload)
+    suspend fun unprotect(chatId: String, payload: ByteArray): ByteArray? {
+        val owner = currentOwner() ?: return null
+        return mutex.withLock {
+            val group = stateOf(owner).groups[chatId] ?: return null
+            MlsGroupCrypto.unprotect(owner, group, payload)
+        }
     }
 
     /**
@@ -668,10 +746,10 @@ class MlsRepository(
         return runCatching { api.getMlsCoverage(bearer(token), chatId).body() }.getOrNull()
     }
 
-    private suspend fun logState(chatId: String, where: String) {
+    private suspend fun logState(owner: MlsOwner, chatId: String, where: String) {
         val coverage = fetchCoverage(chatId)
         val roster = mutex.withLock {
-            groups[chatId]?.let { MlsGroupCrypto.memberIdentities(it) }.orEmpty()
+            stateOf(owner).groups[chatId]?.let { MlsGroupCrypto.memberIdentities(it) }.orEmpty()
         }
         val meDev = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
         val live = coverage?.liveDevices?.map { it.deviceId }.orEmpty()
@@ -695,8 +773,8 @@ class MlsRepository(
      * Used after a 409: the rejected add is already applied locally and must
      * not be the base for handshake replay.
      */
-    private suspend fun rebuildFromBundle(chatId: String): Boolean {
-        val json = tokenManager.loadMlsBundle(groupKey(chatId)).getOrNull() ?: return false
+    private suspend fun rebuildFromBundle(owner: MlsOwner, chatId: String): Boolean {
+        val json = tokenManager.loadMlsBundle(owner, groupKey(chatId)).getOrNull() ?: return false
         val o = runCatching { org.json.JSONObject(json) }.getOrNull() ?: return false
         val identity = MlsGroupCrypto.decodeIdentity(o.optString("identity")) ?: return false
         val welcomeB64 = o.optString("welcome")
@@ -707,8 +785,8 @@ class MlsRepository(
             MlsGroupCrypto.joinFromWelcome(published, identity, unb64(welcomeB64))
         }.getOrNull() ?: return false
         mutex.withLock {
-            groups[chatId] = group
-            identities[chatId] = identity
+            stateOf(owner).groups[chatId] = group
+            stateOf(owner).identities[chatId] = identity
         }
         Log.i(TAG, "MLS $chatId: rebuilt from Welcome at epoch ${group.epoch}")
         return true
@@ -720,9 +798,13 @@ class MlsRepository(
      */
     suspend fun publishGroupInfo(chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
+            // Owner captured at the operation boundary, before any
+            // suspending work. Re-reading it after the network call would
+            // file the result under whoever is signed in when it lands.
+            val owner = currentOwner() ?: error("no MLS owner")
             val token = tokenManager.getAccessToken().getOrNull() ?: return@runCatching
             val (info, epoch) = mutex.withLock {
-                val g = groups[chatId] ?: return@runCatching
+                val g = stateOf(owner).groups[chatId] ?: return@runCatching
                 MlsGroupCrypto.exportGroupInfo(g) to g.epoch
             }
             val resp = api.putMlsGroupInfo(
@@ -742,6 +824,10 @@ class MlsRepository(
      */
     suspend fun externalRejoin(chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
+            // Owner captured at the operation boundary, before any
+            // suspending work. Re-reading it after the network call would
+            // file the result under whoever is signed in when it lands.
+            val owner = currentOwner() ?: error("no MLS owner")
             val token = tokenManager.getAccessToken().getOrNull() ?: error("no access token")
             val deviceId = tokenManager.getOrCreateDeviceId().getOrNull().orEmpty()
             val userId = tokenManager.getCurrentUserId().getOrNull().orEmpty()
@@ -775,9 +861,9 @@ class MlsRepository(
             if (!resp.isSuccessful) error("external commit rejected: ${resp.code()}")
 
             mutex.withLock {
-                groups[chatId] = joined.group
-                identities[chatId] = identity
-                persistGroupBundle(chatId, identity, welcome = null, published = published)
+                stateOf(owner).groups[chatId] = joined.group
+                stateOf(owner).identities[chatId] = identity
+                persistGroupBundle(owner, chatId, identity, welcome = null, published = published)
             }
             publishGroupInfo(chatId)
             Unit
@@ -797,29 +883,28 @@ class MlsRepository(
      * when the Delivery Service no longer knows the group: the local bundle
      * then describes a group of one that nobody else can ever join.
      */
-    private suspend fun forgetGroup(chatId: String) {
+    private suspend fun forgetGroup(owner: MlsOwner, chatId: String) {
         mutex.withLock {
-            groups.remove(chatId)
-            identities.remove(chatId)
+            stateOf(owner).groups.remove(chatId)
+            stateOf(owner).identities.remove(chatId)
         }
-        rejoinAttempted.remove(chatId)
+        stateOf(owner).rejoinAttempted.remove(chatId)
         // Drop the cached instance too: the caller re-stamps it from the
         // server's current value, and a stale entry here would make the next
         // comparison agree with a group we are no longer part of.
-        groupInstanceIds.remove(chatId)
-        tokenManager.deleteMlsBundle(groupKey(chatId))
+        stateOf(owner).groupInstanceIds.remove(chatId)
+        tokenManager.deleteMlsBundle(owner, groupKey(chatId))
         // Scoped to the group we just dropped. Carrying it into the new group
         // would make us skip re-inviting those devices, and they now wait to be
         // added instead of external-joining — so they would wait forever.
-        tokenManager.deleteMlsBundle("invited/$chatId")
+        tokenManager.deleteMlsBundle(owner, "invited/$chatId")
     }
 
     /** Instance id of the group incarnation each local bundle belongs to. */
-    private val groupInstanceIds = mutableMapOf<String, String>()
 
-    private suspend fun loadGroupInstanceId(chatId: String): String {
-        groupInstanceIds[chatId]?.let { return it }
-        val json = tokenManager.loadMlsBundle(groupKey(chatId)).getOrNull() ?: return ""
+    private suspend fun loadGroupInstanceId(owner: MlsOwner, chatId: String): String {
+        stateOf(owner).groupInstanceIds[chatId]?.let { return it }
+        val json = tokenManager.loadMlsBundle(owner, groupKey(chatId)).getOrNull() ?: return ""
         val id = runCatching { org.json.JSONObject(json).optString("instance") }
             .getOrNull().orEmpty()
         // optString yields the literal "null" for a JSON null.
@@ -830,6 +915,7 @@ class MlsRepository(
     private fun groupKey(chatId: String) = "group/$chatId"
 
     private suspend fun persistKeyPackage(
+        owner: MlsOwner,
         hash: String,
         published: MlsGroupCrypto.PublishedKeyPackage,
         identity: MlsGroupCrypto.Identity
@@ -837,10 +923,11 @@ class MlsRepository(
         val o = org.json.JSONObject()
         o.put("kp", MlsGroupCrypto.encodePublishedKeyPackage(published))
         o.put("identity", MlsGroupCrypto.encodeIdentity(identity))
-        tokenManager.saveMlsBundle(kpKey(hash), o.toString())
+        tokenManager.saveMlsBundle(owner, kpKey(hash), o.toString())
     }
 
     private suspend fun persistGroupBundle(
+        owner: MlsOwner,
         chatId: String,
         identity: MlsGroupCrypto.Identity,
         welcome: ByteArray?,
@@ -853,8 +940,8 @@ class MlsRepository(
         // Stamp which incarnation of the group this state belongs to, so a
         // group that was deleted and recreated under the same chat_id can be
         // told apart from the one we actually joined.
-        groupInstanceIds[chatId]?.let { o.put("instance", it) }
-        tokenManager.saveMlsBundle(groupKey(chatId), o.toString())
+        stateOf(owner).groupInstanceIds[chatId]?.let { o.put("instance", it) }
+        tokenManager.saveMlsBundle(owner, groupKey(chatId), o.toString())
     }
 
     /**
@@ -864,9 +951,13 @@ class MlsRepository(
      */
     suspend fun restoreGroups(): Result<List<String>> = withContext(Dispatchers.IO) {
         runCatching {
+            // Owner captured at the operation boundary, before any
+            // suspending work. Re-reading it after the network call would
+            // file the result under whoever is signed in when it lands.
+            val owner = currentOwner() ?: error("no MLS owner")
             // Re-arm published KeyPackages first, so a Welcome that arrives
             // after the restart can still be opened.
-            tokenManager.listMlsBundles("kp/").getOrDefault(emptyMap()).forEach { (key, json) ->
+            tokenManager.listMlsBundles(owner, "kp/").getOrDefault(emptyMap()).forEach { (key, json) ->
                 val hash = key.removePrefix("kp/")
                 runCatching {
                     val o = org.json.JSONObject(json)
@@ -875,14 +966,14 @@ class MlsRepository(
                     val id = MlsGroupCrypto.decodeIdentity(o.optString("identity"))
                         ?: return@runCatching
                     mutex.withLock {
-                        publishedKeyPackages[hash] = kp
-                        identities[hash] = id
+                        stateOf(owner).publishedKeyPackages[hash] = kp
+                        stateOf(owner).identities[hash] = id
                     }
                 }
             }
 
             val restored = mutableListOf<String>()
-            for ((key, json) in tokenManager.listMlsBundles("group/").getOrDefault(emptyMap())) {
+            for ((key, json) in tokenManager.listMlsBundles(owner, "group/").getOrDefault(emptyMap())) {
                 val chatId = key.removePrefix("group/")
                 val o = runCatching { org.json.JSONObject(json) }.getOrNull() ?: continue
                 val identity = MlsGroupCrypto.decodeIdentity(o.optString("identity")) ?: continue
@@ -905,8 +996,8 @@ class MlsRepository(
                     continue
                 }
                 mutex.withLock {
-                    groups[chatId] = group
-                    identities[chatId] = identity
+                    stateOf(owner).groups[chatId] = group
+                    stateOf(owner).identities[chatId] = identity
                 }
                 // The Welcome lands us at the epoch we joined; replay anything
                 // committed since so this device is current.
@@ -918,8 +1009,14 @@ class MlsRepository(
     }
 
     /** True when this chat has usable MLS state on this device. */
-    suspend fun hasGroup(chatId: String): Boolean = mutex.withLock { groups.containsKey(chatId) }
+    suspend fun hasGroup(chatId: String): Boolean {
+        val owner = currentOwner() ?: return false
+        return mutex.withLock { stateOf(owner).groups.containsKey(chatId) }
+    }
 
     /** Current epoch for diagnostics/tests. */
-    suspend fun epochOf(chatId: String): Long = mutex.withLock { groups[chatId]?.epoch ?: -1L }
+    suspend fun epochOf(chatId: String): Long {
+        val owner = currentOwner() ?: return -1L
+        return mutex.withLock { stateOf(owner).groups[chatId]?.epoch ?: -1L }
+    }
 }

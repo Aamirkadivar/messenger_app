@@ -7,11 +7,13 @@ import com.messenger.app.BuildConfig
 import com.messenger.app.data.model.MlsClaimKeyPackageRequest
 import com.messenger.app.data.model.MlsCommitRequest
 import com.messenger.app.data.model.MlsWelcomeItem
+import com.messenger.app.data.remote.SessionRefresher
 import com.messenger.app.data.remote.TokenRefreshAuthenticator
 import com.messenger.app.data.remote.api.AuthApiService
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.security.KeyStoreManagerImpl
 import com.messenger.app.security.TokenManagerImpl
+import javax.inject.Provider
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -30,6 +32,9 @@ import java.security.MessageDigest
  * Never launches MainActivity, never calls inviteMissingDevices/evictPhantomMembers.
  */
 class SamsungAddSubmitTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "R2SUBMIT"
@@ -63,7 +68,7 @@ class SamsungAddSubmitTest {
             .client(OkHttpClient()).addConverterFactory(json.asConverterFactory(ct))
             .build().create(AuthApiService::class.java)
         val client = OkHttpClient.Builder()
-            .authenticator(TokenRefreshAuthenticator(tm) { authApi }).build()
+            .authenticator(TokenRefreshAuthenticator(SessionRefresher(tm, Provider { authApi }))).build()
         val api: ChatApiService = Retrofit.Builder().baseUrl(BuildConfig.API_BASE_URL)
             .client(client).addConverterFactory(json.asConverterFactory(ct))
             .build().create(ChatApiService::class.java)
@@ -95,7 +100,7 @@ class SamsungAddSubmitTest {
         if (local != EXPECTED_EPOCH) { repo.syncHandshakes(CHAT); local = repo.epoch(CHAT) }
         p("adder local epoch   : $local")
         if (local != EXPECTED_EPOCH) { p("ABORT: local epoch != 9"); return@runBlocking }
-        val gid = Base64.decode(tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
+        val gid = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
 
         val rosterBefore = repo.roster(CHAT)
         p("roster BEFORE (${rosterBefore.size}):")

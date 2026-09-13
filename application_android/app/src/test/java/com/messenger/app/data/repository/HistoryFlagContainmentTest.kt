@@ -53,20 +53,20 @@ class HistoryFlagContainmentTest {
         var generation: Long? = null
         var writes = 0
 
-        override suspend fun saveHistoryKeyring(sealed: ByteArray) =
+        override suspend fun saveHistoryKeyring(owner: String, sealed: ByteArray) =
             Result.success(Unit).also { writes++; authoritative = sealed.copyOf() }
-        override suspend fun loadHistoryKeyring() = Result.success(authoritative?.copyOf())
-        override suspend fun deleteHistoryKeyring() =
+        override suspend fun loadHistoryKeyring(owner: String) = Result.success(authoritative?.copyOf())
+        override suspend fun deleteHistoryKeyring(owner: String) =
             Result.success(Unit).also { writes++; authoritative = null }
-        override suspend fun saveHistoryKeyringCache(plain: ByteArray) =
+        override suspend fun saveHistoryKeyringCache(owner: String, plain: ByteArray) =
             Result.success(Unit).also { writes++; cache = plain.copyOf() }
-        override suspend fun loadHistoryKeyringCache() = Result.success(cache?.copyOf())
-        override suspend fun deleteHistoryKeyringCache() =
+        override suspend fun loadHistoryKeyringCache(owner: String) = Result.success(cache?.copyOf())
+        override suspend fun deleteHistoryKeyringCache(owner: String) =
             Result.success(Unit).also { writes++; cache = null }
-        override suspend fun saveHistoryKeyringGeneration(generation: Long) =
+        override suspend fun saveHistoryKeyringGeneration(owner: String, generation: Long) =
             Result.success(Unit).also { writes++; this.generation = generation }
-        override suspend fun loadHistoryKeyringGeneration() = Result.success(generation)
-        override suspend fun deleteHistoryKeyringGeneration() =
+        override suspend fun loadHistoryKeyringGeneration(owner: String) = Result.success(generation)
+        override suspend fun deleteHistoryKeyringGeneration(owner: String) =
             Result.success(Unit).also { writes++; generation = null }
     }
 
@@ -153,15 +153,15 @@ class HistoryFlagContainmentTest {
         val cipher = Cipher()
         val archiver = MessageArchiver(keyring, cipher, feature)
         /** The real object ChatRepository drives for both archive directions. */
-        val archiveSync = ArchiveSync(archiver, server, Tokens(), feature, dagger.Lazy { sync })
+        val archiveSync = ArchiveSync(archiver, server, Tokens(), feature, dagger.Lazy { sync }, keyring)
     }
 
     // ================================================ the flag is still OFF
 
     @Test
-    fun theProductionDefaultIsOff() {
-        assertFalse(HistoryArchiveFeature.DEFAULT_ENABLED)
-        assertFalse(HistoryArchiveFeature.Default.isEnabled())
+    fun theProductionDefaultIsOn() {
+        assertTrue(HistoryArchiveFeature.DEFAULT_ENABLED)
+        assertTrue(HistoryArchiveFeature.Default.isEnabled())
     }
 
     // ================================================ OFF: nothing is minted
@@ -208,7 +208,7 @@ class HistoryFlagContainmentTest {
         assertTrue(r.keyring.ensureRoot(CHAT).exceptionOrNull() is HistoryArchiveDisabledException)
         assertTrue(r.keyring.rotate(CHAT).exceptionOrNull() is HistoryArchiveDisabledException)
         assertTrue(
-            r.keyring.importFromRecovery(byteArrayOf(1, 0, 0, 0, 0))
+            r.keyring.importFromRecovery(byteArrayOf(1, 0, 0, 0, 0), USER)
                 .exceptionOrNull() is HistoryArchiveDisabledException
         )
         r.keyring.markRotationRequired(CHAT)

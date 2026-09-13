@@ -24,6 +24,9 @@ import org.junit.Test
  * Performs NO HTTP request, NO submitMlsCommit, NO mergePending, NO persist.
  */
 class SamsungRemovePreflightTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "PREFLIGHT"
@@ -54,7 +57,7 @@ class SamsungRemovePreflightTest {
         }
 
         // ---- precondition: local active GID
-        val gidB64 = tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull()
+        val gidB64 = tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull()
         if (gidB64.isNullOrBlank()) {
             p("RESULT: ABORT - no persisted active GID for $CHAT"); return@runBlocking
         }
@@ -67,7 +70,7 @@ class SamsungRemovePreflightTest {
         p("GID match       : YES")
 
         // ---- restore a SEPARATE client from the real snapshot
-        val blobB64 = tm.loadMlsBundle(SNAPSHOT_KEY).getOrNull()
+        val blobB64 = tm.loadMlsBundle(PROBE_OWNER, SNAPSHOT_KEY).getOrNull()
         if (blobB64.isNullOrBlank()) {
             p("RESULT: ABORT - no MLS snapshot stored"); return@runBlocking
         }

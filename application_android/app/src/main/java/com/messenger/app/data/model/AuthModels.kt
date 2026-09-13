@@ -23,7 +23,18 @@ data class RegisterRequest(
 
 @Serializable
 data class RefreshTokenRequest(
-    @SerialName("refresh_token") val refreshToken: String
+    @SerialName("refresh_token") val refreshToken: String,
+    /**
+     * Identifies one LOGICAL refresh, not one HTTP attempt.
+     *
+     * The server consumes a refresh token exactly once and caches the successor
+     * for 60 seconds keyed by this value. A transport retry of the same logical
+     * refresh must therefore send the SAME request_id - that is what lets a lost
+     * response be recovered instead of looking like a replay. Generating a fresh
+     * id per attempt would start a second logical refresh and, once the first
+     * successor has been used, be treated as fork evidence.
+     */
+    @SerialName("request_id") val requestId: String
 )
 
 @Serializable

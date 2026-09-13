@@ -80,6 +80,38 @@ set(PROJECT_SOURCES
     src/crypto/mlsgroupcrypto.h
     src/crypto/vaultcrypto.cpp
     src/crypto/vaultcrypto.h
+    # Layer B history keyring. historycrypto supplies the shared encoding helpers
+    # (u32be, ROOT_BYTES) that the keyring format and the cache framing both use;
+    # historykeyring is the cross-platform format; historykeyringstore is the
+    # DPAPI-protected local persistence plus the repository policy; the transport
+    # and its http binding reach the server over the existing authenticated path.
+    src/crypto/historycrypto.cpp
+    src/crypto/historycrypto.h
+    src/crypto/historykeyring.cpp
+    src/crypto/historykeyring.h
+    src/crypto/historykeyringstore.cpp
+    src/crypto/historykeyringstore.h
+    src/crypto/historykeyringtransport.cpp
+    src/crypto/historykeyringtransport.h
+    src/crypto/historykeyringhttp.cpp
+    src/crypto/historykeyringhttp.h
+    # These two were reachable from AuthService but never listed here, so the app
+    # did not link. Both predate Phase 67; adding them is what makes the Windows
+    # build - and therefore the Windows tests - verifiable at all.
+    src/crypto/historykeyringrecovery.cpp
+    src/crypto/historykeyringrecovery.h
+    src/crypto/deviceenrollment.cpp
+    src/crypto/deviceenrollment.h
+    # Layer B orchestration: keyring root + sealing primitive -> one archive record.
+    src/crypto/historyarchiver.cpp
+    src/crypto/historyarchiver.h
+    src/crypto/archiverepository.cpp
+    src/crypto/archiverepository.h
+    # The message-flow archive caller, invoked from the successful-decrypt gate.
+    src/crypto/decryptedmessagearchiver.cpp
+    src/crypto/decryptedmessagearchiver.h
+    src/crypto/archiverestorer.cpp
+    src/crypto/archiverestorer.h
     src/models/user.cpp
     src/models/user.h
     src/models/message.h
@@ -90,6 +122,10 @@ set(PROJECT_SOURCES
     src/services/websocketservice.h
     src/services/chatservice.cpp
     src/services/chatservice.h
+    src/services/messageoutbox.cpp
+    src/services/messageoutbox.h
+    src/services/messagesyncpager.cpp
+    src/services/messagesyncpager.h
     src/services/groupservice.cpp
     src/services/groupservice.h
     src/services/voiceservice.cpp

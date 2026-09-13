@@ -93,13 +93,19 @@ class MessengerApplication : Application() {
 
         val senderName = resolveChatName(message.chatId)
         // Decrypt the E2EE ciphertext for the notification preview.
-        val text = chatRepository.decryptFor(
+        val text = chatRepository.previewFor(
             message.chatId,
+            // If the realtime path already stored this message in the clear,
+            // reuse it rather than spending its one-shot ratchet secret again.
+            message.messageId,
             message.content,
             message.encrypted,
             message.senderId,
             message.keyVersion,
-            message.encryptionVersion
+            message.encryptionVersion,
+            // Same reason as the chat-list preview: never ask OpenMLS to
+            // decrypt a row this device itself sealed.
+            message.senderDeviceId
         )
 
         val intent = Intent(this, MainActivity::class.java).apply {

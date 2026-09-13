@@ -69,14 +69,14 @@ class MlsGidConvergenceTest {
         val b = body("private suspend fun ensureCurrentGid(")
         assertTrue(
             "adoption must reuse forgetLocal - not a second teardown path",
-            b.contains("forgetLocal(chatId)")
+            b.contains("forgetLocal(owner, chatId)")
         )
         assertTrue(
             "adoption must reuse setActiveGid - not a second persistence mechanism",
-            b.contains("setActiveGid(chatId, serverGid)")
+            b.contains("setActiveGid(owner, chatId, serverGid)")
         )
-        val drop = b.indexOf("forgetLocal(chatId)")
-        val adopt = b.indexOf("setActiveGid(chatId, serverGid)")
+        val drop = b.indexOf("forgetLocal(owner, chatId)")
+        val adopt = b.indexOf("setActiveGid(owner, chatId, serverGid)")
         assertTrue("the stale group must be dropped before the new id is adopted", drop < adopt)
         assertTrue(
             "adoption must be conditional on the ids actually differing",
@@ -88,7 +88,7 @@ class MlsGidConvergenceTest {
     fun `a matching gid is not torn down`() {
         val b = body("private suspend fun ensureCurrentGid(")
         val guard = b.indexOf("if (!serverGid.contentEquals(")
-        val drop = b.indexOf("forgetLocal(chatId)")
+        val drop = b.indexOf("forgetLocal(owner, chatId)")
         assertTrue("expected the equality guard", guard >= 0)
         assertTrue(
             "forgetLocal must sit INSIDE the mismatch branch; an unconditional drop " +
@@ -126,7 +126,7 @@ class MlsGidConvergenceTest {
         assertTrue(
             "hasGroup must refuse the chat when the gid cannot be confirmed, rather " +
                 "than falling back to the chat-derived id",
-            h.contains("if (!ensureCurrentGid(chatId))")
+            h.contains("if (!ensureCurrentGid(owner, chatId))")
         )
         assertTrue(
             "the failure must return false, not continue into loadGroup",
@@ -145,7 +145,7 @@ class MlsGidConvergenceTest {
         )
         assertTrue(
             "serverHasGroup must delegate to the single adoption implementation",
-            b.contains("ensureCurrentGid(chatId)")
+            b.contains("ensureCurrentGid(owner, chatId)")
         )
     }
 

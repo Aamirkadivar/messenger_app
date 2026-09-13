@@ -7,6 +7,7 @@
 #include "../crypto/doubleratchet.h"
 #include "../utils/credentialmanager.h"
 #include "../utils/pairingqr.h"
+#include <QTimer>
 #include <QNetworkRequest>
 #include <QUrl>
 #include <QUrlQuery>
@@ -61,10 +62,53 @@ ChatService::ChatService(AuthService* authService, GroupService* groupService, Q
                  [this]() { return m_authService ? m_authService->currentUserId() : QString(); },
                  [this]() { return m_authService ? m_authService->getOrCreateDeviceId() : QString(); });
     setupForwardSignalHooks();
+    setupDurableDelivery();
     if (m_authService) {
         connect(m_authService, &AuthService::vaultRatchetsUpdated, this, [this]() {
             m_dr.clear();
         });
+        // Gate 20: the cache namespace IS the account.
+        //
+        // Nothing is open until someone authenticates, and the handle is
+        // released the moment they leave. AuthService::logout() clears
+        // m_currentUserId BEFORE emitting, so by the time this runs there is no
+        // account and every cache method fails closed on its existing
+        // !m_db.isOpen() guard.
+        connect(m_authService, &AuthService::loginSuccess, this,
+                [this](const QString& userId, const QString&) {
+                    if (m_messageCache) m_messageCache->openForAccount(userId);
+                    processOutbox();
+                });
+        connect(m_authService, &AuthService::logoutSuccess, this, [this]() {
+            // Closes, never deletes: this account's offline history outlives the
+            // session and is reopened when it signs back in.
+            if (m_messageCache) m_messageCache->close();
+        });
+        // A session restored from stored credentials at startup emits no
+        // loginSuccess, so bind on identity change too. Idempotent for the same
+        // account, and a cleared id closes the handle.
+        connect(m_authService, &AuthService::currentUserIdChanged, this, [this]() {
+            // Whoever is signed in now, the peer identities and the per-chat
+            // refresh budget belonged to the previous account. Drop them: the
+            // next chat-list fetch repopulates them for this account, and a new
+            // account must not inherit either a peer user id it never had or an
+            // attempt budget someone else spent.
+            m_chatOtherUserId.clear();
+            m_chatOtherName.clear();
+            m_peerKeyRefreshed.clear();
+            m_peerKeyInFlight.clear();
+
+            if (!m_messageCache) return;
+            const QString id = m_authService ? m_authService->currentUserId() : QString();
+            if (id.isEmpty()) m_messageCache->close();
+            else m_messageCache->openForAccount(id);
+            processOutbox();
+        });
+        if (!m_authService->currentUserId().isEmpty()) {
+            m_messageCache->openForAccount(m_authService->currentUserId());
+            // Whatever an earlier run left in this account's outbox goes out now.
+            QMetaObject::invokeMethod(this, [this]() { processOutbox(); }, Qt::QueuedConnection);
+        }
     }
 }
 
@@ -88,6 +132,28 @@ QString ChatService::buildAuthHeader() const {
         }
     }
     return {};
+}
+
+ArchiveRestorer* ChatService::archiveRestorer() {
+    if (!m_archiveRestorer) {
+        m_archiveRestorer = std::make_unique<ArchiveRestorer>(
+            []() { return ArchiveRestorer::DEFAULT_ENABLED; },
+            [this]() { return m_authService ? m_authService->currentUserId() : QString(); },
+            [this]() { return m_authService->historyArchiver(); },
+            [this]() { return m_authService->archiveRepository(); });
+    }
+    return m_archiveRestorer.get();
+}
+
+DecryptedMessageArchiver* ChatService::archiveCaller() {
+    if (!m_archiveCaller) {
+        m_archiveCaller = std::make_unique<DecryptedMessageArchiver>(
+            []() { return DecryptedMessageArchiver::DEFAULT_ENABLED; },
+            [this]() { return m_authService ? m_authService->currentUserId() : QString(); },
+            [this]() { return m_authService->historyArchiver(); },
+            [this]() { return m_authService->archiveRepository(); });
+    }
+    return m_archiveCaller.get();
 }
 
 void ChatService::applyAuthHeaders(QNetworkRequest& request) const {
@@ -171,9 +237,16 @@ void ChatService::fetchChats() {
     qDebug() << "[ChatService] Fetching chats from:" << url.toString();
 
     m_currentReply = m_networkManager->get(request);
+    // onChatsReplyFinished is a slot, not a lambda, so the owning account rides
+    // on the reply itself - same guarantee, captured at issue time.
+    if (m_currentReply) {
+        m_currentReply->setProperty("cacheOwner",
+            m_authService ? m_authService->currentUserId() : QString());
+    }
 }
 
 void ChatService::onChatsReplyFinished(QNetworkReply* reply) {
+    const QString cacheOwner = reply ? reply->property("cacheOwner").toString() : QString();
     // QNetworkAccessManager::finished fires for *every* request made through
     // m_networkManager (fetchMessages, sendMessage, markAsRead, etc. all
     // share it) - not just fetchChats. Without this check, an unrelated
@@ -234,10 +307,14 @@ void ChatService::onChatsReplyFinished(QNetworkReply* reply) {
     }
 
     sortChatsByActivity(result);
-    m_messageCache->saveChats(toCache);
+    m_messageCache->saveChats(toCache, cacheOwner);
 
     qDebug() << "[ChatService] Fetched" << result.size() << "chats";
     emit chatsFetched(result);
+    // Every chat, not only the open one: messages that arrived while this
+    // device was away are fetched however many there are.
+    syncAllChats();
+    processOutbox();
 }
 
 void ChatService::searchUsers(const QString& query) {
@@ -361,6 +438,8 @@ void ChatService::fetchMessages(const QString& chatId) {
         const QList<MessageCache::Entry> cached = m_messageCache->loadMessages(chatId);
         if (!cached.isEmpty()) {
             QVariantList cachedResult;
+            // Messages whose normal decryption failed, gathered for one archive lookup below.
+            QStringList unrecovered;
             for (const auto& e : cached) {
                 bool hasFile = e.fileType == QStringLiteral("audio") || e.fileType == QStringLiteral("image")
                                || e.fileType == QStringLiteral("file")
@@ -388,8 +467,54 @@ void ChatService::fetchMessages(const QString& chatId) {
                 item["replyToId"] = e.replyToId;
                 if (e.encrypted && !e.content.isEmpty())
                     applyEnvelopeMeta(item, openCipher(chatId, e.content, e.encrypted, e.senderId, e.keyVersion, e.encryptionVersion, e.senderDeviceId));
+                // Layer B read side. Normal decryption has already run for this message; only the
+                // ones it could not open are collected. A message that decrypted normally is
+                // authoritative and is never revisited.
+                if (ArchiveRestorer::needsRestore(e.encrypted, hasFile,
+                                                  item["content"].toString())) {
+                    unrecovered.append(e.id);
+                }
                 cachedResult.append(item);
             }
+
+            // One archive lookup for the whole chat, and only when something actually needs it.
+            // Anything that fails - no archive, tampered, wrong account, backend down - simply
+            // leaves that message with the placeholder it already had.
+            if (!unrecovered.isEmpty() && m_authService) {
+                const QHash<QString, QString> recovered =
+                    archiveRestorer()->restore(chatId, unrecovered);
+                if (!recovered.isEmpty()) {
+                    for (QVariant& v : cachedResult) {
+                        QVariantMap row = v.toMap();
+                        const auto it = recovered.constFind(row["id"].toString());
+                        if (it != recovered.constEnd()) {
+                            row["content"] = *it;
+                            v = row;
+                        }
+                    }
+
+                    // Persist what was recovered, so the next open reads plaintext from the cache
+                    // and needs no archive request at all. The rows are the ones already loaded,
+                    // with only content and the encrypted flag changed - every other field is
+                    // carried over - and saveMessages upserts them by message id, so exactly these
+                    // messages change. Its keepPlaintext rule then stops a later server fetch from
+                    // putting the ciphertext back.
+                    //
+                    // A failed write costs only the next lookup: the plaintext above is already in
+                    // the emitted rows, and the archive is untouched either way.
+                    QList<MessageCache::Entry> restoredRows;
+                    for (const auto& e : cached) {
+                        const auto it = recovered.constFind(e.id);
+                        if (it == recovered.constEnd()) continue;
+                        restoredRows.append(MessageCache::withRecoveredPlaintext(e, *it));
+                    }
+                    if (!restoredRows.isEmpty() && m_authService) {
+                        m_messageCache->saveMessages(chatId, restoredRows,
+                                                     m_authService->currentUserId());
+                    }
+                }
+            }
+
             emit messagesFetched(chatId, cachedResult);
         }
 
@@ -404,7 +529,12 @@ void ChatService::fetchMessages(const QString& chatId) {
         applyAuthHeaders(request);
 
         QNetworkReply* reply = m_networkManager->get(request);
-        connect(reply, &QNetworkReply::finished, this, [this, reply, chatId]() {
+        // Captured when the request is ISSUED, not when it completes: that is the
+        // whole point. A reply that lands after this account has been replaced
+        // must be refused by the cache rather than silently written into the new
+        // account's namespace.
+        const QString cacheOwner = m_authService ? m_authService->currentUserId() : QString();
+        connect(reply, &QNetworkReply::finished, this, [this, reply, chatId, cacheOwner]() {
             reply->deleteLater();
 
             if (reply->error() != QNetworkReply::NoError) {
@@ -431,101 +561,12 @@ void ChatService::fetchMessages(const QString& chatId) {
             QList<MessageCache::Entry> toCache;
             for (int i = messagesArray.size() - 1; i >= 0; --i) {
                 if (!messagesArray[i].isObject()) continue;
-                QJsonObject m = messagesArray[i].toObject();
-                QJsonObject sender = m["sender"].toObject();
-
-                QString senderName = sender["display_name"].toString().isEmpty()
-                                          ? sender["username"].toString()
-                                          : sender["display_name"].toString();
-                QString rawContent = m["content"].toString();
-                bool encrypted = m["encrypted"].toBool(false);
-                QString readAt = m["read_at"].isString() ? m["read_at"].toString() : QString();
-                QString createdAt = m["created_at"].toString();
-                QString fileUrl = m["file_url"].toString();
-                QString fileType = m["file_type"].toString();
-                QString fileName = m["file_name"].toString();
-                qint64 fileSize = static_cast<qint64>(m["file_size"].toDouble(0));
-                qint64 durationMs = static_cast<qint64>(m["duration_ms"].toDouble(0));
-                QString thumbnailUrl = m["thumbnail_url"].toString();
-                QString senderId = m["sender_id"].toString();
-                int keyVersion = m["key_version"].toInt();
-                int encryptionVersion = m["encryption_version"].toInt(1);
-                if (encryptionVersion <= 0) encryptionVersion = 1;
-                bool hasFile = fileType == QStringLiteral("audio") || fileType == QStringLiteral("image")
-                               || fileType == QStringLiteral("file")
-                               || fileType == QStringLiteral("video_note");
-
-                QVariantMap item;
-                item["id"] = m["id"].toString();
-                item["senderId"] = senderId;
-                item["senderName"] = senderName;
-                // Both the ciphertext and a best-effort decryption are handed
-                // over. QML decrypts from rawContent at display time so a row
-                // rendered before the keys arrived fixes itself; content is
-                // only a fallback for callers that do not.
-                QString display = hasFile ? QString()
-                                           : decryptMessage(chatId, rawContent, encrypted, senderId, keyVersion, encryptionVersion,
-                                                            m[QStringLiteral("sender_device_id")].toString());
-                item["content"] = display;
-                item["rawContent"] = hasFile ? rawContent : rawContent;
-                item["encrypted"] = encrypted;
-                item["keyVersion"] = keyVersion;
-                item["encryptionVersion"] = encryptionVersion;
-                item["senderDeviceId"] = m[QStringLiteral("sender_device_id")].toString();
-                item["createdAt"] = createdAt;
-                item["readAt"] = readAt;
-                item["fileUrl"] = hasFile ? fileUrl : QString();
-                item["fileType"] = fileType;
-                item["fileName"] = fileName;
-                item["fileSize"] = fileSize;
-                item["durationMs"] = durationMs;
-                item["thumbnailUrl"] = thumbnailUrl;
-                item["voiceEncrypted"] = hasFile && encrypted;
-                item["isForwarded"] = m[QStringLiteral("is_forwarded")].toBool(false);
-                item["forwardedFromName"] = m[QStringLiteral("forwarded_from_name")].toString();
-                item["forwardedFromMessageId"] = m[QStringLiteral("forwarded_from_message_id")].toString();
-                item["replyToId"] = m[QStringLiteral("reply_to_id")].toString();
-                if (encrypted && !rawContent.isEmpty()) {
-                    applyEnvelopeMeta(item, openCipher(chatId, rawContent, encrypted, senderId, keyVersion, encryptionVersion,
-                                                       item["senderDeviceId"].toString()));
-                }
-                result.append(item);
-
                 MessageCache::Entry cacheEntry;
-                cacheEntry.id = m["id"].toString();
-                cacheEntry.senderId = senderId;
-                cacheEntry.senderName = senderName;
-                // MLS (and ratchet) message keys are consumed on first open.
-                // Store plaintext when we have it so a reopen does not have to
-                // unprotect again — the sender's other device depends on this.
-                const QString placeholder = QString::fromUtf8("\xF0\x9F\x94\x92 Encrypted message");
-                if (encrypted && !hasFile && !display.isEmpty() && display != placeholder) {
-                    cacheEntry.content = display;
-                    cacheEntry.encrypted = false;
-                } else {
-                    cacheEntry.content = rawContent;
-                    cacheEntry.encrypted = encrypted;
-                }
-                cacheEntry.readAt = readAt;
-                cacheEntry.createdAt = createdAt;
-                cacheEntry.fileUrl = item.value(QStringLiteral("fileUrl")).toString();
-                cacheEntry.fileType = fileType;
-                cacheEntry.fileName = fileName;
-                cacheEntry.fileSize = fileSize;
-                cacheEntry.durationMs = durationMs;
-                cacheEntry.keyVersion = keyVersion;
-                cacheEntry.encryptionVersion = encryptionVersion;
-                // Required for v3/v4: the ratchet session is keyed by
-                // "chatId|senderDeviceId", so a cached message without it
-                // decrypts against the wrong session on reopen.
-                cacheEntry.senderDeviceId = item["senderDeviceId"].toString();
-                cacheEntry.isForwarded = item["isForwarded"].toBool();
-                cacheEntry.forwardedFromName = item["forwardedFromName"].toString();
-                cacheEntry.replyToId = item["replyToId"].toString();
+                result.append(ingestServerRow(chatId, messagesArray[i].toObject(), &cacheEntry));
                 toCache.append(cacheEntry);
             }
 
-            m_messageCache->saveMessages(chatId, toCache);
+            m_messageCache->saveMessages(chatId, toCache, cacheOwner);
 
             emit messagesFetched(chatId, result);
         });
@@ -548,29 +589,154 @@ void ChatService::fetchMessages(const QString& chatId) {
     }
 }
 
+// One server row -> the display item fetchMessages emits, and the cache entry it
+// stores (plaintext once decrypted, since MLS and ratchet keys open only once).
+// Shared by history (fetchMessages) and reconnect catch-up (MessageSyncPager), so
+// both ingest through exactly the same decrypt, archive and cache rules.
+QVariantMap ChatService::ingestServerRow(const QString& chatId, const QJsonObject& m,
+                                         MessageCache::Entry* cacheOut) {
+    QJsonObject sender = m["sender"].toObject();
+
+    QString senderName = sender["display_name"].toString().isEmpty()
+                              ? sender["username"].toString()
+                              : sender["display_name"].toString();
+    QString rawContent = m["content"].toString();
+    bool encrypted = m["encrypted"].toBool(false);
+    QString readAt = m["read_at"].isString() ? m["read_at"].toString() : QString();
+    QString createdAt = m["created_at"].toString();
+    QString fileUrl = m["file_url"].toString();
+    QString fileType = m["file_type"].toString();
+    QString fileName = m["file_name"].toString();
+    qint64 fileSize = static_cast<qint64>(m["file_size"].toDouble(0));
+    qint64 durationMs = static_cast<qint64>(m["duration_ms"].toDouble(0));
+    QString thumbnailUrl = m["thumbnail_url"].toString();
+    QString senderId = m["sender_id"].toString();
+    int keyVersion = m["key_version"].toInt();
+    int encryptionVersion = m["encryption_version"].toInt(1);
+    if (encryptionVersion <= 0) encryptionVersion = 1;
+    bool hasFile = fileType == QStringLiteral("audio") || fileType == QStringLiteral("image")
+                   || fileType == QStringLiteral("file")
+                   || fileType == QStringLiteral("video_note");
+
+    QVariantMap item;
+    item["id"] = m["id"].toString();
+    item["senderId"] = senderId;
+    item["senderName"] = senderName;
+    // Both the ciphertext and a best-effort decryption are handed
+    // over. QML decrypts from rawContent at display time so a row
+    // rendered before the keys arrived fixes itself; content is
+    // only a fallback for callers that do not.
+    QString display = hasFile ? QString()
+                               : decryptMessage(chatId, rawContent, encrypted, senderId, keyVersion, encryptionVersion,
+                                                m[QStringLiteral("sender_device_id")].toString());
+    item["content"] = display;
+    item["rawContent"] = hasFile ? rawContent : rawContent;
+    item["encrypted"] = encrypted;
+    item["keyVersion"] = keyVersion;
+    item["encryptionVersion"] = encryptionVersion;
+    item["senderDeviceId"] = m[QStringLiteral("sender_device_id")].toString();
+    item["createdAt"] = createdAt;
+    item["readAt"] = readAt;
+    item["fileUrl"] = hasFile ? fileUrl : QString();
+    item["fileType"] = fileType;
+    item["fileName"] = fileName;
+    item["fileSize"] = fileSize;
+    item["durationMs"] = durationMs;
+    item["thumbnailUrl"] = thumbnailUrl;
+    item["voiceEncrypted"] = hasFile && encrypted;
+    item["isForwarded"] = m[QStringLiteral("is_forwarded")].toBool(false);
+    item["forwardedFromName"] = m[QStringLiteral("forwarded_from_name")].toString();
+    item["forwardedFromMessageId"] = m[QStringLiteral("forwarded_from_message_id")].toString();
+    item["replyToId"] = m[QStringLiteral("reply_to_id")].toString();
+    if (encrypted && !rawContent.isEmpty()) {
+        applyEnvelopeMeta(item, openCipher(chatId, rawContent, encrypted, senderId, keyVersion, encryptionVersion,
+                                           item["senderDeviceId"].toString()));
+    }
+
+    MessageCache::Entry& cacheEntry = *cacheOut;
+    cacheEntry.id = m["id"].toString();
+    cacheEntry.senderId = senderId;
+    cacheEntry.senderName = senderName;
+    // MLS (and ratchet) message keys are consumed on first open.
+    // Store plaintext when we have it so a reopen does not have to
+    // unprotect again — the sender's other device depends on this.
+    const QString placeholder = QString::fromUtf8("\xF0\x9F\x94\x92 Encrypted message");
+    if (encrypted && !hasFile && !display.isEmpty() && display != placeholder) {
+        cacheEntry.content = display;
+        cacheEntry.encrypted = false;
+        // Layer B. This branch IS "the decryption succeeded", which is why the archive
+        // attempt lives here and nowhere else: the plaintext being cached is the
+        // plaintext being archived, from the one open that already happened. The call
+        // re-checks the same gate, cannot throw, and its result is deliberately not
+        // acted on - a locked vault or an unreachable backend must never affect whether
+        // this message was delivered.
+        if (m_authService) {
+            archiveCaller()->archive(chatId, cacheEntry.id, encrypted, hasFile, display);
+        }
+    } else {
+        cacheEntry.content = rawContent;
+        cacheEntry.encrypted = encrypted;
+    }
+    cacheEntry.readAt = readAt;
+    cacheEntry.createdAt = createdAt;
+    cacheEntry.fileUrl = item.value(QStringLiteral("fileUrl")).toString();
+    cacheEntry.fileType = fileType;
+    cacheEntry.fileName = fileName;
+    cacheEntry.fileSize = fileSize;
+    cacheEntry.durationMs = durationMs;
+    cacheEntry.keyVersion = keyVersion;
+    cacheEntry.encryptionVersion = encryptionVersion;
+    // Required for v3/v4: the ratchet session is keyed by
+    // "chatId|senderDeviceId", so a cached message without it
+    // decrypts against the wrong session on reopen.
+    cacheEntry.senderDeviceId = item["senderDeviceId"].toString();
+    cacheEntry.isForwarded = item["isForwarded"].toBool();
+    cacheEntry.forwardedFromName = item["forwardedFromName"].toString();
+    cacheEntry.replyToId = item["replyToId"].toString();
+    return item;
+}
+
 void ChatService::sendMessage(const QString& chatId, const QString& text, const QString& chatType,
                                bool isForwarded, const QString& forwardedFromName,
                                const QString& forwardedFromMessageId) {
+    // Forwards and any legacy caller: the same durable path as the composer.
+    const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (m_forwardPhase == ForwardPhase::WaitingSend) m_forwardClientMessageId = clientMessageId;
+    m_pendingText.insert(clientMessageId, PendingText{text, forwardedFromName, QString(), cacheOwnerNow()});
+    sealAndQueueText(chatId, text, chatType, isForwarded, forwardedFromName, forwardedFromMessageId,
+                     takePendingReplyToId(), clientMessageId);
+}
+
+QString ChatService::sendTextMessage(const QString& chatId, const QString& text, const QString& chatType,
+                                     const QString& replyToId) {
+    // Minted once, here; every retry of this message reuses it.
+    const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_pendingText.insert(clientMessageId, PendingText{text, QString(), replyToId, cacheOwnerNow()});
+    // Asynchronous from here on (peer keys, device list, group keys); the bubble
+    // already exists under this id and settles through outgoingQueued /
+    // messageSent / outgoingFailed.
+    QMetaObject::invokeMethod(this, [this, chatId, text, chatType, replyToId, clientMessageId]() {
+        sealAndQueueText(chatId, text, chatType, false, QString(), QString(), replyToId, clientMessageId);
+    }, Qt::QueuedConnection);
+    return clientMessageId;
+}
+
+void ChatService::sealAndQueueText(const QString& chatId, const QString& text, const QString& chatType,
+                                   bool isForwarded, const QString& forwardedFromName,
+                                   const QString& forwardedFromMessageId, const QString& replyToId,
+                                   const QString& clientMessageId) {
     if (chatType == QStringLiteral("group")) {
-        sendGroupTextMessage(chatId, text, isForwarded, forwardedFromName, forwardedFromMessageId);
+        sendGroupTextMessage(chatId, text, isForwarded, forwardedFromName, forwardedFromMessageId,
+                             replyToId, clientMessageId);
         return;
     }
 
     QString authToken = buildAuthHeader();
     if (authToken.isEmpty()) {
-        emit messageError("Not authenticated. Please login first.");
+        failOutgoing(chatId, clientMessageId, QStringLiteral("Not authenticated. Please login first."));
         return;
     }
 
-    QUrl url(Config::apiBaseUrl() + "/messages");
-    QNetworkRequest request(url);
-    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    applyAuthHeaders(request);
-
-    // Encrypt end-to-end when we know the recipient's public key. If we don't
-    // (they've never published one - e.g. still on an old build - or this is
-    // a group chat, where the pairwise scheme doesn't apply), fall back to
-    // plaintext so messaging keeps working during rollout.
     QString otherPub = m_chatOtherPub.value(chatId);
     QString myPriv = m_authService ? m_authService->e2eePrivateKey() : QString();
     // Distinguish the two failures. Conflating them sent users looking at the
@@ -578,19 +744,40 @@ void ChatService::sendMessage(const QString& chatId, const QString& text, const 
     // cause is signing in somewhere new (e.g. by QR) without unlocking the
     // E2EE vault on that device yet.
     if (myPriv.isEmpty()) {
-        emit messageError("Encryption isn't set up on this device yet. "
-                          "Unlock your encrypted messages with your password "
-                          "or recovery key to send.");
+        failOutgoing(chatId, clientMessageId,
+                     QStringLiteral("Encryption isn't set up on this device yet. "
+                                    "Unlock your encrypted messages with your password "
+                                    "or recovery key to send."));
         return;
     }
     if (otherPub.isEmpty()) {
-        emit messageError("Cannot send: this contact hasn't published an "
-                          "encryption key yet.");
+        // We may simply be out of date: the contact can have published since
+        // our last chat-list fetch. Ask the server once before refusing, then
+        // re-enter this send with the SAME client_message_id. ensurePeerKey only
+        // reports back after the request settles, and it will not start a second
+        // one for the same chat, so this resolves in one round trip or not at all.
+        if (!m_peerKeyRefreshed.contains(chatId) && !m_chatOtherUserId.value(chatId).isEmpty()) {
+            m_peerKeyRefreshed.insert(chatId);
+            ensurePeerKey(chatId, [this, chatId, text, chatType, isForwarded, forwardedFromName,
+                                   forwardedFromMessageId, replyToId, clientMessageId]() {
+                if (m_chatOtherPub.value(chatId).isEmpty()) {
+                    // Still nothing: the contact really has not published.
+                    failOutgoing(chatId, clientMessageId,
+                                 QStringLiteral("Cannot send: this contact hasn't published an "
+                                                "encryption key yet."));
+                    return;
+                }
+                sealAndQueueText(chatId, text, chatType, isForwarded, forwardedFromName,
+                                 forwardedFromMessageId, replyToId, clientMessageId);
+            });
+            return;
+        }
+        failOutgoing(chatId, clientMessageId,
+                     QStringLiteral("Cannot send: this contact hasn't published an encryption key yet."));
         return;
     }
-    const QString replyToId = takePendingReplyToId();
-    refreshChatDevices(chatId, [this, request, chatId, chatType, text, otherPub, myPriv,
-                                isForwarded, forwardedFromName, forwardedFromMessageId, replyToId]() mutable {
+    refreshChatDevices(chatId, [this, chatId, chatType, text, otherPub, myPriv, isForwarded,
+                                forwardedFromName, forwardedFromMessageId, replyToId, clientMessageId]() {
     QString outContent;
     bool encrypted = true;
     int encryptionVersion = 4;
@@ -610,11 +797,13 @@ void ChatService::sendMessage(const QString& chatId, const QString& text, const 
         encryptionVersion = 1;
     }
     if (cipher.isEmpty()) {
-        emit messageError("Cannot send: encryption failed");
+        failOutgoing(chatId, clientMessageId, QStringLiteral("Cannot send: encryption failed"));
         return;
     }
     outContent = cipher;
 
+    // Sealed exactly once. From here the outbox owns it: it is stored before
+    // any transmission and every retry re-sends these bytes.
     QJsonObject body;
     body["chat_id"] = chatId;
     body["chat_type"] = chatType;
@@ -623,63 +812,182 @@ void ChatService::sendMessage(const QString& chatId, const QString& text, const 
     body["encryption_version"] = encryptionVersion;
     appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
     appendReplyField(body, replyToId);
+    queueSealed(chatId, chatType, body, clientMessageId);
+    });
+}
 
-    QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [this, reply, chatId, text, forwardedFromName, replyToId]() {
-        reply->deleteLater();
+QString ChatService::cacheOwnerNow() const {
+    return (m_messageCache && m_messageCache->isOpen()) ? m_messageCache->ownerAccountId() : QString();
+}
 
-        if (reply->error() != QNetworkReply::NoError) {
-            emit messageError(reply->errorString());
+void ChatService::setupDurableDelivery() {
+    // Both persist in m_messageCache - this account's own database - and both
+    // talk plain HTTP. Neither knows the WebSocket exists.
+    MessageOutbox::Config oc;
+    oc.cache = m_messageCache;
+    oc.network = m_networkManager;
+    oc.apiBase = []() { return Config::apiBaseUrl(); };
+    oc.applyHeaders = [this](QNetworkRequest& r) { applyAuthHeaders(r); };
+    oc.owner = [this]() { return cacheOwnerNow(); };
+    m_outbox = new MessageOutbox(oc, this);
+    connect(m_outbox, &MessageOutbox::accepted, this, &ChatService::onOutboxAccepted);
+    connect(m_outbox, &MessageOutbox::retrying, this,
+            [this](const QString& chatId, const QString& clientMessageId, const QString&) {
+                emit outgoingQueued(chatId, clientMessageId);
+            });
+    connect(m_outbox, &MessageOutbox::failed, this,
+            [this](const QString& chatId, const QString& clientMessageId, const QString& error) {
+                emit outgoingFailed(chatId, clientMessageId, error);
+                emit messageError(error);
+            });
+
+    MessageSyncPager::Config sc;
+    sc.cache = m_messageCache;
+    sc.network = m_networkManager;
+    sc.apiBase = []() { return Config::apiBaseUrl(); };
+    sc.applyHeaders = [this](QNetworkRequest& r) { applyAuthHeaders(r); };
+    sc.owner = [this]() { return cacheOwnerNow(); };
+    // The same decrypt / archive / cache rules as history, oldest first.
+    sc.ingest = [this](const QString& chatId, const QJsonArray& rows) {
+        QList<QJsonObject> ordered;
+        for (const QJsonValue& v : rows) {
+            if (v.isObject()) ordered << v.toObject();
+        }
+        std::sort(ordered.begin(), ordered.end(), [](const QJsonObject& a, const QJsonObject& b) {
+            return a.value(QStringLiteral("seq")).toVariant().toLongLong()
+                   < b.value(QStringLiteral("seq")).toVariant().toLongLong();
+        });
+        QList<MessageCache::Entry> toCache;
+        for (const QJsonObject& m : ordered) {
+            MessageCache::Entry e;
+            ingestServerRow(chatId, m, &e);
+            toCache << e;
+        }
+        if (m_messageCache) m_messageCache->saveMessages(chatId, toCache, cacheOwnerNow());
+    };
+    // A group's rows cannot be opened before its keys: the same preparation
+    // fetchMessages makes before decrypting a group's history.
+    sc.prepare = [this](const QString& chatId, std::function<void()> ready) {
+        if (m_chatType.value(chatId) != QStringLiteral("group")) {
+            ready();
             return;
         }
-
-        QJsonParseError parseError;
-        QJsonDocument doc = QJsonDocument::fromJson(reply->readAll(), &parseError);
-        if (parseError.error != QJsonParseError::NoError) {
-            emit messageError("Failed to parse send response: " + parseError.errorString());
-            return;
+        if (m_mls2 && m_mls2->isReady()) {
+            mlsV2EnsureGroup(chatId);
         }
-
-        QJsonObject root = doc.object();
-        if (root.contains("error")) {
-            emit messageError(root["error"].toString());
-            return;
+#ifdef HAVE_MLSPP
+        else {
+            mlsEnsureGroup(chatId);
         }
+#endif
+        fetchGroupSenderKeys(chatId, ready);
+    };
+    m_syncPager = new MessageSyncPager(sc, this);
+    connect(m_syncPager, &MessageSyncPager::chatSynced, this,
+            [this](const QString& chatId, int messages, bool) {
+                if (messages > 0) emit chatCaughtUp(chatId);
+            });
+}
 
-        QJsonObject data = root["data"].toObject();
-        QVariantMap item;
-        item["id"] = data["id"].toString();
-        item["senderId"] = data["sender_id"].toString();
-        item["content"] = text;
-        item["createdAt"] = data["created_at"].toString();
-        item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
-        item["forwardedFromName"] = forwardedFromName;
-        item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
-        if (item["replyToId"].toString().isEmpty()) item["replyToId"] = replyToId;
+QVariantList ChatService::pendingOutgoing(const QString& chatId) const {
+    QVariantList out;
+    if (!m_messageCache) return out;
+    const QString owner = cacheOwnerNow();
+    for (const MessageCache::OutboxItem& it : m_messageCache->unacceptedOutbox(chatId)) {
+        const auto p = m_pendingText.constFind(it.clientMessageId);
+        const bool haveText = p != m_pendingText.constEnd() && p->owner == owner;
+        const QJsonObject body = QJsonDocument::fromJson(it.requestJson.toUtf8()).object();
+        QVariantMap m;
+        m["clientMessageId"] = it.clientMessageId;
+        // Never stored as plaintext: a message queued before a restart has no
+        // text on this device, only its ciphertext in the outbox.
+        m["text"] = haveText ? p->text : QStringLiteral("Queued on this device");
+        m["failed"] = it.state == QStringLiteral("FAILED");
+        m["createdAt"] = QDateTime::fromMSecsSinceEpoch(it.createdAt).toUTC().toString(Qt::ISODate);
+        m["replyToId"] = body.value(QStringLiteral("reply_to_id")).toString();
+        out << m;
+    }
+    return out;
+}
 
-        // Cache our OWN message as plaintext. A sender cannot decrypt its own
-        // v2/v3/v4 ciphertext - the sending chain does not retain the message
-        // keys it just used - so if we only ever cached the server's copy, our
-        // own messages turned into "Encrypted message" the moment the chat was
-        // reopened and re-read from cache. Storing the plaintext we already
-        // have is what every client does for its own sends.
+bool ChatService::retryOutgoing(const QString& clientMessageId) {
+    return m_outbox && m_outbox->retry(clientMessageId);
+}
+
+void ChatService::processOutbox() {
+    if (m_outbox && !cacheOwnerNow().isEmpty()) m_outbox->drain();
+}
+
+void ChatService::syncAllChats() {
+    if (!m_syncPager || cacheOwnerNow().isEmpty() || buildAuthHeader().isEmpty()) return;
+    QStringList ids = m_chatType.keys();
+    if (ids.isEmpty() && m_messageCache) {
+        for (const QJsonObject& c : m_messageCache->loadChats()) ids << c.value(QStringLiteral("id")).toString();
+    }
+    m_syncPager->syncChats(ids);
+}
+
+void ChatService::queueSealed(const QString& chatId, const QString& chatType, QJsonObject body,
+                              const QString& clientMessageId) {
+    body[QStringLiteral("client_message_id")] = clientMessageId;
+    MessageCache::OutboxItem item;
+    item.clientMessageId = clientMessageId;
+    item.chatId = chatId;
+    item.chatType = chatType;
+    item.requestJson = QString::fromUtf8(QJsonDocument(body).toJson(QJsonDocument::Compact));
+    item.state = QStringLiteral("PENDING");
+    item.createdAt = QDateTime::currentMSecsSinceEpoch();
+    item.nextAttemptAt = item.createdAt;
+    if (!m_outbox || !m_outbox->enqueue(item)) {
+        failOutgoing(chatId, clientMessageId, QStringLiteral("Cannot send: the outbox is unavailable"));
+        return;
+    }
+    m_outbox->drain();
+}
+
+void ChatService::failOutgoing(const QString& chatId, const QString& clientMessageId, const QString& reason) {
+    // Refused before (or instead of) reaching the outbox: the bubble turns
+    // FAILED rather than sitting on a clock with no attempt made. Nothing was
+    // stored, so nothing is retried; the user re-sends it.
+    m_pendingText.remove(clientMessageId);
+    emit outgoingFailed(chatId, clientMessageId, reason);
+    emit messageError(reason);
+}
+
+void ChatService::onOutboxAccepted(const QString& chatId, const QString& clientMessageId, const QJsonObject& data) {
+    const PendingText pending = m_pendingText.take(clientMessageId);
+    const QString owner = cacheOwnerNow();
+    QVariantMap item;
+    item["id"] = data["id"].toString();
+    item["senderId"] = data["sender_id"].toString();
+    item["createdAt"] = data["created_at"].toString();
+    item["clientMessageId"] = clientMessageId;
+    item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
+    item["replyToId"] = data[QStringLiteral("reply_to_id")].toString();
+    if (item["replyToId"].toString().isEmpty()) item["replyToId"] = pending.replyToId;
+    // Our OWN plaintext, while this process still holds it. A sender cannot
+    // decrypt its own v2/v3/v4 or MLS ciphertext - the sending chain does not
+    // retain the key it just used - so this row is what keeps our message
+    // readable on reopen. A message queued before a restart is delivered all
+    // the same; this device just never had its text to cache.
+    if (!pending.text.isNull() && pending.owner == owner) {
+        item["content"] = pending.text;
+        item["forwardedFromName"] = pending.forwardedFromName;
         if (m_messageCache) {
             MessageCache::Entry sentEntry;
             sentEntry.id = item["id"].toString();
             sentEntry.senderId = item["senderId"].toString();
-            sentEntry.content = text;          // plaintext
-            sentEntry.encrypted = false;       // already open; do not re-decrypt
+            sentEntry.content = pending.text;   // plaintext
+            sentEntry.encrypted = false;        // already open; do not re-decrypt
             sentEntry.createdAt = item["createdAt"].toString();
             sentEntry.isForwarded = item["isForwarded"].toBool();
-            sentEntry.forwardedFromName = forwardedFromName;
+            sentEntry.forwardedFromName = pending.forwardedFromName;
             sentEntry.replyToId = item["replyToId"].toString();
-            sentEntry.encryptionVersion = 1;   // stored open, no scheme needed
-            m_messageCache->saveMessages(chatId, { sentEntry });
+            sentEntry.encryptionVersion = 1;    // stored open, no scheme needed
+            m_messageCache->saveMessages(chatId, { sentEntry }, owner);
         }
-
-        emit messageSent(chatId, item);
-    });
-    });
+    }
+    emit messageSent(chatId, item);
 }
 
 bool ChatService::loadDr(const QString& chatId, DoubleRatchet::State& st, bool sending) const {
@@ -1923,8 +2231,17 @@ QByteArray ChatService::decryptToBytes(const QString& chatId, const QByteArray& 
                 if (!plain.isEmpty()) break;
             }
         }
-        if (plain.isEmpty())
+        if (plain.isEmpty()) {
             qWarning() << "[DecryptTrace] FAIL v4 chat=" << chatId << "sess=" << sess;
+            // A v4 thread cannot open without the peer's key. If we never
+            // learned one - the peer published after our last chat-list fetch -
+            // ask for it now. The refresh bumps cryptoRevision on success, and
+            // the QML binding that produced this call re-runs, which is the
+            // single retry. No key is assumed and nothing is shown until one
+            // arrives; if the peer really has none, this asks exactly once.
+            if (m_chatOtherPub.value(chatId).isEmpty())
+                requestPeerKeyRefresh(chatId);
+        }
         return plain;
     }
     if (encryptionVersion == 3) {
@@ -1937,9 +2254,22 @@ QByteArray ChatService::decryptToBytes(const QString& chatId, const QByteArray& 
         if (plain.isEmpty() && sess != chatId) plain = decryptDirectV3(chatId, blob);
         return plain;
     }
-    if (encryptionVersion >= 2) {
+    // Version 2 only. This used to read ">= 2", which meant any version this
+    // build does not know - a scheme added by a newer client - was decrypted as
+    // if it were v2 ephemeral box. That is exactly the "treat an unknown
+    // version as a known one" case: it cannot produce plaintext, but it decides
+    // an unknown format on the sender's behalf instead of admitting it. The
+    // known group schemes (5, 6) are already routed above, before this point.
+    if (!isSupportedDirectVersion(encryptionVersion)) {
+        // Fail closed before any scheme is chosen.
+        qWarning() << "[DecryptTrace] FAIL unsupported direct encryption_version"
+                   << encryptionVersion << "chat=" << chatId;
+        return {};
+    }
+    if (encryptionVersion == 2) {
         return Encryption::boxDecryptBytesEphemeral(payload, myPriv);
     }
+    // Version 1: the original pairwise box, keyed by the peer's identity.
     QString otherPub = m_chatOtherPub.value(chatId);
     if (otherPub.isEmpty()) return {};
     return Encryption::boxDecryptBytes(payload, otherPub, myPriv);
@@ -2106,6 +2436,156 @@ void ChatService::applyPeerIdentity(const QString& chatId, const QString& server
     emit securityCodeChanged(chatId, contactName);
     emit peerKeyChangePendingChanged(chatId);
     CredentialManager::instance().deleteToken(QStringLiteral("verified_pubkey_%1").arg(chatId));
+}
+
+void ChatService::ensurePeerKey(const QString& chatId, std::function<void()> onDone) {
+    const QString userId = m_chatOtherUserId.value(chatId);
+    // Group threads have no single peer key, and without a user id there is
+    // nothing to ask for. Report completion so callers are not left hanging.
+    if (m_chatType.value(chatId) == QStringLiteral("group")) {
+        qInfo().noquote() << "[peer-key] refresh-skip reason=group-chat chat=" << chatId;
+        if (onDone) onDone();
+        return;
+    }
+    if (userId.isEmpty()) {
+        // "No peer id" is how a thread silently stays unreadable, and it is not
+        // otherwise visible from the outside.
+        qInfo().noquote() << "[peer-key] refresh-skip reason=no-peer-id chat=" << chatId;
+        if (onDone) onDone();
+        return;
+    }
+    if (m_peerKeyInFlight.contains(chatId)) {
+        // Someone is already asking. Dropping the callback would strand a send,
+        // so run it now against whatever we hold; the send re-checks the cache.
+        qInfo().noquote() << "[peer-key] refresh-skip reason=already-in-flight chat=" << chatId;
+        if (onDone) onDone();
+        return;
+    }
+    if (buildAuthHeader().isEmpty()) {
+        // Not signed in (yet). Do not burn the attempt on a request that cannot
+        // carry credentials; leave it for a later, authenticated try.
+        qInfo().noquote() << "[peer-key] refresh-skip reason=not-authenticated chat=" << chatId;
+        m_peerKeyRefreshed.remove(chatId);
+        if (onDone) onDone();
+        return;
+    }
+    qInfo().noquote() << "[peer-key] refresh-start chat=" << chatId << "peer=" << userId;
+    m_peerKeyInFlight.insert(chatId);
+
+    // Who asked. The reply lands after a round trip, and the account can change
+    // in between - a sign-out, or a switch. Adopting a key fetched for the
+    // previous account would file one account's peer identity under another's
+    // chat, so the answer is discarded unless the same account is still signed
+    // in. Validating before the request would authorise nothing after it.
+    const QString requestedAs = m_authService ? m_authService->currentUserId() : QString();
+
+    QNetworkRequest request(QUrl(Config::apiBaseUrl()
+                                 + QStringLiteral("/crypto/public-key/") + userId));
+    applyAuthHeaders(request);
+    qInfo().noquote() << "[peer-key] GET /crypto/public-key/" + userId;
+    QNetworkReply* reply = m_networkManager->get(request);
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, chatId, userId, onDone, requestedAs]() {
+        reply->deleteLater();
+        m_peerKeyInFlight.remove(chatId);
+        const int status =
+            reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString nowSignedIn = m_authService ? m_authService->currentUserId() : QString();
+        if (nowSignedIn != requestedAs) {
+            qWarning().noquote() << "[peer-key] refresh-skip reason=account-changed chat="
+                                 << chatId;
+            if (onDone) onDone();
+            return;
+        }
+        QString pub;
+        if (reply->error() == QNetworkReply::NoError) {
+            const QJsonObject obj = QJsonDocument::fromJson(reply->readAll()).object();
+            // The server answers {"public_key": "..."}; older shapes nested it
+            // under "data". Absent or empty means the peer still has not
+            // published - a legitimate state, not an error, and never a reason
+            // to invent a key or drop to plaintext.
+            pub = obj.value(QStringLiteral("public_key")).toString();
+            if (pub.isEmpty())
+                pub = obj.value(QStringLiteral("data")).toObject()
+                         .value(QStringLiteral("public_key")).toString();
+        }
+        qInfo().noquote() << "[peer-key] refresh-response status=" << status
+                          << "chat=" << chatId << "peer=" << userId
+                          << "keyPresent=" << (pub.isEmpty() ? "false" : "true");
+        if (!pub.isEmpty()) {
+            const QString previous = m_chatOtherPub.value(chatId);
+            if (previous != pub) {
+                // Straight through applyPeerIdentity: a key that differs from
+                // the one we already trust must still raise the security-code
+                // prompt rather than being adopted silently.
+                applyPeerIdentity(chatId, pub, m_chatOtherName.value(chatId));
+                if (previous != m_chatOtherPub.value(chatId)) {
+                    qInfo().noquote() << "[peer-key] identity-applied chat=" << chatId
+                                      << "peer=" << userId;
+                    ++m_cryptoRevision;
+                    emit cryptoRevisionChanged();
+                    qInfo().noquote() << "[peer-key] crypto-revision chat=" << chatId
+                                      << "revision=" << m_cryptoRevision;
+                }
+            }
+        }
+        if (onDone) onDone();
+    });
+}
+
+void ChatService::requestPeerKeyRefresh(const QString& chatId) const {
+    // Decryption is const and runs inside a QML binding, so this only records
+    // intent and hands the work to the event loop. One automatic attempt per
+    // chat per session: if the peer genuinely has no key, later messages must
+    // not each spawn another request.
+    qInfo().noquote() << "[peer-key] decrypt-missing chat=" << chatId
+                      << "peer=" << m_chatOtherUserId.value(chatId, QStringLiteral("(none)"));
+    if (chatId.isEmpty()) {
+        qInfo().noquote() << "[peer-key] refresh-skip reason=empty-chat-id";
+        return;
+    }
+    if (m_peerKeyRefreshed.contains(chatId)) {
+        qInfo().noquote() << "[peer-key] refresh-skip reason=attempt-already-used chat=" << chatId;
+        return;
+    }
+    if (m_peerKeyInFlight.contains(chatId)) {
+        qInfo().noquote() << "[peer-key] refresh-skip reason=already-in-flight chat=" << chatId;
+        return;
+    }
+    m_peerKeyRefreshed.insert(chatId);
+    QMetaObject::invokeMethod(const_cast<ChatService*>(this), [this, chatId]() {
+        const_cast<ChatService*>(this)->ensurePeerKey(chatId);
+    }, Qt::QueuedConnection);
+}
+
+void ChatService::onGroupLifecycleEvent(const QString& event, const QString& chatId) {
+    Q_UNUSED(chatId);
+    qInfo() << "[group] lifecycle event" << event << "- refreshing chat list";
+    // Every one of these events can change which chats this account may see:
+    // created/added make one appear, deleted/removed/left make one go away, a
+    // role change alters its metadata. The server is the only authority on
+    // that, so re-read the list rather than editing the model from a broadcast
+    // any client can receive. Re-reading also replaces entries in place, which
+    // is what keeps a repeated event from duplicating a chat.
+    if (m_groupRefreshPending) return;
+    m_groupRefreshPending = true;
+    scheduleGroupChatRefresh();
+}
+
+void ChatService::scheduleGroupChatRefresh() {
+    QTimer::singleShot(250, this, [this]() {
+        // fetchChats() returns immediately while another fetch is in flight,
+        // and that one may have been issued BEFORE this group existed - its
+        // reply would not contain it. Dropping the event here is how the group
+        // would stay invisible anyway, so wait for the current fetch to land
+        // and then ask again, rather than losing the update.
+        if (m_isLoading) {
+            scheduleGroupChatRefresh();
+            return;
+        }
+        m_groupRefreshPending = false;
+        fetchChats();
+    });
 }
 
 void ChatService::acceptPeerKeyChange(const QString& chatId) {
@@ -2392,11 +2872,13 @@ void ChatService::fetchGroupSenderKeys(const QString& chatId, std::function<void
 
 void ChatService::sendGroupTextMessage(const QString& chatId, const QString& text,
                                         bool isForwarded, const QString& forwardedFromName,
-                                        const QString& forwardedFromMessageId) {
-    ensureGroupSenderKeyReady(chatId, [this, chatId, text, isForwarded, forwardedFromName, forwardedFromMessageId]() {
+                                        const QString& forwardedFromMessageId, const QString& replyToId,
+                                        const QString& clientMessageId) {
+    ensureGroupSenderKeyReady(chatId, [this, chatId, text, isForwarded, forwardedFromName, forwardedFromMessageId,
+                                       replyToId, clientMessageId]() {
         QString authToken = buildAuthHeader();
         if (authToken.isEmpty()) {
-            emit messageError("Not authenticated. Please login first.");
+            failOutgoing(chatId, clientMessageId, QStringLiteral("Not authenticated. Please login first."));
             return;
         }
 
@@ -2441,12 +2923,12 @@ void ChatService::sendGroupTextMessage(const QString& chatId, const QString& tex
 #endif
         const QMap<int, QString> versions = m_mySenderKeys.value(chatId);
         if (versions.isEmpty() || versions.last().isEmpty()) {
-            emit messageError("Cannot send: group encryption key is not ready");
+            failOutgoing(chatId, clientMessageId, QStringLiteral("Cannot send: group encryption key is not ready"));
             return;
         }
         QByteArray cipher = Encryption::secretBoxEncryptBytes(innerGroup, versions.last());
         if (cipher.isEmpty()) {
-            emit messageError("Cannot send: group encryption failed");
+            failOutgoing(chatId, clientMessageId, QStringLiteral("Cannot send: group encryption failed"));
             return;
         }
         outContent = QString::fromUtf8(cipher.toHex());
@@ -2458,11 +2940,7 @@ void ChatService::sendGroupTextMessage(const QString& chatId, const QString& tex
         }
 #endif
 
-        QUrl url(Config::apiBaseUrl() + "/messages");
-        QNetworkRequest request(url);
-        request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-        applyAuthHeaders(request);
-
+        // Sealed exactly once; the outbox stores it before any transmission.
         QJsonObject body;
         body["chat_id"] = chatId;
         body["chat_type"] = "group";
@@ -2472,50 +2950,8 @@ void ChatService::sendGroupTextMessage(const QString& chatId, const QString& tex
         // Tells the receiver which scheme opened it: 5 = MLS, 1 = Sender Key.
         body["encryption_version"] = encryptionVersion;
         appendForwardFields(body, isForwarded, forwardedFromName, forwardedFromMessageId);
-    appendReplyField(body, takePendingReplyToId());
-
-        QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
-        connect(reply, &QNetworkReply::finished, this, [this, reply, chatId, text]() {
-            reply->deleteLater();
-            if (reply->error() != QNetworkReply::NoError) {
-                emit messageError(reply->errorString());
-                return;
-            }
-            QJsonObject root = QJsonDocument::fromJson(reply->readAll()).object();
-            if (root.contains("error")) {
-                emit messageError(root["error"].toString());
-                return;
-            }
-            QJsonObject data = root["data"].toObject();
-            QVariantMap item;
-            item["id"] = data["id"].toString();
-            item["senderId"] = data["sender_id"].toString();
-            // Use the plaintext we just sent. Re-decrypting our own ciphertext
-            // cannot work under MLS or v4: the sending ratchet does not retain
-            // the message key it just consumed, so this returned the "Encrypted
-            // message" placeholder for our own group messages. (It also passed a
-            // hardcoded encryption_version of 1, which was wrong for both.)
-            item["content"] = text;
-            item["createdAt"] = data["created_at"].toString();
-            item["isForwarded"] = data[QStringLiteral("is_forwarded")].toBool(false);
-            item["forwardedFromName"] = data[QStringLiteral("forwarded_from_name")].toString();
-
-            // Cache it open, for the same reason - otherwise reopening the chat
-            // re-reads the server's ciphertext and shows a placeholder again.
-            if (m_messageCache) {
-                MessageCache::Entry sentEntry;
-                sentEntry.id = item["id"].toString();
-                sentEntry.senderId = item["senderId"].toString();
-                sentEntry.content = text;
-                sentEntry.encrypted = false;
-                sentEntry.createdAt = item["createdAt"].toString();
-                sentEntry.isForwarded = item["isForwarded"].toBool();
-                sentEntry.forwardedFromName = item["forwardedFromName"].toString();
-                sentEntry.encryptionVersion = 1;
-                m_messageCache->saveMessages(chatId, { sentEntry });
-            }
-            emit messageSent(chatId, item);
-        });
+        appendReplyField(body, replyToId);
+        queueSealed(chatId, QStringLiteral("group"), body, clientMessageId);
     });
 }
 
@@ -3315,6 +3751,12 @@ void ChatService::setupForwardSignalHooks() {
             finishCurrentForward(true);
     };
     connect(this, &ChatService::messageSent, this, onSendOk);
+    // Phase 71: a forwarded text that is stored in the outbox but not yet
+    // accepted (offline, server busy) is not a failure - it will be delivered.
+    connect(this, &ChatService::outgoingQueued, this, [this](const QString&, const QString& clientMessageId) {
+        if (m_forwardPhase == ForwardPhase::WaitingSend && clientMessageId == m_forwardClientMessageId)
+            finishCurrentForward(true);
+    });
     connect(this, &ChatService::voiceMessageSent, this, onSendOk);
     connect(this, &ChatService::attachmentMessageSent, this, onSendOk);
     connect(this, &ChatService::videoNoteMessageSent, this, onSendOk);
@@ -3656,6 +4098,26 @@ QVariantMap ChatService::parseChatItem(const QJsonObject& obj) {
         otherUser["avatar_url"] = userObj["avatar_url"].toString();
         otherUser["is_online"] = userObj["is_online"].toBool(false);
         item["other_user"] = otherUser;
+
+        // Remember who the peer IS, always - separately from whether they have
+        // published a key yet. The identity is what lets the key be re-read on
+        // its own later. While the two were only ever learned together, a peer
+        // who published after our last chat-list fetch stayed unreadable for
+        // the rest of the session, because nothing else could ask for the key.
+        {
+            const QString peerId = userObj["id"].toString();
+            if (!peerId.isEmpty()) m_chatOtherUserId.insert(chatId, peerId);
+            if (userObj["public_key"].toString().isEmpty()) {
+                // The case that used to be unrecoverable: peer exists, key not
+                // published yet. Recording the id is what makes it recoverable.
+                qInfo().noquote() << "[peer-key] chat-parsed chat=" << chatId
+                                  << "peer=" << (peerId.isEmpty() ? QStringLiteral("(none)") : peerId)
+                                  << "peerKeyPresent=false";
+            }
+            QString peerName = userObj["display_name"].toString();
+            if (peerName.isEmpty()) peerName = userObj["username"].toString();
+            if (!peerName.isEmpty()) m_chatOtherName.insert(chatId, peerName);
+        }
 
         // Remember the other participant's public key so we can encrypt to /
         // decrypt from this chat.

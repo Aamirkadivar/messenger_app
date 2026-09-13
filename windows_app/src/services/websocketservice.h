@@ -49,6 +49,12 @@ signals:
     // MLS group epoch advanced for this chat (fetch Welcome / handshakes).
     void mlsCommitReceived(const QString& chatId);
 
+    // A group appeared, or its membership/roles changed. Carries the server's
+    // own event name so the receiver decides what to do. Broadcast to every
+    // connected client, so it is a hint to re-read the authoritative chat list,
+    // never an assertion that this account is a member.
+    void groupLifecycleEvent(const QString& event, const QString& chatId);
+
     void messageReceived(const QString& chatId, const QVariantMap& message);
     void typingIndicator(const QString& chatId, const QString& userId, bool typing);
     // Fired when the other participant marks messages in a chat as read.

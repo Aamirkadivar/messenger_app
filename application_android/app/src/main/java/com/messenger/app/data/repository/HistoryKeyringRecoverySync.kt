@@ -6,9 +6,11 @@ import com.messenger.app.data.encryption.history.HistoryKeyringRecoveryTransport
 import com.messenger.app.data.model.HistoryKeyringPutRequest
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.security.TokenManager
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -53,6 +55,27 @@ class HistoryKeyringRecoverySync @Inject constructor(
     /** One recovery attempt per session; reset by [resetSession] on account change. */
     @Volatile
     private var recoveryAttempted = false
+
+    /**
+     * The recovery currently running, if any, and the outcome every caller of it will receive.
+     *
+     * This exists to separate two states the flag above cannot tell apart. `recoveryAttempted` is
+     * set BEFORE the work runs, so it means "an attempt has begun" - but callers were answered
+     * `success(false)`, which means "an attempt FINISHED and imported nothing". A caller arriving
+     * mid-flight was therefore told a completed-and-empty story about work that had not happened
+     * yet, and the one consumer that branches on this result reads any non-failure as permission to
+     * proceed.
+     *
+     * A caller that finds this set joins the running recovery and receives its real outcome. It is
+     * completed with a VALUE rather than cancelled, so a joiner is never cancelled by whatever
+     * happened to the caller that owned the work.
+     *
+     * Atomic rather than merely volatile because [resetSession] can now clear it too, so a worker
+     * finishing after a session change must be able to ask "is this still MY attempt?" and stand
+     * down if it is not. A plain read-then-write could clear the incoming session handle in the
+     * window between the two.
+     */
+    private val inFlight = AtomicReference<CompletableDeferred<Result<Boolean>>?>(null)
 
     /**
      * The repository revision the last successful [upload] actually published.
@@ -111,27 +134,92 @@ class HistoryKeyringRecoverySync @Inject constructor(
      */
     suspend fun ensureRecovered(): Result<Boolean> {
         if (!feature.isEnabled()) return Result.success(false)
+
+        // Join a recovery that is already running rather than inventing an answer about it.
+        inFlight.get()?.let { return it.await() }
+        // A recovery that has already FINISHED still latches: this is the one-shot, unchanged.
         if (recoveryAttempted) return Result.success(false)
 
-        return gate.withLock {
-            if (recoveryAttempted) return@withLock Result.success(false)
+        // Claim the work, or discover the claim someone else made first. Only the claim is taken
+        // under the gate; the recovery itself runs outside it, so a joiner never waits on a lock
+        // held for the length of a network round trip.
+        var claimed: CompletableDeferred<Result<Boolean>>? = null
+        val joined = gate.withLock {
+            inFlight.get() ?: if (recoveryAttempted) {
+                null
+            } else {
+                CompletableDeferred<Result<Boolean>>().also { inFlight.set(it); claimed = it }
+            }
+        }
+        val mine = claimed ?: return joined?.await() ?: Result.success(false)
+
+        var outcome: Result<Boolean>? = null
+        try {
             recoveryAttempted = true
-            recoverInternal().map { it.imported }.onSuccess {
-                // Converge the server copy ONLY when this device held roots the
-                // server does not. A pure import already equals the server copy,
-                // so publishing it back would be a pointless GET -> PUT cycle
-                // that bumps the version on every fresh install.
+            outcome = runRecovery()
+            return outcome
+        } finally {
+            // Settle the joiners on every exit, including cancellation of the coroutine that owned
+            // the work. Recovery runs in the CALLER's coroutine and this class owns no scope of its
+            // own, so there is nothing left to continue it - stranding joiners on a deferred that
+            // will never complete would be the worst outcome available. They are handed an ordinary
+            // failure value instead of a cancellation, so they are not cancelled in turn, and the
+            // attempt is re-armed so the next caller genuinely retries.
+            // Stand down if this attempt has been superseded. A session reset clears the handle,
+            // so by the time a worker gets here the field may already hold the INCOMING session's
+            // attempt - and clearing that would strand its joiners on a handle nobody will complete,
+            // which is exactly the fabricated-success bug this whole design exists to prevent.
+            // Compare-and-set makes "still mine" and "clear it" one step.
+            val stillCurrent = inFlight.compareAndSet(mine, null)
+            val settled = outcome ?: run {
+                // The worker coroutine went away before recovery settled - most often cancellation.
+                // Re-arm only if we still own the session state; re-arming someone else's would let
+                // a third caller start a duplicate recovery underneath them.
+                if (stillCurrent) recoveryAttempted = false
+                Result.failure(
+                    IllegalStateException("history keyring recovery was interrupted before it completed")
+                )
+            }
+            mine.complete(settled)
+        }
+    }
+
+    /**
+     * One recovery attempt. Extracted only so [ensureRecovered] can settle its joiners in a
+     * `finally`; the body is unchanged.
+     */
+    private suspend fun runRecovery(): Result<Boolean> {
+        // Flatten a THROWN recovery failure into a returned one.
+        //
+        // recoverInternal unwraps its steps with getOrElse, which handles a failure it RETURNS but
+        // not one it RAISES - and its inner block is try/finally with no catch. A raise (a Keystore
+        // or JNI fault out of the recovery open, a decode, an import) therefore left the caller
+        // before the .onFailure below was ever applied, so the reset never ran and
+        // recoveryAttempted stayed true for the rest of the session: recovery never retried, and
+        // every later caller was told success(false) - which reads as "no failure" to the one
+        // consumer that branches on this, suppressing its per-chat root check.
+        //
+        // This changes only the SHAPE of a failure, never its meaning. A returned failure is
+        // untouched, success is untouched, and nothing is swallowed: the same exception reaches
+        // the same .onFailure and the same caller.
+        return runCatching { recoverInternal() }
+            .getOrElse { Result.failure(it) }
+            .map { it.imported }
+            .onSuccess {
+                // Converge the server copy ONLY when this device held roots the server does not. A
+                // pure import already equals the server copy, so publishing it back would be a
+                // pointless GET -> PUT cycle that bumps the version on every fresh install.
                 if (lastRecovery?.localHadExtraRoots == true) {
                     upload().onSuccess { uploadedRevision = publishedRevision }
                         .onFailure { Log.w(TAG, "post-recovery convergence deferred: ${it.message}") }
                 }
-            }.onFailure {
-                // Allow a later attempt: a transient failure must not permanently
-                // disable recovery for the session.
+            }
+            .onFailure {
+                // Allow a later attempt: a transient failure must not permanently disable recovery
+                // for the session.
                 recoveryAttempted = false
                 Log.w(TAG, "keyring recovery failed: ${it.message}")
             }
-        }
     }
 
     /**
@@ -245,6 +333,13 @@ class HistoryKeyringRecoverySync @Inject constructor(
         recoveryAttempted = false
         uploadedRevision = -1
         publishedRevision = -1
+        // Forget any attempt still running for the OUTGOING session. This object is a singleton and
+        // survives the account switch, so leaving the handle in place would let the next account
+        // join the previous account's recovery and be handed its outcome - skipping its own.
+        //
+        // Only the reference is dropped. The worker keeps its own copy and still completes it, so
+        // callers already attached to that attempt are settled exactly as before.
+        inFlight.set(null)
     }
 
     /**
@@ -260,6 +355,11 @@ class HistoryKeyringRecoverySync @Inject constructor(
         if (!feature.isEnabled()) return Result.failure(disabled())
         val token = currentToken() ?: return Result.failure(
             IllegalStateException("no usable session for keyring recovery upload")
+        )
+        // Same reasoning as recoverInternal: the conflict-merge below opens and imports a remote
+        // blob, and that import must be filed under the account this upload began for.
+        val attemptOwner = currentOwner() ?: return Result.failure(
+            IllegalStateException("no signed-in account for keyring recovery upload")
         )
 
         // A locked vault means the authoritative keyring cannot be read at all,
@@ -314,7 +414,8 @@ class HistoryKeyringRecoverySync @Inject constructor(
             val remotePlain = transport.openFromRecovery(remote.second)
                 .getOrElse { return Result.failure(it) }
             try {
-                keyring.importFromRecovery(remotePlain).getOrElse { return Result.failure(it) }
+                keyring.importFromRecovery(remotePlain, attemptOwner)
+                    .getOrElse { return Result.failure(it) }
             } finally {
                 com.messenger.app.data.encryption.history.HistoryCrypto.bestEffortWipe(remotePlain)
             }
@@ -357,6 +458,12 @@ class HistoryKeyringRecoverySync @Inject constructor(
         currentToken() ?: return Result.failure(
             IllegalStateException("no usable session for keyring recovery")
         )
+        // The account this attempt belongs to, captured ONCE and never re-read. Everything after
+        // this line can suspend, and the signed-in account is mutable, so re-asking later would let
+        // a sign-out/sign-in decide where these roots get filed.
+        val attemptOwner = currentOwner() ?: return Result.failure(
+            IllegalStateException("no signed-in account for keyring recovery")
+        )
 
         val remote = fetch().getOrElse { return Result.failure(it) }
             ?: return Result.success(RecoveryResult(imported = false, localHadExtraRoots = false))
@@ -371,7 +478,7 @@ class HistoryKeyringRecoverySync @Inject constructor(
         return try {
             val remoteCount = com.messenger.app.data.encryption.history.HistoryKeyring
                 .decode(plain).getOrElse { return Result.failure(it) }.entries.size
-            keyring.importFromRecovery(plain).map { merged ->
+            keyring.importFromRecovery(plain, attemptOwner).map { merged ->
                 RecoveryResult(
                     imported = true,
                     localHadExtraRoots = merged.entries.size > remoteCount,
@@ -426,6 +533,20 @@ class HistoryKeyringRecoverySync @Inject constructor(
         runCatching { tokenManager.getAccessToken().getOrNull() }
             .getOrNull()
             ?.takeIf { it.isNotBlank() }
+
+    /**
+     * The account an attempt belongs to, read once at its start.
+     *
+     * Deliberately separate from "who is signed in now": the two are the same at the moment an
+     * attempt begins and can diverge before it finishes, and only the first is the authority on
+     * where that attempt's roots may be written.
+     *
+     * Read from the keyring repository rather than the token store on purpose - that is the same
+     * authority its persistence consults, so the capture and the later check can never disagree
+     * about who the account is.
+     */
+    private suspend fun currentOwner(): String? =
+        runCatching { keyring.currentOwner() }.getOrNull()?.takeIf { it.isNotBlank() }
 
     private fun bearer(token: String) =
         if (token.startsWith("Bearer ")) token else "Bearer $token"

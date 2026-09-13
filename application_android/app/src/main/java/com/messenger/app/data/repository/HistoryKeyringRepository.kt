@@ -135,6 +135,15 @@ class HistoryKeyringRepository @Inject constructor(
      */
     private suspend fun loadLocked(): Result<HistoryKeyring> {
         val owner = runCatching { users.currentUserId() }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+        // No signed-in account, no keyring. The durable slots are account-scoped
+        // now, so there is nothing to address without an owner - and serving
+        // "empty" here would be indistinguishable from a genuinely empty keyring.
+        if (owner == null) {
+            return Result.failure(
+                IllegalStateException("no signed-in account to load a history keyring for")
+            )
+        }
 
         // Identity first. An in-memory keyring belongs to the account it was
         // opened for and to no other.
@@ -145,7 +154,7 @@ class HistoryKeyringRepository @Inject constructor(
         }
         cached?.let { return Result.success(it) }
 
-        val cacheRead = store.loadHistoryKeyringCache()
+        val cacheRead = store.loadHistoryKeyringCache(owner)
         val cacheBytes = cacheRead.getOrNull()
 
         // The cache is account-bound. Three outcomes, and the difference between
@@ -171,7 +180,7 @@ class HistoryKeyringRepository @Inject constructor(
         // A mismatch is not corruption and not foreign ownership: it means a
         // write was interrupted. The response is to fall through to the
         // authoritative copy, which then re-stamps the cache below.
-        val marker = store.loadHistoryKeyringGeneration().getOrNull()
+        val marker = store.loadHistoryKeyringGeneration(owner).getOrNull()
         if (decodedCache is HistoryKeyringCacheFormat.Decoded.Owned) {
             if (marker != null && decodedCache.generation == marker) {
                 val decoded = decodeAndCache(decodedCache.keyringBytes)
@@ -188,7 +197,7 @@ class HistoryKeyringRepository @Inject constructor(
             }
         }
 
-        val stored = store.loadHistoryKeyring().getOrElse { return Result.failure(it) }
+        val stored = store.loadHistoryKeyring(owner).getOrElse { return Result.failure(it) }
         if (stored == null) {
             // Absent cache, or a cache that demonstrably belongs to someone else.
             // Note the condition is unchanged in meaning: only a genuinely absent
@@ -251,7 +260,7 @@ class HistoryKeyringRepository @Inject constructor(
                 // not durably recorded would leave it permanently mismatched, so
                 // the marker is established here - once - and the cache is stamped
                 // to match it.
-                writeCache(plain, ensureMarkerLocked(marker))
+                writeCache(owner, plain, ensureMarkerLocked(owner, marker))
             }
         } finally {
             HistoryCrypto.bestEffortWipe(plain)
@@ -282,10 +291,10 @@ class HistoryKeyringRepository @Inject constructor(
      * which simply leaves the cache mismatched and forces the next read through
      * the vault again - the safe direction.
      */
-    private suspend fun ensureMarkerLocked(current: Long?): Long {
+    private suspend fun ensureMarkerLocked(owner: String, current: Long?): Long {
         if (current != null) return current
         val seeded = 1L
-        return store.saveHistoryKeyringGeneration(seeded).fold(
+        return store.saveHistoryKeyringGeneration(owner, seeded).fold(
             onSuccess = { seeded },
             onFailure = {
                 Log.w(TAG, "could not establish a history keyring generation marker: ${it.message}")
@@ -294,14 +303,13 @@ class HistoryKeyringRepository @Inject constructor(
         )
     }
 
-    private suspend fun writeCache(plain: ByteArray, generation: Long): Result<Unit> {
+    private suspend fun writeCache(owner: String, plain: ByteArray, generation: Long): Result<Unit> {
         // Bind the cache to the signed-in account. Without an identity there is
         // nothing to bind to, so no cache is written at all - the authoritative
         // MK-sealed copy is already durable, and an unbound cache is precisely
         // what this change exists to eliminate.
-        val owner = runCatching { users.currentUserId() }.getOrNull()
-        if (owner.isNullOrBlank()) {
-            return store.deleteHistoryKeyringCache().fold(
+        if (owner.isBlank()) {
+            return store.deleteHistoryKeyringCache(owner).fold(
                 onSuccess = { Result.success(Unit) },
                 onFailure = {
                     Result.failure(
@@ -315,8 +323,8 @@ class HistoryKeyringRepository @Inject constructor(
             )
         }
         val bound = HistoryKeyringCacheFormat.encode(owner, generation, plain)
-        store.saveHistoryKeyringCache(bound).onSuccess { return Result.success(Unit) }
-        return store.deleteHistoryKeyringCache().fold(
+        store.saveHistoryKeyringCache(owner, bound).onSuccess { return Result.success(Unit) }
+        return store.deleteHistoryKeyringCache(owner).fold(
             onSuccess = { Result.success(Unit) },
             onFailure = {
                 Result.failure(
@@ -441,12 +449,28 @@ class HistoryKeyringRepository @Inject constructor(
      * arrived, and a blob that opened under another account can never be stored
      * as this one's.
      */
-    suspend fun importFromRecovery(remoteKeyringBytes: ByteArray): Result<HistoryKeyring> =
+    suspend fun importFromRecovery(
+        remoteKeyringBytes: ByteArray,
+        /**
+         * The account the recovery attempt began for.
+         *
+         * Everything below resolves the owner from the CURRENT session, and a recovery attempt can
+         * suspend across a network round trip and an AEAD open before it gets here. Without this,
+         * an attempt released after a sign-out/sign-in would file the OUTGOING account's roots
+         * under the INCOMING one - the signed-in account at persistence time is not the authority
+         * on who an already-started attempt belongs to.
+         */
+        attemptOwner: String,
+    ): Result<HistoryKeyring> =
         mutex.withLock {
             if (!feature.isEnabled()) return Result.failure(HistoryArchiveDisabledException())
+            if (!ownerStillIs(attemptOwner)) return Result.failure(accountChanged())
             val remote = HistoryKeyring.decode(remoteKeyringBytes)
                 .getOrElse { return Result.failure(it) }
             val local = loadLocked().getOrElse { return Result.failure(it) }
+            // loadLocked suspends - durable reads and a vault open - so the account can move
+            // between the check above and anything written below. Re-verify before the first write.
+            if (!ownerStillIs(attemptOwner)) return Result.failure(accountChanged())
 
             val merged = HistoryKeyringMerge.union(local, remote)
                 .getOrElse { return Result.failure(it) }
@@ -459,6 +483,25 @@ class HistoryKeyringRepository @Inject constructor(
             }
             persistLocked(merged).map { merged }
         }
+
+    /**
+     * The account this repository would file a write under right now.
+     *
+     * Exposed so a caller starting a long-running attempt can capture the owner from the SAME
+     * authority the persistence below consults. Reading it from anywhere else - the token store,
+     * say - would make the guard depend on two sources agreeing, which is a weaker invariant than
+     * the one being enforced.
+     */
+    suspend fun currentOwner(): String? =
+        runCatching { users.currentUserId() }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    /** Whether the signed-in account is still the one an in-flight attempt began for. */
+    private suspend fun ownerStillIs(attemptOwner: String): Boolean =
+        currentOwner() == attemptOwner
+
+    private fun accountChanged() = IllegalStateException(
+        "history keyring recovery abandoned: the signed-in account changed while it was running"
+    )
 
     /** The exact root a stored archive was sealed under, or null if this device does not hold it. */
     suspend fun find(chatId: String, rootVersion: Int): Result<HistoryRootEntry?> = mutex.withLock {
@@ -489,6 +532,11 @@ class HistoryKeyringRepository @Inject constructor(
      * present the next load with a keyring that disagrees with itself.
      */
     suspend fun discardForMkReplacement(): Result<Unit> = mutex.withLock {
+        val owner = runCatching { users.currentUserId() }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: return@withLock Result.failure(
+                IllegalStateException("no signed-in account to discard a history keyring for")
+            )
         val failures = mutableListOf<Throwable>()
         // ORDER MATTERS, and the marker goes FIRST.
         //
@@ -503,9 +551,9 @@ class HistoryKeyringRepository @Inject constructor(
         // authoritative copy, which cannot be opened by the replacement key and
         // is reported as a failure rather than as an empty or stale keyring.
         // Only when all three are gone does a load legitimately see "no keyring".
-        store.deleteHistoryKeyringGeneration().onFailure { failures += it }
-        store.deleteHistoryKeyringCache().onFailure { failures += it }
-        store.deleteHistoryKeyring().onFailure { failures += it }
+        store.deleteHistoryKeyringGeneration(owner).onFailure { failures += it }
+        store.deleteHistoryKeyringCache(owner).onFailure { failures += it }
+        store.deleteHistoryKeyring(owner).onFailure { failures += it }
         cached = null
         cachedOwner = null
         rotationRequired.clear()
@@ -553,6 +601,15 @@ class HistoryKeyringRepository @Inject constructor(
      * message is unaffected.
      */
     private suspend fun persistLocked(keyring: HistoryKeyring): Result<Unit> {
+        // Captured before sealHistoryKeyring, which reaches the vault. A durable
+        // write that lands after an account switch must still be filed under the
+        // account this operation started as - never under whoever is current when
+        // the write finally happens.
+        val owner = runCatching { users.currentUserId() }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: return Result.failure(
+                IllegalStateException("no signed-in account to persist a history keyring for")
+            )
         val plain = keyring.encode()
         try {
             val sealed = vault.sealHistoryKeyring(plain).getOrElse { return Result.failure(it) }
@@ -576,10 +633,10 @@ class HistoryKeyringRepository @Inject constructor(
             // The marker is never rolled back on failure. A marker that ran ahead
             // costs one extra vault read; a marker that lagged would re-validate a
             // stale cache, which is the whole defect.
-            val nextGeneration = (store.loadHistoryKeyringGeneration().getOrNull() ?: 0L) + 1
-            store.saveHistoryKeyringGeneration(nextGeneration).getOrElse { return Result.failure(it) }
-            store.saveHistoryKeyring(sealed).getOrElse { return Result.failure(it) }
-            writeCache(plain, nextGeneration).getOrElse { return Result.failure(it) }
+            val nextGeneration = (store.loadHistoryKeyringGeneration(owner).getOrNull() ?: 0L) + 1
+            store.saveHistoryKeyringGeneration(owner, nextGeneration).getOrElse { return Result.failure(it) }
+            store.saveHistoryKeyring(owner, sealed).getOrElse { return Result.failure(it) }
+            writeCache(owner, plain, nextGeneration).getOrElse { return Result.failure(it) }
         } finally {
             HistoryCrypto.bestEffortWipe(plain)
         }

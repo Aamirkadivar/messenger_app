@@ -139,6 +139,16 @@ interface ChatApiService {
         @Body request: SendMessageRequest
     ): Response<SendMessageResponse>
 
+    /**
+     * The outbox send: [body] is the stored request JSON, posted byte for byte so every retry of
+     * one logical message carries the identical ciphertext and client_message_id.
+     */
+    @POST("messages")
+    suspend fun sendMessageRaw(
+        @Header("Authorization") token: String,
+        @Body body: okhttp3.RequestBody
+    ): Response<SendMessageResponse>
+
     /** Opaque (usually encrypted) voice payload. Returns {"file_url": ...}. */
     @Multipart
     @POST("messages/voice")
@@ -171,12 +181,17 @@ interface ChatApiService {
         @Part file: MultipartBody.Part
     ): Response<Map<String, kotlinx.serialization.json.JsonElement>>
 
+    /**
+     * No cursor: newest page, newest first. [before] (a seq): older than it, newest first.
+     * [after] (a seq): newer than it, oldest first - the catch-up direction. Never both.
+     */
     @GET("messages/{chatId}")
     suspend fun getMessages(
         @Header("Authorization") token: String,
         @Path("chatId") chatId: String,
         @Query("limit") limit: Int = 50,
-        @Query("before") before: String? = null
+        @Query("before") before: String? = null,
+        @Query("after") after: String? = null
     ): Response<MessagesResponse>
 
     // ==================== Groups ====================
@@ -337,6 +352,14 @@ interface ChatApiService {
     suspend fun deleteHistoryKeyring(
         @Header("Authorization") token: String
     ): Response<Unit>
+
+    // Phase 44 device enrolment, step one. Creates no device row: it only seals a
+    // random value to the key the caller claims to hold.
+    @POST("e2ee/devices/challenge")
+    suspend fun createE2EEDeviceChallenge(
+        @Header("Authorization") token: String,
+        @Body body: E2EEDeviceChallengeRequest
+    ): Response<E2EEDeviceChallengeResponse>
 
     @POST("e2ee/devices")
     suspend fun registerE2EEDevice(

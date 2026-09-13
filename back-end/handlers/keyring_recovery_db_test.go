@@ -37,6 +37,15 @@ type keyringEnv struct {
 	deviceB     string
 	revokedA    string
 	currentUser uuid.UUID
+
+	// Phase 44: authorization resolves through the session, so the fixture needs
+	// one live session per legitimate (user, device) pair. sessionFor maps a
+	// device id to the session that device proved itself on.
+	sessionFor map[string]uuid.UUID
+	// primaryFor is the session a user falls back to when the request names a
+	// device they never proved - the real-world case of a client asserting some
+	// other device's id, which must be refused as a mismatch rather than allowed.
+	primaryFor map[uuid.UUID]uuid.UUID
 }
 
 func keyringEnvSetup(t *testing.T) *keyringEnv {
@@ -70,17 +79,39 @@ func keyringEnvSetup(t *testing.T) *keyringEnv {
 			t.Fatalf("seed user: %v", err)
 		}
 	}
-	db.Create(&models.E2EEDevice{ID: uuid.New(), UserID: e.userA, DeviceID: e.deviceA, CreatedAt: now, UpdatedAt: now})
-	db.Create(&models.E2EEDevice{ID: uuid.New(), UserID: e.userB, DeviceID: e.deviceB, CreatedAt: now, UpdatedAt: now})
-	db.Create(&models.E2EEDevice{
-		ID: uuid.New(), UserID: e.userA, DeviceID: e.revokedA,
-		RevokedAt: &now, CreatedAt: now, UpdatedAt: now,
-	})
+	e.sessionFor = map[string]uuid.UUID{}
+	e.primaryFor = map[uuid.UUID]uuid.UUID{}
+	// Devices that completed proof of possession, each with the session it proved
+	// itself on. This is the state a real client reaches after registration.
+	e.sessionFor[e.deviceA] = seedVerifiedDeviceSession(t, db, e.userA, e.deviceA)
+	e.sessionFor[e.deviceB] = seedVerifiedDeviceSession(t, db, e.userB, e.deviceB)
+	e.primaryFor[e.userA] = e.sessionFor[e.deviceA]
+	e.primaryFor[e.userB] = e.sessionFor[e.deviceB]
+	// A device that proved itself and was then revoked. Its session is left LIVE
+	// on purpose: this fixture exercises the device gate, and a revoked session
+	// would be rejected earlier by AuthMiddleware, which these tests do not run.
+	revokedRow := seedVerifiedDevice(t, db, e.userA, e.revokedA)
+	e.sessionFor[e.revokedA] = seedBoundSession(t, db, e.userA, revokedRow)
+	if err := db.Model(&models.E2EEDevice{}).Where("id = ?", revokedRow).
+		Update("revoked_at", now).Error; err != nil {
+		t.Fatalf("seed revoked device: %v", err)
+	}
 
 	e.currentUser = e.userA
 	e.app = fiber.New()
 	e.app.Use(func(c *fiber.Ctx) error {
-		c.Locals(middleware.ContextKeyUser, &middleware.JWTClaims{UserID: e.currentUser})
+		// Stand in for AuthMiddleware. The session is chosen by the device the
+		// request claims to be: a device that proved itself gets its own session,
+		// and anything else falls back to the caller's real session - which is
+		// exactly what a client asserting somebody else's device id would carry,
+		// and must be refused as a mismatch rather than honoured.
+		sid, ok := e.sessionFor[c.Get("X-Device-Id")]
+		if !ok {
+			sid = e.primaryFor[e.currentUser]
+		}
+		c.Locals(middleware.ContextKeyUser, &middleware.JWTClaims{
+			UserID: e.currentUser, SessionID: sid,
+		})
 		return c.Next()
 	})
 	e.app.Use(middleware.RequireDeviceIdentity())
@@ -1222,7 +1253,10 @@ func gate11Setup(t *testing.T) *gate11Env {
 	e.app.Use(middleware.DeviceRevocationGuard())
 	vh := NewE2EEHandler(nil)
 	kh := NewKeyringRecoveryHandler()
-	e.app.Put("/vault", vh.PutVault) // no RequireDeviceIdentity
+	// Phase 67 gated this route in main.go. The harness follows production rather
+	// than pinning the old wiring - a Gate 11 exploit is only interesting if it
+	// still works against the routes that actually ship.
+	e.app.Put("/vault", middleware.RequireDeviceIdentity(), vh.PutVault)
 	e.app.Put("/history-keyring", middleware.RequireDeviceIdentity(), kh.PutHistoryKeyring)
 	return e
 }
@@ -1270,8 +1304,17 @@ func TestGate11_RevokedDeviceIsBlockedWhenItIdentifiesItself(t *testing.T) {
 func TestGate11_RevokedDeviceBypassesGuardByOmittingTheHeader(t *testing.T) {
 	e := gate11Setup(t)
 	code := e.send(t, http.MethodPut, "/vault", "", gate11VaultBody(1, 0), false)
-	if code == http.StatusForbidden || code == http.StatusBadRequest {
-		return // safe
+	// Any 4xx is a refusal. The original list named only 403/400 because those
+	// were the only refusals the UNGATED route could produce; once the route
+	// carries RequireDeviceIdentity a revoked device's dead session answers 401,
+	// and treating that as a successful exploit reports the opposite of the truth.
+	if code >= 400 {
+		var v models.E2EEVault
+		database.DB.Where("user_id = ?", e.userA).First(&v)
+		if len(v.PwWrappedMaster) != 0 {
+			t.Fatalf("refused with %d but the vault was still written (%q)", code, string(v.PwWrappedMaster))
+		}
+		return // safe: refused, and nothing was stored
 	}
 	var v models.E2EEVault
 	database.DB.Where("user_id = ?", e.userA).First(&v)
@@ -1285,7 +1328,12 @@ func TestGate11_RevokedDeviceBypassesGuardByOmittingTheHeader(t *testing.T) {
 func TestGate11_RevokedDeviceBypassesGuardByInventingADeviceId(t *testing.T) {
 	e := gate11Setup(t)
 	code := e.send(t, http.MethodPut, "/vault", "device-freshly-invented", gate11VaultBody(1, 0), true)
-	if code == http.StatusForbidden || code == http.StatusBadRequest {
+	if code >= 400 {
+		var v models.E2EEVault
+		database.DB.Where("user_id = ?", e.userA).First(&v)
+		if len(v.PwWrappedMaster) != 0 {
+			t.Fatalf("refused with %d but the vault was still written (%q)", code, string(v.PwWrappedMaster))
+		}
 		return
 	}
 	t.Fatalf("GATE11 EXPLOIT: a revoked device wrote the vault under a self-chosen "+
@@ -1297,7 +1345,7 @@ func TestGate11_InventedDeviceIdDefeatsRequireDeviceIdentity(t *testing.T) {
 	e := gate11Setup(t)
 	body := putBody(0, "attacker-keyring")
 	code := e.send(t, http.MethodPut, "/history-keyring", "device-freshly-invented-2", body, true)
-	if code == http.StatusForbidden || code == http.StatusBadRequest {
+	if code >= 400 {
 		return
 	}
 	t.Fatalf("GATE11 EXPLOIT: RequireDeviceIdentity accepted a self-chosen device id "+

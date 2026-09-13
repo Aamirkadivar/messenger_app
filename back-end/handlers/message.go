@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"messenger-app/database"
@@ -15,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // MessageService handles message-related operations
@@ -50,6 +53,38 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		})
 	}
 
+	// Idempotency. A client that sends client_message_id repeats it on every
+	// retry of the same logical message, so the one question that matters for a
+	// retry is "did this sender already get it accepted?".
+	//
+	// That is answered before every other check on purpose: a retry that lands
+	// after the sender left the group, or after a block, must still learn that
+	// its message WAS accepted - reporting a failure for a message the server
+	// holds is how a client ends up re-sending it as a new one. The lookup is
+	// scoped to the caller's own rows, so it discloses nothing about anyone else.
+	var clientMessageID *string
+	if raw := strings.TrimSpace(req.ClientMessageID); raw != "" {
+		parsed, err := uuid.Parse(raw)
+		if err != nil {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+				"error":   "invalid_client_message_id",
+				"message": "client_message_id must be a UUID",
+			})
+		}
+		canonical := parsed.String()
+		clientMessageID = &canonical
+		existing, found, err := findSentByClientID(userID, canonical)
+		if err != nil {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+				"error":   "internal error",
+				"message": "Failed to check message",
+			})
+		}
+		if found {
+			return replayAccepted(c, existing, chatIDParsed)
+		}
+	}
+
 	// Verify chat exists and user is a participant
 	var chat models.Chat
 	if err := database.DB.First(&chat, chatIDParsed).Error; err != nil {
@@ -62,6 +97,16 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 	// Check if user is a participant
 	var participant models.ChatParticipant
 	if err := database.DB.Where("chat_id = ? AND user_id = ?", chatIDParsed, userID).First(&participant).Error; err != nil {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "You are not a participant of this chat",
+		})
+	}
+	// A group member who left, or was removed, keeps their row - left_at records
+	// the departure - so the row alone is not membership. Direct chats are the
+	// exception: there left_at only means the chat was cleared from the list, and
+	// sending brings it back (below).
+	if chat.Type != "direct" && participant.LeftAt != nil {
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{
 			"error":   "forbidden",
 			"message": "You are not a participant of this chat",
@@ -127,6 +172,7 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		ForwardedFromName:      req.ForwardedFromName,
 		ForwardedFromMessageID: req.ForwardedFromMessageID,
 		SenderDeviceID:         c.Get("X-Device-Id"),
+		ClientMessageID:        clientMessageID,
 	}
 
 	if message.EncryptionVersion == 0 {
@@ -148,22 +194,105 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 		message.ThumbnailURL = req.ThumbnailURL
 	}
 
+	// The checks above ran without a lock, and a group can change under them:
+	// every lifecycle operation - DeleteGroup included, which soft-deletes the
+	// group's messages and then deletes the chat - first takes the chat row FOR
+	// UPDATE (see lockGroup). So the insert runs in a transaction that holds the
+	// chat row in KEY SHARE, and the checks a lifecycle operation can invalidate
+	// are taken again under it. A send either commits before a concurrent
+	// DeleteGroup, which then soft-deletes it with the rest, or waits and finds
+	// the chat gone: it can never leave a live message in a deleted chat.
+	//
+	// KEY SHARE is exactly the lock the old fk_chats_last_message check took on
+	// every INSERT (see MigrateDB). It does not block other sends, nor plain
+	// updates of the chat row. Everything in the transaction goes through tx:
+	// the connection pool is bounded, and a second connection taken while this
+	// one holds the lock could exhaust it.
+	failedToSave := func() error {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "internal error",
+			"message": "Failed to save message",
+		})
+	}
+	tx := database.DB.Begin()
+	if tx.Error != nil {
+		return failedToSave()
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+	var held models.Chat
+	lock := tx.Clauses(clause.Locking{Strength: "KEY SHARE"}).Select("id").
+		Where("id = ?", chatIDParsed.String()).Limit(1).Find(&held)
+	if lock.Error != nil {
+		return failedToSave()
+	}
+	if lock.RowsAffected == 0 {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{
+			"error":   "chat not found",
+			"message": "Chat not found",
+		})
+	}
+	if chat.Type != "direct" {
+		var active int64
+		if err := tx.Model(&models.ChatParticipant{}).
+			Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatIDParsed, userID).
+			Count(&active).Error; err != nil {
+			return failedToSave()
+		}
+		if active == 0 {
+			return c.Status(http.StatusForbidden).JSON(fiber.Map{
+				"error":   "forbidden",
+				"message": "You are not a participant of this chat",
+			})
+		}
+	}
+
 	// A new message brings a direct chat back for anyone who had cleared it
 	// off their list (see DeleteChat) - otherwise the chat stays hidden and
 	// their messages silently disappear. Deliberately direct-only: in a group,
 	// left_at means someone actually left, and a message must not drag them
 	// back in.
 	if chat.Type == "direct" {
-		database.DB.Model(&models.ChatParticipant{}).
+		tx.Model(&models.ChatParticipant{}).
 			Where("chat_id = ? AND left_at IS NOT NULL", chatID).
 			Update("left_at", nil)
 	}
 
-	if err := database.DB.Create(&message).Error; err != nil {
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-			"error":   "internal error",
-			"message": "Failed to save message",
-		})
+	// Durable persistence, and the only point acceptance may follow. The INSERT
+	// commits before anything is reported, and a failure is an HTTP failure.
+	//
+	// ON CONFLICT covers the race the lookup above cannot: two retries of one
+	// logical message arriving together. Exactly one inserts; the other gets no
+	// row back and resolves to the winner. RETURNING reads the seq the database
+	// assigned inside the INSERT (see migratePhase71).
+	res := tx.Clauses(
+		clause.OnConflict{
+			Columns:     []clause.Column{{Name: "sender_id"}, {Name: "client_message_id"}},
+			TargetWhere: clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: "client_message_id IS NOT NULL"}}},
+			DoNothing:   true,
+		},
+		clause.Returning{Columns: []clause.Column{{Name: "seq"}}},
+	).Create(&message)
+	if res.Error != nil {
+		return failedToSave()
+	}
+	if err := tx.Commit().Error; err != nil {
+		return failedToSave()
+	}
+	committed = true
+	if res.RowsAffected == 0 && clientMessageID != nil {
+		existing, found, err := findSentByClientID(userID, *clientMessageID)
+		if err != nil || !found {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+				"error":   "internal error",
+				"message": "Failed to save message",
+			})
+		}
+		return replayAccepted(c, existing, chatIDParsed)
 	}
 	now := time.Now()
 	database.DB.Model(&models.Chat{}).Where("id = ?", chatID).Updates(map[string]interface{}{
@@ -184,7 +313,8 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 	wsMsg := models.WebSocketMessage{
 		Type: "message",
 		Data: map[string]interface{}{
-			"chat_id":                   chatID,
+			// Canonical form: rooms are joined under the canonical chat id.
+			"chat_id":                   chatIDParsed.String(),
 			"chat_type":                 chat.Type,
 			"message_id":                messageID.String(),
 			"sender_id":                 userID.String(),
@@ -204,44 +334,97 @@ func (s *MessageService) SendMessage(c *fiber.Ctx) error {
 			"forwarded_from_name":       message.ForwardedFromName,
 			"forwarded_from_message_id": forwardedFromMsgID,
 			"timestamp":                 message.CreatedAt,
+			"seq":                       message.Seq,
 		},
 		Timestamp: time.Now(),
 	}
 
 	wsData, _ := json.Marshal(wsMsg)
 
-	// Broadcast via WebSocket hub
+	// Realtime push of the PERSISTED message, after the commit. It is a
+	// best-effort shortcut, never the delivery guarantee: a recipient that is
+	// offline, disconnected mid-push or too slow to drain its buffer gets this
+	// message from GET /messages ?after= when it next syncs.
 	if s.hub != nil {
 		s.hub.Broadcast <- wsData
 	}
 
-	return c.JSON(fiber.Map{
-		"message": "Message sent successfully",
+	return c.JSON(acceptedResponse(message, false))
+}
+
+// findSentByClientID returns the caller's own message carrying clientMessageID.
+func findSentByClientID(senderID uuid.UUID, clientMessageID string) (models.Message, bool, error) {
+	var m models.Message
+	tx := database.DB.Where("sender_id = ? AND client_message_id = ?", senderID, clientMessageID).
+		Limit(1).Find(&m)
+	if tx.Error != nil {
+		return m, false, tx.Error
+	}
+	return m, tx.RowsAffected > 0, nil
+}
+
+// replayAccepted answers a retry of a message that is already stored. Nothing
+// is inserted and nothing is re-broadcast: the original acceptance did both.
+// A client_message_id reused for a DIFFERENT chat is not a retry but a client
+// bug, and resolving it to the other chat's message would be wrong either way.
+func replayAccepted(c *fiber.Ctx, existing models.Message, chatID uuid.UUID) error {
+	if existing.ChatID != chatID.String() {
+		return c.Status(http.StatusConflict).JSON(fiber.Map{
+			"error":   "client_message_id_conflict",
+			"message": "client_message_id already identifies a message in another chat",
+		})
+	}
+	return c.JSON(acceptedResponse(existing, true))
+}
+
+// acceptedResponse reports server acceptance: the ciphertext is durably stored
+// and has a position in its chat. It deliberately carries no delivered_at -
+// acceptance says nothing about whether any recipient has the message yet, and
+// this server does not track delivery at all.
+func acceptedResponse(m models.Message, replay bool) fiber.Map {
+	var forwardedFromMsgID interface{}
+	if m.ForwardedFromMessageID != nil {
+		forwardedFromMsgID = m.ForwardedFromMessageID.String()
+	}
+	var replyToID interface{}
+	if m.ReplyToID != nil {
+		replyToID = m.ReplyToID.String()
+	}
+	var clientMessageID interface{}
+	if m.ClientMessageID != nil {
+		clientMessageID = *m.ClientMessageID
+	}
+	return fiber.Map{
+		"message": "Message accepted",
 		"data": fiber.Map{
-			"id":                        messageID,
-			"chat_id":                   chatID,
-			"sender_id":                 userID,
-			"encrypted":                 req.Encrypted,
-			"content":                   content,
-			"file_url":                  message.FileURL,
-			"file_type":                 message.ContentType,
-			"file_name":                 message.FileName,
-			"file_size":                 message.FileSize,
-			"duration_ms":               message.DurationMs,
-			"thumbnail_url":             message.ThumbnailURL,
-			"key_version":               message.KeyVersion,
-			"encryption_version":        message.EncryptionVersion,
-			"sender_device_id":          message.SenderDeviceID,
+			"id":                        m.ID,
+			"chat_id":                   m.ChatID,
+			"sender_id":                 m.SenderID,
+			"encrypted":                 m.IsEncrypted,
+			"content":                   m.EncryptedContent,
+			"file_url":                  m.FileURL,
+			"file_type":                 m.ContentType,
+			"file_name":                 m.FileName,
+			"file_size":                 m.FileSize,
+			"duration_ms":               m.DurationMs,
+			"thumbnail_url":             m.ThumbnailURL,
+			"key_version":               m.KeyVersion,
+			"encryption_version":        m.EncryptionVersion,
+			"sender_device_id":          m.SenderDeviceID,
 			"reply_to_id":               replyToID,
-			"is_forwarded":              message.IsForwarded,
-			"forwarded_from_name":       message.ForwardedFromName,
+			"is_forwarded":              m.IsForwarded,
+			"forwarded_from_name":       m.ForwardedFromName,
 			"forwarded_from_message_id": forwardedFromMsgID,
-			"type":                      chat.Type,
-			"delivered_at":              message.CreatedAt,
-			"created_at":                message.CreatedAt,
-			"updated_at":                message.CreatedAt,
+			"type":                      m.ChatType,
+			"status":                    "accepted",
+			"accepted_at":               m.CreatedAt,
+			"seq":                       m.Seq,
+			"client_message_id":         clientMessageID,
+			"idempotent_replay":         replay,
+			"created_at":                m.CreatedAt,
+			"updated_at":                m.UpdatedAt,
 		},
-	})
+	}
 }
 
 // GetDirectChat handles getting or creating a direct chat
@@ -326,28 +509,64 @@ func (s *MessageService) GetDirectChat(c *fiber.Ctx) error {
 }
 
 // GetMessages handles getting messages for a chat with pagination
+//
+// Pagination contract (Phase 71) - one model, keyed on the per-chat seq:
+//
+//	(no cursor)   the newest `limit` messages, newest first         order=desc
+//	?before=N     messages with seq < N, newest first (scroll back)  order=desc
+//	?after=N      messages with seq > N, oldest first (catch-up)     order=asc
+//
+// limit is 1..100 (default 50; larger values are clamped to 100). has_more is
+// exact: another page exists in the direction being read. cursor.after is the
+// highest seq on the page (the next ?after=) and cursor.before the lowest (the
+// next ?before=); on an empty page cursor.after echoes the ?after= it was given
+// so a client's sync point never moves backwards. A client is synchronised when
+// ?after=<its sync point> returns has_more=false.
+//
+// seq is gap-free and commit-ordered per chat (see models.migratePhase71), so
+// paging ?after= from any point returns every later message exactly once, even
+// for rows that share a timestamp. before+after together, offset, and malformed
+// or negative cursors are 400: nothing here is silently ignored.
 func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 	chatID := c.Params("chat_id")
+
+	badPage := func(code, msg string) error {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": code, "message": msg})
+	}
 	limit := 50
-	offset := 0
-
-	if l := c.QueryInt("limit", 50); l > 0 {
-		limit = l
+	if raw := c.Query("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return badPage("invalid_limit", "limit must be a positive integer")
+		}
+		if n > 100 {
+			n = 100
+		}
+		limit = n
 	}
-	if l := c.QueryInt("limit", 50); l > 100 {
-		limit = 100
+	if c.Query("offset") != "" {
+		return badPage("offset_not_supported", "offset pagination is not supported; page with before/after")
 	}
-	if o := c.QueryInt("offset", 0); o >= 0 {
-		offset = o
+	beforeRaw, afterRaw := c.Query("before"), c.Query("after")
+	if beforeRaw != "" && afterRaw != "" {
+		return badPage("ambiguous_cursor", "use either before or after, not both")
 	}
-
-	// Get before/after cursor for cursor-based pagination
-	var before, after string
-	if b := c.Query("before"); b != "" {
-		before = b
+	parseSeq := func(raw string) (int64, bool) {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		return n, err == nil && n >= 0
 	}
-	if a := c.Query("after"); a != "" {
-		after = a
+	var before, after int64
+	if beforeRaw != "" {
+		var ok bool
+		if before, ok = parseSeq(beforeRaw); !ok {
+			return badPage("invalid_cursor", "before must be a non-negative message seq")
+		}
+	}
+	if afterRaw != "" {
+		var ok bool
+		if after, ok = parseSeq(afterRaw); !ok {
+			return badPage("invalid_cursor", "after must be a non-negative message seq")
+		}
 	}
 
 	chatIDParsed, err := uuid.Parse(chatID)
@@ -368,40 +587,66 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 		})
 	}
 
+	// A group member who left keeps what was sent while they were in the group
+	// and nothing after it: the bound below applies to every page, every cursor
+	// and the total alike. Direct chats are exempt - there left_at only means the
+	// chat was cleared from the list, and a new message brings it back.
+	var departedAt *time.Time
+	if participant.LeftAt != nil {
+		var chat models.Chat
+		if err := database.DB.Select("type").First(&chat, "id = ?", chatIDParsed.String()).Error; err != nil || chat.Type != "direct" {
+			departedAt = participant.LeftAt
+		}
+	}
+
 	var messages []models.Message
+	// Soft-deleted messages are not history. DeleteGroup keeps a deleted
+	// group's messages as rows with deleted_at set; every other reader already
+	// leaves them out (the chat list, archive authorization), and so must this
+	// one - the page, every cursor and the total alike.
+	//
 	// Hide anything this user deleted for themselves. A NOT EXISTS against the
 	// join table, rather than an array-contains on messages.deleted_for: that
 	// column cannot be read back at all once written (see MessageDeletion).
 	query := database.DB.Where("chat_id = ?", chatIDParsed.String()).
-		Where("NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = messages.id AND md.user_id = ?)", userID).
-		Order("created_at DESC")
-
-	if before != "" {
-		beforeUUID, err := uuid.Parse(before)
-		if err == nil {
-			query = query.Where("id < ?", beforeUUID)
-		}
+		Where("messages.deleted_at IS NULL").
+		Where("NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = messages.id AND md.user_id = ?)", userID)
+	if departedAt != nil {
+		query = query.Where("created_at < ?", *departedAt)
 	}
-	if after != "" {
-		afterUUID, err := uuid.Parse(after)
-		if err == nil {
-			query = query.Where("id > ?", afterUUID)
-		}
+	order := "desc"
+	switch {
+	case afterRaw != "":
+		query = query.Where("seq > ?", after).Order("seq ASC")
+		order = "asc"
+	case beforeRaw != "":
+		query = query.Where("seq < ?", before).Order("seq DESC")
+	default:
+		query = query.Order("seq DESC")
 	}
 
-	if err := query.Limit(limit).Find(&messages).Error; err != nil {
+	// One extra row decides has_more exactly, without a second query.
+	if err := query.Limit(limit + 1).Find(&messages).Error; err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 			"error":   "internal error",
 			"message": "Failed to fetch messages",
 		})
 	}
+	hasMore := len(messages) > limit
+	if hasMore {
+		messages = messages[:limit]
+	}
 
 	// Get total count
 	var total int64
-	database.DB.Model(&models.Message{}).
+	totalQuery := database.DB.Model(&models.Message{}).
 		Where("chat_id = ?", chatIDParsed.String()).
-		Where("NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = messages.id AND md.user_id = ?)", userID).
-		Count(&total)
+		Where("messages.deleted_at IS NULL").
+		Where("NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = messages.id AND md.user_id = ?)", userID)
+	if departedAt != nil {
+		totalQuery = totalQuery.Where("created_at < ?", *departedAt)
+	}
+	totalQuery.Count(&total)
 
 	// Decrypt messages for response
 	type DecryptedMessage struct {
@@ -429,6 +674,7 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 		ReadAt                 *time.Time `json:"read_at"`
 		CreatedAt              time.Time  `json:"created_at"`
 		UpdatedAt              time.Time  `json:"updated_at"`
+		Seq                    int64      `json:"seq"`
 	}
 
 	decryptedMessages := make([]DecryptedMessage, len(messages))
@@ -501,22 +747,30 @@ func (s *MessageService) GetMessages(c *fiber.Ctx) error {
 			ReadAt:                 m.ReadAt,
 			CreatedAt:              m.CreatedAt,
 			UpdatedAt:              m.UpdatedAt,
+			Seq:                    m.Seq,
 		}
 	}
 
-	hasMore := int64(offset+limit) < total
-
-	var beforeCursor, afterCursor string
-	if len(messages) > 0 {
-		beforeCursor = messages[0].ID.String()
-		afterCursor = messages[len(messages)-1].ID.String()
+	// cursor.after = highest seq on the page, cursor.before = lowest. An empty
+	// page keeps the caller's ?after= so its sync point never moves backwards.
+	var beforeCursor, afterCursor interface{}
+	if afterRaw != "" {
+		afterCursor = after
+	}
+	for _, m := range messages {
+		if hi, ok := afterCursor.(int64); !ok || m.Seq > hi {
+			afterCursor = m.Seq
+		}
+		if lo, ok := beforeCursor.(int64); !ok || m.Seq < lo {
+			beforeCursor = m.Seq
+		}
 	}
 
 	return c.JSON(fiber.Map{
 		"data":     decryptedMessages,
 		"total":    total,
 		"limit":    limit,
-		"offset":   offset,
+		"order":    order,
 		"has_more": hasMore,
 		"cursor": fiber.Map{
 			"before": beforeCursor,
@@ -647,8 +901,39 @@ func (s *MessageService) DeleteChat(c *fiber.Ctx) error {
 	// chat must go with it, in the SAME transaction - otherwise "I deleted this
 	// chat" leaves a decryptable copy behind. The other participant's archives
 	// are untouched, which is what per-user archive identity is for.
+	//
+	// Clearing a group off your list is leaving it, so LeaveGroup's rule holds
+	// here too, decided under the same group lock (see lockGroup): the only
+	// active admin cannot walk out this way. Direct chats have no admins, so the
+	// rule never applies to them.
 	var result *gorm.DB
+	lastAdmin, ownerLeaving := false, false
 	txErr := database.DB.Transaction(func(tx *gorm.DB) error {
+		chat, found, err := lockGroup(tx, chatIDParsed.String())
+		if err != nil {
+			return err
+		}
+		if lastActiveAdmin(tx, chatIDParsed.String(), userID) {
+			lastAdmin = true
+			return errLifecycleRefused
+		}
+		// ...nor may a group's owner leave it this way (see msgOwnerCannotLeave).
+		// A direct chat has an owner_id too - whoever opened it - but clearing one
+		// is not leaving anything, so this is for groups only; and only for an
+		// owner still in the group, since for one who is not there is nothing to
+		// leave (the not-a-participant answer below stands).
+		if found && chat.Type != "direct" && chat.OwnerID == userID {
+			var active int64
+			if err := tx.Model(&models.ChatParticipant{}).
+				Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatIDParsed.String(), userID).
+				Count(&active).Error; err != nil {
+				return err
+			}
+			if active > 0 {
+				ownerLeaving = true
+				return errLifecycleRefused
+			}
+		}
 		result = tx.Model(&models.ChatParticipant{}).
 			Where("chat_id = ? AND user_id = ? AND left_at IS NULL",
 				chatIDParsed.String(), userID).
@@ -661,6 +946,18 @@ func (s *MessageService) DeleteChat(c *fiber.Ctx) error {
 		}
 		return models.PurgeArchivesForParticipant(tx, chatIDParsed.String(), userID)
 	})
+	if lastAdmin {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "Group owner cannot leave while still being the only admin. Transfer ownership first.",
+		})
+	}
+	if ownerLeaving {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": msgOwnerCannotLeave,
+		})
+	}
 	if txErr != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 			"error":   "internal error",
@@ -681,7 +978,33 @@ func (s *MessageService) DeleteChat(c *fiber.Ctx) error {
 		})
 	}
 
+	// Clearing a group this way is leaving it, so the live subscription ends now
+	// rather than at the next reconnect. Not for direct chats: there left_at only
+	// hides the chat, and a new message brings it back.
+	var chat models.Chat
+	if database.DB.Select("type").First(&chat, "id = ?", chatIDParsed.String()).Error == nil && chat.Type != "direct" {
+		evictFromChatRoom(s.hub, chatIDParsed.String(), userID)
+	}
+
 	return c.JSON(fiber.Map{"message": "Chat deleted"})
+}
+
+// canUseReadState reports whether userID may read or change chatID's read
+// state: a participant of a direct chat - where left_at only means the chat was
+// cleared from their list - or a member of any other chat who has not left it.
+// read_at is one column per message, shared by every recipient, so anyone else
+// could rewrite what the members see as unread and seen, or learn how much
+// unread traffic the chat carries.
+func canUseReadState(chatID string, userID uuid.UUID) bool {
+	var participant models.ChatParticipant
+	if err := database.DB.Where("chat_id = ? AND user_id = ?", chatID, userID).First(&participant).Error; err != nil {
+		return false
+	}
+	if participant.LeftAt == nil {
+		return true
+	}
+	var chat models.Chat
+	return database.DB.Select("type").First(&chat, "id = ?", chatID).Error == nil && chat.Type == "direct"
 }
 
 func (s *MessageService) MarkAsRead(c *fiber.Ctx) error {
@@ -693,6 +1016,12 @@ func (s *MessageService) MarkAsRead(c *fiber.Ctx) error {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
 			"error":   "invalid chat ID",
 			"message": "Invalid chat ID format",
+		})
+	}
+	if !canUseReadState(chatIDParsed.String(), userID) {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "You are not a participant of this chat",
 		})
 	}
 
@@ -756,6 +1085,12 @@ func (s *MessageService) GetUnreadCount(c *fiber.Ctx) error {
 			"message": "Invalid chat ID format",
 		})
 	}
+	if !canUseReadState(chatIDParsed.String(), userID) {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "You are not a participant of this chat",
+		})
+	}
 
 	var count int64
 	database.DB.Model(&models.Message{}).
@@ -796,6 +1131,12 @@ type MessageResp struct {
 	Encrypted   bool      `json:"encrypted"`
 	KeyVersion  int       `json:"key_version"`
 	EncryptionVersion int `json:"encryption_version"`
+	// Which of the sender's devices sealed this row. The chat-list preview
+	// decrypts last_message, and for MLS (v6) a client must not hand its OWN
+	// ciphertext to OpenMLS - the sending leaf's key is dropped at encrypt
+	// time for forward secrecy. Without this field the preview could not tell
+	// its own row from a peer's and asked OpenMLS to open it on every refresh.
+	SenderDeviceID string `json:"sender_device_id"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -928,6 +1269,7 @@ func (s *MessageService) GetChatsByUserID(c *fiber.Ctx) error {
 				Encrypted:   msg.IsEncrypted,
 				KeyVersion:  msg.KeyVersion,
 				EncryptionVersion: msg.EncryptionVersion,
+				SenderDeviceID:    msg.SenderDeviceID,
 				CreatedAt:   msg.CreatedAt,
 			}
 		}

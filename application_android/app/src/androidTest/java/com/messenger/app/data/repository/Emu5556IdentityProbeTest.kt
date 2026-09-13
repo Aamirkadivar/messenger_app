@@ -21,6 +21,9 @@ import org.junit.Test
  * never rewritten because persist() is never invoked.
  */
 class Emu5556IdentityProbeTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "IDPROBE"
@@ -47,7 +50,7 @@ class Emu5556IdentityProbeTest {
         p("prefs e2ee_device_id  : $prefsDev")
 
         // ---- stored active GID for this chat
-        val gidB64 = tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull()
+        val gidB64 = tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull()
         if (gidB64.isNullOrBlank()) { p("RESULT: no stored active GID for this chat"); return@runBlocking }
         val gid = Base64.decode(gidB64, Base64.NO_WRAP)
         p("stored local GID      : ${gid.hex()}")
@@ -55,7 +58,7 @@ class Emu5556IdentityProbeTest {
         p("GID matches server    : ${gid.hex() == SERVER_GID}")
 
         // ---- stored snapshot
-        val blobB64 = tm.loadMlsBundle(SNAPSHOT_KEY).getOrNull()
+        val blobB64 = tm.loadMlsBundle(PROBE_OWNER, SNAPSHOT_KEY).getOrNull()
         if (blobB64.isNullOrBlank()) { p("RESULT: no MLS snapshot stored"); return@runBlocking }
         val blob = Base64.decode(blobB64, Base64.NO_WRAP)
         p("snapshot bytes        : ${blob.size}")

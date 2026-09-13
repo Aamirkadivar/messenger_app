@@ -77,4 +77,15 @@ interface MessageDao {
 
     @Query("SELECT archiveState FROM messages WHERE id = :messageId")
     suspend fun getArchiveState(messageId: String): String?
+
+    /**
+     * Records the decrypted body of a row that is still stored as ciphertext, leaving every other
+     * column alone.
+     *
+     * An MLS sender-ratchet secret is consumed by the first successful decrypt, so a row left as
+     * ciphertext can never be opened again. Whoever decrypts it must write the plaintext back or
+     * the message is lost to every later read.
+     */
+    @Query("UPDATE messages SET content = :content, isEncrypted = 0 WHERE id = :messageId")
+    suspend fun setPlaintext(messageId: String, content: String)
 }

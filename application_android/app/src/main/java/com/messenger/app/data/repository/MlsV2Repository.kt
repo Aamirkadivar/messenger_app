@@ -15,6 +15,7 @@ import com.messenger.app.data.model.MlsRecreateGroupRequest
 import com.messenger.app.data.model.MlsWelcomeAckRequest
 import com.messenger.app.data.model.MlsWelcomeItem
 import com.messenger.app.data.remote.api.ChatApiService
+import com.messenger.app.security.MlsOwner
 import com.messenger.app.security.TokenManager
 import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
@@ -147,16 +148,16 @@ class MlsV2Repository(
      * not silently drop back to the chat-derived id and start talking to an
      * abandoned tree.
      */
-    private suspend fun setActiveGid(chatId: String, gid: ByteArray) {
+    private suspend fun setActiveGid(owner: MlsOwner, chatId: String, gid: ByteArray) {
         activeGid[chatId] = gid
-        tokenManager.saveMlsBundle(gidKey(chatId), b64(gid))
+        tokenManager.saveMlsBundle(owner, gidKey(chatId), b64(gid))
             .onFailure { Log.w(TAG, "could not persist active group id for $chatId: ${it.message}") }
     }
 
     /** Loads the persisted active group id, if one was recorded. */
-    private suspend fun loadActiveGid(chatId: String) {
+    private suspend fun loadActiveGid(owner: MlsOwner, chatId: String) {
         if (activeGid.containsKey(chatId)) return
-        val stored = tokenManager.loadMlsBundle(gidKey(chatId)).getOrElse {
+        val stored = tokenManager.loadMlsBundle(owner, gidKey(chatId)).getOrElse {
             // Present but unreadable: do not guess. Leaving it unset means the
             // chat-derived default applies, and a genuine mismatch surfaces as
             // "not a member" rather than as silent traffic to the wrong tree.
@@ -167,6 +168,20 @@ class MlsV2Repository(
             runCatching { unb64(stored) }.getOrNull()?.let { activeGid[chatId] = it }
         }
     }
+
+    /**
+     * The owner of the operation starting now, or null when the account or the
+     * device cannot be named.
+     *
+     * The snapshot is a whole-store image, so it is now one image PER OWNER:
+     * account A and account B on the same phone each get their own, and neither
+     * can overwrite, adopt or observe the other's. Resolve this once, at the
+     * operation boundary - never after suspending work.
+     */
+    private suspend fun currentOwner(): MlsOwner? = MlsOwner.of(
+        tokenManager.getCurrentUserId().getOrNull(),
+        tokenManager.getOrCreateDeviceId().getOrNull()
+    )
 
     private fun gidKey(chatId: String) = "mls2_gid_$chatId"
 
@@ -205,7 +220,8 @@ class MlsV2Repository(
             // into "absent" is what destroyed group state: a fresh empty client
             // looks legitimate, and the next persist writes its empty whole-store
             // snapshot straight over the real one.
-            val stored = tokenManager.loadMlsBundle(SNAPSHOT_KEY)
+            val owner = MlsOwner(userId, deviceId)
+            val stored = tokenManager.loadMlsBundle(owner, SNAPSHOT_KEY)
             val blob = stored.getOrElse { e ->
                 // Case C(i): something is stored but cannot be read. Fail; the
                 // blob stays on disk so a later read (or a fixed Keystore) can
@@ -219,7 +235,7 @@ class MlsV2Repository(
                 // Case A: genuinely nothing stored. A fresh client is correct.
                 // Guard against a blank-but-present value, which would be a
                 // stored bundle we must not silently replace.
-                if (tokenManager.hasMlsBundle(SNAPSHOT_KEY).getOrDefault(false)) {
+                if (tokenManager.hasMlsBundle(owner, SNAPSHOT_KEY).getOrDefault(false)) {
                     Log.e(TAG, "MLS snapshot is stored but decoded empty; refusing " +
                         "to start with an empty client")
                     return@withLock null
@@ -324,7 +340,7 @@ class MlsV2Repository(
             }
         }
 
-    private suspend fun persist(c: MlsClient): Result<Unit> {
+    private suspend fun persist(owner: MlsOwner, c: MlsClient): Result<Unit> {
         return runCatching {
             val raw = c.snapshot()
 
@@ -332,14 +348,14 @@ class MlsV2Repository(
             // snapshot from an empty client would erase every group, so an empty
             // image may never replace a populated one. Decided on the plaintext
             // snapshot's own entry count, never by comparing wrapped blobs.
-            if (snapshotEntryCount(raw) == 0 && storedSnapshotIsPopulated()) {
+            if (snapshotEntryCount(raw) == 0 && storedSnapshotIsPopulated(owner)) {
                 throw IllegalStateException(
                     "refusing to overwrite a populated MLS snapshot with an empty one"
                 )
             }
 
             val encoded = android.util.Base64.encodeToString(raw, android.util.Base64.NO_WRAP)
-            tokenManager.saveMlsBundle(SNAPSHOT_KEY, encoded).getOrThrow()
+            tokenManager.saveMlsBundle(owner, SNAPSHOT_KEY, encoded).getOrThrow()
         }.onFailure { Log.e(TAG, "failed to persist MLS state: ${it.message}") }
     }
 
@@ -365,13 +381,13 @@ class MlsV2Repository(
      * guard exists for, and assuming "empty" there would licence exactly the
      * overwrite it is meant to prevent.
      */
-    private suspend fun storedSnapshotIsPopulated(): Boolean {
-        val stored = tokenManager.loadMlsBundle(SNAPSHOT_KEY)
+    private suspend fun storedSnapshotIsPopulated(owner: MlsOwner): Boolean {
+        val stored = tokenManager.loadMlsBundle(owner, SNAPSHOT_KEY)
         val blob = stored.getOrElse {
-            return tokenManager.hasMlsBundle(SNAPSHOT_KEY).getOrDefault(true)
+            return tokenManager.hasMlsBundle(owner, SNAPSHOT_KEY).getOrDefault(true)
         }
         if (blob.isNullOrBlank()) {
-            return tokenManager.hasMlsBundle(SNAPSHOT_KEY).getOrDefault(false)
+            return tokenManager.hasMlsBundle(owner, SNAPSHOT_KEY).getOrDefault(false)
         }
         val decoded = runCatching {
             android.util.Base64.decode(blob, android.util.Base64.NO_WRAP)
@@ -396,11 +412,14 @@ class MlsV2Repository(
      * re-checkable, while a group that exists never stops existing.
      */
     suspend fun serverHasGroup(chatId: String): Boolean = withContext(Dispatchers.IO) {
+        // Owner captured before any suspending work, so a later write is
+        // filed under the account+device this operation began as.
+        val owner = currentOwner() ?: return@withContext false
         // Adoption lives in ensureCurrentGid so there is exactly one place that
         // compares against the DS. The positive cache below used to be set
         // BEFORE adoption ran, which latched this path shut for the rest of the
         // process and was the second reason a stale group was never noticed.
-        if (!ensureCurrentGid(chatId)) return@withContext serverGroups.contains(chatId)
+        if (!ensureCurrentGid(owner, chatId)) return@withContext serverGroups.contains(chatId)
         serverGroups.contains(chatId)
     }
 
@@ -411,14 +430,14 @@ class MlsV2Repository(
      * Used when the active incarnation changes: the old group's keys are dead, and
      * keeping them live would let a send address a tree nobody else is on.
      */
-    private suspend fun forgetLocal(chatId: String) {
+    private suspend fun forgetLocal(owner: MlsOwner, chatId: String) {
         val c = client ?: return
         runCatching { c.dropGroup(gidOf(chatId)) }
             .onFailure { Log.w(TAG, "dropGroup $chatId: ${it.message}") }
         liveGroups.remove(chatId)
         // Persist the removal. This is a non-empty snapshot in every realistic
         // case (identity keys remain), so the empty-overwrite guard does not fire.
-        persist(c).onFailure { Log.w(TAG, "could not persist group drop: ${it.message}") }
+        persist(owner, c).onFailure { Log.w(TAG, "could not persist group drop: ${it.message}") }
     }
 
     /**
@@ -429,7 +448,7 @@ class MlsV2Repository(
      * do not call joinFromWelcome: an existing group makes OpenMLS consume the
      * KeyPackage and then fail with "already exists".
      */
-    private suspend fun dropStaleLocalForWelcome(chatId: String): Boolean {
+    private suspend fun dropStaleLocalForWelcome(owner: MlsOwner, chatId: String): Boolean {
         val c = client ?: return false
         if (runCatching { c.dropGroup(gidOf(chatId)) }
                 .onFailure { Log.w(TAG, "drop stale group $chatId: ${it.message}") }
@@ -437,7 +456,7 @@ class MlsV2Repository(
             return false
         }
         liveGroups.remove(chatId)
-        return persist(c).onFailure {
+        return persist(owner, c).onFailure {
             Log.w(TAG, "could not persist stale group drop for $chatId: ${it.message}")
         }.isSuccess
     }
@@ -451,8 +470,12 @@ class MlsV2Repository(
      * is stale. Equal or newer local state is healthy/redundant and must not be
      * opened, dropped, or acknowledged here.
      */
-    private suspend fun prepareForWelcome(chatId: String, welcomeEpoch: Long): Boolean {
-        if (chatId.isBlank() || !ensureCurrentGid(chatId)) return false
+    private suspend fun prepareForWelcome(
+        owner: MlsOwner,
+        chatId: String,
+        welcomeEpoch: Long
+    ): Boolean {
+        if (chatId.isBlank() || !ensureCurrentGid(owner, chatId)) return false
         val c = ensureClient() ?: return false
         val localEpoch = runCatching { c.loadGroup(gidOf(chatId)) }.getOrNull()
         if (localEpoch == null) return true
@@ -466,7 +489,7 @@ class MlsV2Repository(
 
         Log.i(TAG, "MLS v2 $chatId: replacing stale local epoch $localEpoch " +
             "for Welcome epoch $welcomeEpoch")
-        return dropStaleLocalForWelcome(chatId)
+        return dropStaleLocalForWelcome(owner, chatId)
     }
 
     /**
@@ -486,6 +509,10 @@ class MlsV2Repository(
      */
     suspend fun recreateMlsGroup(chatId: String): Boolean = withContext(Dispatchers.IO) {
         if (!ENABLED) return@withContext false
+        // Owner captured at the operation boundary: a snapshot written later belongs
+        // to the account+device this operation began as, never to whoever is
+        // signed in when the write lands.
+        val owner = currentOwner() ?: return@withContext false
         if (!recreateAttempted.add(chatId)) {
             Log.w(TAG, "recreate already attempted for $chatId this run; not retrying")
             return@withContext false
@@ -580,7 +607,7 @@ class MlsV2Repository(
             return@withContext false
         }
 
-        setActiveGid(chatId, adoptedGid)
+        setActiveGid(owner, chatId, adoptedGid)
         serverGroups.add(chatId)
 
         if (adoptedGid.contentEquals(freshGid)) {
@@ -622,7 +649,7 @@ class MlsV2Repository(
      * Adoption reuses the existing [forgetLocal] + [setActiveGid] pair; this adds
      * no second persistence mechanism.
      */
-    private suspend fun ensureCurrentGid(chatId: String): Boolean {
+    private suspend fun ensureCurrentGid(owner: MlsOwner, chatId: String): Boolean {
         if (gidVerified.contains(chatId)) return true
         val t = token() ?: return false
         val resp = runCatching { api.getMlsGroup(bearer(t), chatId) }.getOrNull() ?: return false
@@ -636,23 +663,26 @@ class MlsV2Repository(
         if (b64Gid.isNullOrBlank()) return false
         val serverGid = runCatching { unb64(b64Gid) }.getOrNull() ?: return false
 
-        loadActiveGid(chatId)
+        loadActiveGid(owner, chatId)
         if (!serverGid.contentEquals(gidOf(chatId))) {
             Log.i(TAG, "active MLS group id changed for $chatId; adopting the DS value")
-            forgetLocal(chatId)
-            setActiveGid(chatId, serverGid)
+            forgetLocal(owner, chatId)
+            setActiveGid(owner, chatId, serverGid)
         }
         gidVerified.add(chatId)
         return true
     }
 
     suspend fun hasGroup(chatId: String): Boolean = withContext(Dispatchers.IO) {
+        // Owner captured before any suspending work, so a later write is
+        // filed under the account+device this operation began as.
+        val owner = currentOwner() ?: return@withContext false
         val c = ensureClient() ?: return@withContext false
         // The DS owns group identity. Checking this BEFORE trusting a loadable
         // local group is the whole point: a stale group loads just as cleanly as
         // a current one, and accepting it is how a device went silent in both
         // directions while believing it was fine.
-        if (!ensureCurrentGid(chatId)) {
+        if (!ensureCurrentGid(owner, chatId)) {
             Log.w(TAG, "hasGroup $chatId: cannot confirm the active group id; failing closed")
             return@withContext false
         }
@@ -688,12 +718,16 @@ class MlsV2Repository(
 
     /** The DS accepted the commit: apply it and persist the new epoch. */
     suspend fun onCommitAccepted(chatId: String): Long = withContext(Dispatchers.IO) {
+        // Owner captured at the operation boundary: a snapshot written later belongs
+        // to the account+device this operation began as, never to whoever is
+        // signed in when the write lands.
+        val owner = currentOwner() ?: return@withContext 0L
         val c = ensureClient() ?: return@withContext -1
         runCatching {
             val epoch = c.mergePending(gidOf(chatId))
             // An unpersisted merge means the next start sits on the pre-commit
             // epoch while the group has moved on - the fork v1 suffered from.
-            persist(c).getOrThrow()
+            persist(owner, c).getOrThrow()
             epoch
         }.getOrElse {
             Log.w(TAG, "merge $chatId failed: ${it.message}")
@@ -706,10 +740,14 @@ class MlsV2Repository(
      * v1 forked groups — local state advanced past a commit the group rejected.
      */
     suspend fun onCommitRejected(chatId: String) = withContext(Dispatchers.IO) {
+        // Owner captured at the operation boundary: a snapshot written later belongs
+        // to the account+device this operation began as, never to whoever is
+        // signed in when the write lands.
+        val owner = currentOwner() ?: return@withContext Unit
         val c = ensureClient() ?: return@withContext
         runCatching {
             c.clearPending(gidOf(chatId))
-            persist(c)
+            persist(owner, c)
         }.onFailure { Log.w(TAG, "clearPending $chatId failed: ${it.message}") }
     }
 
@@ -727,12 +765,16 @@ class MlsV2Repository(
      * solely in memory. The next process start had no group and no way back in.
      */
     suspend fun joinFromWelcome(welcome: ByteArray): String? = withContext(Dispatchers.IO) {
+        // Owner captured at the operation boundary: a snapshot written later belongs
+        // to the account+device this operation began as, never to whoever is
+        // signed in when the write lands.
+        val owner = currentOwner() ?: return@withContext null
         val c = ensureClient() ?: return@withContext null
         runCatching {
             val gid = c.joinFromWelcome(welcome)
             val chatId = String(gid, Charsets.UTF_8)
             liveGroups.add(chatId)
-            persist(c).getOrElse { e ->
+            persist(owner, c).getOrElse { e ->
                 // Not durable, so not joined. Drop the in-memory membership so
                 // the device does not believe it is a member on this run either.
                 liveGroups.remove(chatId)
@@ -747,13 +789,17 @@ class MlsV2Repository(
 
     /** A fresh single-use KeyPackage to publish for this device. */
     suspend fun keyPackage(): ByteArray? = withContext(Dispatchers.IO) {
+        // Owner captured at the operation boundary: a snapshot written later belongs
+        // to the account+device this operation began as, never to whoever is
+        // signed in when the write lands.
+        val owner = currentOwner() ?: return@withContext null
         val c = ensureClient() ?: return@withContext null
         runCatching {
             val kp = c.keyPackage()
             // The private init key was just written to storage; losing it means
             // a Welcome sent to this KeyPackage could never be opened. So an
             // unpersisted KeyPackage must never be handed out for publishing.
-            persist(c).getOrThrow()
+            persist(owner, c).getOrThrow()
             kp
         }.getOrNull()
     }
@@ -767,6 +813,10 @@ class MlsV2Repository(
      */
     suspend fun encrypt(chatId: String, plaintext: ByteArray): ByteArray? =
         withContext(Dispatchers.IO) {
+        // Owner captured at the operation boundary: a snapshot written later belongs
+        // to the account+device this operation began as, never to whoever is
+        // signed in when the write lands.
+            val owner = currentOwner() ?: return@withContext null
             val c = ensureClient()
             if (c == null) {
                 Log.w(TAG, "encrypt " + chatId + ": no client")
@@ -785,7 +835,7 @@ class MlsV2Repository(
                 // next start would reuse a superseded ratchet state, so the
                 // send fails rather than emitting a message we cannot account
                 // for.
-                persist(c).getOrThrow()
+                persist(owner, c).getOrThrow()
                 ct
             }.getOrElse {
                 Log.w(TAG, "encrypt $chatId failed: ${it.message}")
@@ -796,6 +846,9 @@ class MlsV2Repository(
     /** Processes an incoming message, commit or proposal. */
     suspend fun process(chatId: String, message: ByteArray): MlsProcessed? =
         withContext(Dispatchers.IO) {
+            // Owner captured before any suspending work, so a later write is
+            // filed under the account+device this operation began as.
+            val owner = currentOwner() ?: return@withContext null
             val c = ensureClient() ?: return@withContext null
             // Load the group from storage first. After a restart the Rust core
             // holds no live group until load_group() runs, so going straight to
@@ -808,12 +861,12 @@ class MlsV2Repository(
                     return@withContext null
                 }
             }
-            val first = applyBytes(c, chatId, message)
+            val first = applyBytes(owner, c, chatId, message)
             if (first != null) return@withContext first
             // An MLS application message only opens at the epoch it was sent
             // in. Catch up on commits, then retry once.
             syncHandshakes(chatId)
-            applyBytes(c, chatId, message).also { out ->
+            applyBytes(owner, c, chatId, message).also { out ->
                 if (out == null) {
                     Log.w(TAG, "process $chatId failed after handshake catch-up")
                 }
@@ -821,7 +874,12 @@ class MlsV2Repository(
         }
 
     /** Applies one MLS blob without retrying handshakes (avoids recursion). */
-    private suspend fun applyBytes(c: MlsClient, chatId: String, message: ByteArray): MlsProcessed? {
+    private suspend fun applyBytes(
+        owner: MlsOwner,
+        c: MlsClient,
+        chatId: String,
+        message: ByteArray
+    ): MlsProcessed? {
         val out = runCatching { c.process(gidOf(chatId), message) }
             .onFailure {
                 Log.w(TAG, "apply $chatId: ${it.message}")
@@ -831,7 +889,7 @@ class MlsV2Repository(
                 gidVerified.remove(chatId)
             }
             .getOrNull()
-        if (out != null) persist(c)
+        if (out != null) persist(owner, c)
         return out
     }
 
@@ -852,11 +910,15 @@ class MlsV2Repository(
 
     /** Drops local state for a chat (server 404, or group instance mismatch). */
     suspend fun forget(chatId: String) = withContext(Dispatchers.IO) {
+        // Owner captured at the operation boundary: a snapshot written later belongs
+        // to the account+device this operation began as, never to whoever is
+        // signed in when the write lands.
+        val owner = currentOwner() ?: return@withContext Unit
         val c = client
         if (c != null) {
             runCatching { c.dropGroup(gidOf(chatId)) }
                 .onFailure { Log.w(TAG, "dropGroup $chatId: ${it.message}") }
-            persist(c)
+            persist(owner, c)
         }
         mutex.withLock { liveGroups.remove(chatId) }
     }
@@ -928,6 +990,10 @@ class MlsV2Repository(
      * Delivery Service has none. Returns true when we hold usable state.
      */
     suspend fun ensureGroup(chatId: String): Boolean = withContext(Dispatchers.IO) {
+        // Owner captured at the operation boundary: a snapshot written later belongs
+        // to the account+device this operation began as, never to whoever is
+        // signed in when the write lands.
+        val owner = currentOwner() ?: return@withContext false
         val t = token() ?: return@withContext false
         ensureKeyPackages()
 
@@ -971,7 +1037,7 @@ class MlsV2Repository(
             return@withContext false
         }
         val c = ensureClient()
-        if (c != null) persist(c)
+        if (c != null) persist(owner, c)
         inviteMissingDevices(chatId)
         true
     }
@@ -1135,6 +1201,8 @@ class MlsV2Repository(
 
     /** Applies commits we have not seen. Without this we fall an epoch behind. */
     suspend fun syncHandshakes(chatId: String): Unit = withContext(Dispatchers.IO) {
+        // Owner captured before any suspending work.
+        val owner = currentOwner() ?: return@withContext Unit
         val t = token() ?: return@withContext
         if (!hasGroup(chatId)) return@withContext
         val since = epoch(chatId)
@@ -1145,7 +1213,7 @@ class MlsV2Repository(
         for (h in handshakes) {
             if (h.payloadB64.isBlank()) continue
             val c = ensureClient() ?: return@withContext
-            val out = applyBytes(c, chatId, unb64(h.payloadB64))
+            val out = applyBytes(owner, c, chatId, unb64(h.payloadB64))
             if (out is MlsProcessed.Commit) {
                 Log.i(TAG, "MLS v2 " + chatId + ": epoch -> " + out.newEpoch)
             }
@@ -1158,6 +1226,8 @@ class MlsV2Repository(
      * instead of locking this device out of the group for good.
      */
     suspend fun processWelcomes(): List<String> = withContext(Dispatchers.IO) {
+        // Owner captured before any suspending work.
+        val owner = currentOwner() ?: return@withContext emptyList()
         val t = token() ?: return@withContext emptyList()
         val pending = runCatching {
             api.getMlsWelcomes(bearer(t), myDevice()).body()?.welcomes.orEmpty()
@@ -1172,7 +1242,7 @@ class MlsV2Repository(
         val acked = mutableListOf<String>()
         for (w in newestPerChat) {
             if (w.welcomeB64.isBlank()) continue
-            if (!prepareForWelcome(w.chatId, w.epoch)) continue
+            if (!prepareForWelcome(owner, w.chatId, w.epoch)) continue
             val chatId = joinFromWelcome(unb64(w.welcomeB64))
             if (chatId != null) {
                 joined.add(chatId)

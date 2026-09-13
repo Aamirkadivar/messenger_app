@@ -179,20 +179,53 @@ func (h *AuthService) Login(c *fiber.Ctx) error {
 		})
 	}
 
-	return issueLoginTokens(c, user, cfg)
+	// Password alone. Authentication, not recovery authority: the account has no
+	// second factor to verify, so there is nothing to satisfy the policy with.
+	// Such an account can still enrol while the account is LEGACY_OPEN; after
+	// retirement it must configure TOTP first. That is the policy's consequence,
+	// not an oversight.
+	return issueLoginTokens(c, user, cfg, false)
 }
 
-func issueLoginTokens(c *fiber.Ctx, user models.User, cfg *config.Config) error {
-	accessToken, err := middleware.GenerateToken(user.ID, user.Email, user.DisplayName, cfg)
+// issueLoginTokens is the single credential-issuance primitive.
+//
+// Every authenticated path funnels through here - password login, both 2FA
+// branches and QR claim - so a session row is created exactly once per
+// authentication and no path can accidentally mint an untracked credential.
+//
+// device_id is left NULL: none of these paths knows a trusted device. Gate 11
+// established that X-Device-Id is self-asserted, so recording one here would
+// manufacture an association the server cannot vouch for.
+//
+// grantRecoveryAuthority is the ONE thing that differs between these paths, and
+// it is a parameter rather than something inferred here because the caller is
+// the only code that knows what was actually proved. Passing false is the
+// default in every sense: a session with no marker is an ordinary authenticated
+// session and cannot bootstrap a device identity.
+func issueLoginTokens(c *fiber.Ctx, user models.User, cfg *config.Config, grantRecoveryAuthority bool) error {
+	var recoveryUntil *time.Time
+	if grantRecoveryAuthority {
+		until := time.Now().Add(recoveryAuthorityTTL)
+		recoveryUntil = &until
+	}
+	var (
+		sessionID    uuid.UUID
+		refreshToken string
+	)
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		sessionID, refreshToken, err = createSession(tx, cfg, user.ID, nil, recoveryUntil)
+		return err
+	}); err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to generate refresh token",
+		})
+	}
+
+	accessToken, err := middleware.GenerateToken(user.ID, user.Email, user.DisplayName, sessionID, cfg)
 	if err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to generate access token",
-		})
-	}
-	refreshToken, err := middleware.GenerateRefreshToken(user.ID, cfg)
-	if err != nil {
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to generate refresh token",
 		})
 	}
 	database.DB.Model(&user).Update("last_seen", time.Now())
@@ -214,12 +247,37 @@ func issueLoginTokens(c *fiber.Ctx, user models.User, cfg *config.Config) error 
 	})
 }
 
-// RefreshTokenInput represents the input for token refresh
+// RefreshTokenInput represents the input for token refresh.
+//
+// RequestID is client-generated and must be persisted alongside the refresh
+// token in the same durable write, then reused verbatim on every retry of that
+// same request. It is what separates a dropped response from a fork. The server
+// never generates one.
 type RefreshTokenInput struct {
 	RefreshToken string `json:"refresh_token"`
+	RequestID    string `json:"request_id"`
 }
 
-// RefreshToken handles token refresh
+// uniformRefreshDenial is the ONLY failure body this endpoint emits.
+//
+// Unknown, expired, consumed, forked and revoked all look identical from
+// outside. Distinguishing them would tell an attacker whether a token ever
+// existed, whether a session is still live, and whether their replay was
+// detected - each of which is a probe they should not get to run. The reason is
+// recorded internally instead.
+func uniformRefreshDenial(c *fiber.Ctx) error {
+	return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+		"error": "Invalid or expired refresh token",
+	})
+}
+
+// RefreshToken rotates an opaque, session-bound refresh credential.
+//
+// The security decision is ONE PostgreSQL statement (see rotateRefresh): a
+// conditional UPDATE whose predicate covers the presented hash, revocation,
+// refresh expiry and absolute expiry, feeding a ledger INSERT through a
+// data-modifying CTE. There is deliberately no preliminary SELECT - reading
+// state and then deciding in Go is the write-skew this gate exists to remove.
 func (h *AuthService) RefreshToken(c *fiber.Ctx) error {
 	var input RefreshTokenInput
 	if err := c.BodyParser(&input); err != nil {
@@ -227,49 +285,173 @@ func (h *AuthService) RefreshToken(c *fiber.Ctx) error {
 			"error": "Invalid request body",
 		})
 	}
-
 	cfg := config.LoadConfig()
-	claims, err := middleware.VerifyTokenWithSecret(input.RefreshToken, cfg.JWTSecret)
+
+	requestID, err := uuid.Parse(input.RequestID)
 	if err != nil {
-		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
-			"error": "Invalid or expired refresh token",
-		})
-	}
-	// Only a refresh credential may mint credentials. An access token carries an
-	// equally valid signature, so without this check it could renew itself and a
-	// stolen access token would become effectively permanent.
-	if !claims.HasUse(middleware.TokenUseRefresh) {
-		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
-			"error": "Invalid or expired refresh token",
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error": "request_id must be a UUID",
 		})
 	}
 
-	// Find user
-	var user models.User
-	if err := database.DB.First(&user, "id = ?", claims.UserID).Error; err != nil {
-		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
-			"error": "User not found",
-		})
+	// Only the hash ever reaches SQL. The plaintext is not a bind parameter, is
+	// not logged, and does not appear in any error: GORM interpolates binds into
+	// its query log and this repository enables that logger by default.
+	presentedHash, ok := hashRefreshTransport(cfg, input.RefreshToken)
+	if !ok {
+		return uniformRefreshDenial(c)
 	}
 
-	accessToken, err := middleware.GenerateToken(user.ID, user.Email, user.DisplayName, cfg)
-	if err != nil {
+	var (
+		accessToken  string
+		refreshOut   string
+		httpStatus   = http.StatusUnauthorized
+		serverFault  error
+		replayServed bool
+	)
+
+	txErr := database.DB.Transaction(func(tx *gorm.DB) error {
+		// Resolve which session this hash currently belongs to. This is a lookup,
+		// not an authorization decision: the CAS below re-checks every predicate
+		// atomically, so a stale answer here can only cost a wasted round trip.
+		var sess models.Session
+		found := tx.Where("refresh_hash = ?", presentedHash).Limit(1).Find(&sess)
+		if found.Error != nil {
+			return found.Error
+		}
+
+		if found.RowsAffected == 1 {
+			newPlain, newHash, err := mintRefreshToken(cfg)
+			if err != nil {
+				return err
+			}
+			cipherText, nonce, err := sealResponseCache(cfg, presentedHash, sess.ID, requestID, newPlain)
+			if err != nil {
+				return err
+			}
+			_, err = rotateRefresh(tx, cfg, sess.ID, presentedHash, newHash, requestID, cipherText, nonce)
+			switch {
+			case err == nil:
+				// Won the CAS. Only the winning transaction may emit token
+				// material; a loser's freshly minted plaintext is discarded here
+				// and never returned, logged or persisted.
+				var user models.User
+				if err := tx.First(&user, "id = ?", sess.UserID).Error; err != nil {
+					return err
+				}
+				at, err := middleware.GenerateToken(user.ID, user.Email, user.DisplayName, sess.ID, cfg)
+				if err != nil {
+					return err
+				}
+				accessToken, refreshOut, httpStatus = at, newPlain, http.StatusOK
+				return nil
+			case errors.Is(err, errNoSessionRow):
+				// Lost the CAS, or the session died between lookup and statement.
+				// Fall through to the ledger classifier.
+			default:
+				if name, isConstraint := constraintViolation(err); isConstraint &&
+					name == "consumed_refresh_pkey" {
+					// Unreachable in correct operation: a consumed hash fails the
+					// CAS first, leaving the ledger insert with no input. If it
+					// fires, the CAS and ledger have diverged - an invariant
+					// failure to alarm on, never attacker reuse, and never a
+					// reason to revoke anything.
+					serverFault = ledgerFault(err)
+					return serverFault
+				}
+				return err
+			}
+		}
+
+		// Either the hash is not current, or the CAS lost. Ask the ledger what
+		// actually happened.
+		v, err := classifyFailedCAS(tx, presentedHash)
+		if err != nil {
+			return err
+		}
+		if !v.Found {
+			// Unattributable. Deny, and revoke NOTHING: otherwise any attacker
+			// could log a victim out by posting arbitrary bytes.
+			return nil
+		}
+		if v.SuccessorConsumed {
+			// Fork evidence. The successor was itself already spent, so two
+			// lineages exist and one of them is not the legitimate client.
+			// Session-scoped: revoking every session of the account would hand an
+			// attacker holding one stale token a full-account logout.
+			if _, err := revokeOneSession(tx, v.UserID, v.SessionID, "refresh_reuse"); err != nil {
+				return err
+			}
+			log.Printf("[security] refresh_reuse: fork detected, session %s revoked", v.SessionID)
+			return nil
+		}
+		if !v.SessionLive {
+			// Revocation dominates idempotency. A logged-out or revoked session
+			// never receives cached credentials, however well-formed the retry.
+			return nil
+		}
+		if v.StoredRequestID != requestID || !v.CacheLive {
+			// A different request, or a retry that arrived after the
+			// lost-response window closed. Deny without minting and without
+			// revoking - there is no fork evidence, only lateness.
+			return nil
+		}
+		plain, ok := openResponseCache(cfg, presentedHash, v.SessionID, v.StoredRequestID, v.Ciphertext, v.Nonce)
+		if !ok {
+			return nil
+		}
+		// Legitimate lost-response retry: same successor, no new generation, no
+		// new ledger row. The access token is re-minted rather than cached, so
+		// the database never holds a directly usable credential.
+		var user models.User
+		if err := tx.First(&user, "id = ?", v.UserID).Error; err != nil {
+			return err
+		}
+		at, err := middleware.GenerateToken(user.ID, user.Email, user.DisplayName, v.SessionID, cfg)
+		if err != nil {
+			return err
+		}
+		accessToken, refreshOut, httpStatus, replayServed = at, plain, http.StatusOK, true
+		return nil
+	})
+
+	if serverFault != nil {
+		log.Printf("[alarm] %v", serverFault)
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to generate access token",
+			"error": "Internal error",
 		})
 	}
-
-	newRefreshToken, err := middleware.GenerateRefreshToken(user.ID, cfg)
-	if err != nil {
+	if txErr != nil {
+		// The transaction itself failed: a lookup, the mint, the AEAD seal, a
+		// lock timeout, a lost connection, a failed commit. None of that is
+		// evidence about the credential, and answering 401 is not merely
+		// imprecise - it is destructive. Both clients read any HTTP status as a
+		// definitive verdict and discard the pending refresh record, which is
+		// the only thing that can recover a rotation the server already
+		// committed. A database blip would then permanently end sessions whose
+		// credentials were never in doubt.
+		//
+		// Every genuine denial leaves the transaction with a nil error and
+		// httpStatus at its 401 default (note the lookup uses Find, not First,
+		// so a missing row is not an error), which is why this branch can be
+		// treated as unexpected without swallowing a real refusal.
+		//
+		// The transaction has rolled back, so nothing rotated and nothing was
+		// revoked. Only the hash reaches SQL, so the error text cannot carry
+		// refresh plaintext.
+		log.Printf("[alarm] refresh transaction failed: %v", txErr)
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to generate refresh token",
+			"error": "Internal error",
 		})
 	}
-
+	if httpStatus != http.StatusOK {
+		return uniformRefreshDenial(c)
+	}
+	_ = replayServed
 	return c.JSON(fiber.Map{
 		"tokens": fiber.Map{
 			"access_token":  accessToken,
-			"refresh_token": newRefreshToken,
+			"refresh_token": refreshOut,
 			"type":          "Bearer",
 			"expires_in":    cfg.JWTExpiration * 3600,
 		},
@@ -315,9 +497,22 @@ func (h *AuthService) ChangePassword(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to hash password"})
 	}
-	if err := database.DB.Model(&user).Update("password_hash", string(hashed)).Error; err != nil {
+	// Password replacement is the canonical response to compromise, so it must
+	// take the credentials with it. Both writes are in ONE transaction: the
+	// session rows are the serialization point, so a refresh racing this either
+	// commits before it (and is revoked by the sweep) or blocks and then observes
+	// the revocation. Reading users.password_changed_at from the refresh path
+	// instead would be write skew.
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&user).Update("password_hash", string(hashed)).Error; err != nil {
+			return err
+		}
+		_, err := revokeSessionsForUser(tx, user.ID, "password_change")
+		return err
+	}); err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update password"})
 	}
+	kickSessionsOfUser(user.ID)
 	return c.JSON(fiber.Map{"message": "Password updated"})
 }
 
@@ -495,4 +690,48 @@ func (h *UserHandler) GetUserPresence(c *fiber.Ctx) error {
 		"is_online": user.IsOnline,
 		"last_seen": user.LastSeen,
 	})
+}
+// LogoutInput optionally widens a logout to the whole account.
+type LogoutInput struct {
+	Scope string `json:"scope"` // "" (this session) or "all"
+}
+
+// Logout revokes the caller's session.
+//
+// The session is taken from the verified access token's sid, never from the
+// request body: accepting a client-supplied session id would be an IDOR, and
+// there is no reason to make the client send its refresh token - the more
+// sensitive credential - merely to sign out.
+//
+// Idempotent by construction. An already-revoked, expired or unknown session
+// all return 204, so the endpoint cannot be used to probe which sessions exist.
+func (h *AuthService) Logout(c *fiber.Ctx) error {
+	claims, ok := c.Locals(middleware.ContextKeyUser).(*middleware.JWTClaims)
+	if !ok || claims == nil || claims.UserID == uuid.Nil {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	var input LogoutInput
+	_ = c.BodyParser(&input) // body is optional
+
+	var revokedIDs []uuid.UUID
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if input.Scope == "all" {
+			if err := tx.Raw(`SELECT id FROM sessions WHERE user_id = ? AND revoked_at IS NULL`,
+				claims.UserID).Scan(&revokedIDs).Error; err != nil {
+				return err
+			}
+			_, err := revokeSessionsForUser(tx, claims.UserID, "logout_all")
+			return err
+		}
+		revokedIDs = []uuid.UUID{claims.SessionID}
+		// Scoped to (id, user_id) so one account can never revoke another's
+		// session even if it names one.
+		_, err := revokeOneSession(tx, claims.UserID, claims.SessionID, "logout")
+		return err
+	})
+	if err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "logout failed"})
+	}
+	kickSessions(revokedIDs)
+	return c.SendStatus(http.StatusNoContent)
 }

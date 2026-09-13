@@ -20,6 +20,9 @@ import java.io.File
  * Read-only: restores the snapshot in memory, never calls persist().
  */
 class ExportGroupInfoTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "GIEXPORT"
@@ -45,10 +48,10 @@ class ExportGroupInfoTest {
         p("identity : $user|$dev")
         if (dev != ADDER_DEV) { p("ABORT: wrong device, expected $ADDER_DEV"); return@runBlocking }
 
-        val gid = Base64.decode(tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
+        val gid = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
         if (gid.hex() != EXPECTED_GID) { p("ABORT: GID mismatch"); return@runBlocking }
 
-        val blob = Base64.decode(tm.loadMlsBundle("mls2_snapshot").getOrNull(), Base64.NO_WRAP)
+        val blob = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, "mls2_snapshot").getOrNull(), Base64.NO_WRAP)
         val c = MlsClient.restore(blob, user, dev)
         try {
             val epoch = c.loadGroup(gid)

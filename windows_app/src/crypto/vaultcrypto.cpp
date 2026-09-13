@@ -8,13 +8,21 @@
 
 namespace {
 
+// The one-shot crypto_auth_hmacsha256 takes only a key POINTER and always reads exactly
+// crypto_auth_hmacsha256_KEYBYTES (32) bytes, so any caller passing a shorter key read past the end
+// of its buffer and mixed adjacent heap bytes into the MAC. HKDF-Extract passes the salt as the key,
+// and the salts here are 16 and 29 bytes, so that read was routinely out of bounds. The streaming
+// API takes an explicit key length and is the same primitive - identical results for a 32-byte key.
 QByteArray hmacSha256(const QByteArray& key, const QByteArray& data) {
     QByteArray out(crypto_auth_hmacsha256_BYTES, 0);
-    crypto_auth_hmacsha256(
-        reinterpret_cast<unsigned char*>(out.data()),
+    crypto_auth_hmacsha256_state st;
+    crypto_auth_hmacsha256_init(&st,
+        reinterpret_cast<const unsigned char*>(key.constData()),
+        static_cast<size_t>(key.size()));
+    crypto_auth_hmacsha256_update(&st,
         reinterpret_cast<const unsigned char*>(data.constData()),
-        static_cast<unsigned long long>(data.size()),
-        reinterpret_cast<const unsigned char*>(key.constData()));
+        static_cast<unsigned long long>(data.size()));
+    crypto_auth_hmacsha256_final(&st, reinterpret_cast<unsigned char*>(out.data()));
     return out;
 }
 
@@ -61,6 +69,13 @@ VaultCrypto::ArgonParams VaultCrypto::ArgonParams::fromParamsJson(const QString&
     return p;
 }
 
+// Forwards to the file-local RFC 5869 implementation above. Qualified with :: so it names the
+// free function rather than recursing into this member.
+QByteArray VaultCrypto::hkdfSha256(const QByteArray& ikm, const QByteArray& salt,
+                                   const QByteArray& info, int length) {
+    return ::hkdfSha256(ikm, salt, info, length);
+}
+
 QByteArray VaultCrypto::randomBytes(int n) {
     QByteArray b(n, 0);
     randombytes_buf(b.data(), static_cast<size_t>(n));
@@ -89,7 +104,9 @@ QByteArray VaultCrypto::derivePasswordKek(const QString& password,
 
 QByteArray VaultCrypto::deriveRecoveryKek(const QByteArray& recoveryKey, const QByteArray& salt) {
     if (recoveryKey.size() < 32 || salt.size() < 16) return {};
-    return hkdfSha256(recoveryKey, salt, QByteArray("messenger-e2ee-recovery-kek-v1"), 32);
+    // Qualified: names the file-local RFC 5869 implementation directly rather than relying on
+    // unqualified lookup, which since Phase 30 would find the VaultCrypto::hkdfSha256 member.
+    return ::hkdfSha256(recoveryKey, salt, QByteArray("messenger-e2ee-recovery-kek-v1"), 32);
 }
 
 QByteArray VaultCrypto::masterKeyAad(const QString& userId, const QString& purpose) {

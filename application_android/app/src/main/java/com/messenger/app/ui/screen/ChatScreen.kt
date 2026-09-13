@@ -57,6 +57,7 @@ import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.SelectAll
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -601,7 +602,8 @@ fun ChatScreen(
                             onSeekVideo = { f -> viewModel.seekVideo(message.id, f) },
                             onExpandVideo = { fullscreenVideo = message },
                             onLongPress = { viewModel.toggleMessageSelection(message.id) },
-                            onReplyQuoteClick = { id -> scrollToMessageId = id }
+                            onReplyQuoteClick = { id -> scrollToMessageId = id },
+                            onRetry = { viewModel.retryOutgoing(message.id) }
                         )
                         if (message.isVideoNote) {
                             LaunchedEffect(message.id) { viewModel.ensureVideoThumbnail(message) }
@@ -937,7 +939,8 @@ private fun MessageBubble(
     onSeekVideo: (Float) -> Unit = {},
     onExpandVideo: () -> Unit = {},
     onLongPress: () -> Unit = {},
-    onReplyQuoteClick: (String) -> Unit = {}
+    onReplyQuoteClick: (String) -> Unit = {},
+    onRetry: () -> Unit = {}
 ) {
     val bubbleMax = LocalMessageBubbleMaxWidth.current
     val quoteMax = minOf(bubbleMax, 220.dp)
@@ -1106,6 +1109,16 @@ private fun MessageBubble(
                             contentDescription = "Sending",
                             tint = Color.White.copy(alpha = 0.7f),
                             modifier = Modifier.size(14.dp)
+                        )
+                        // Refused by the server (or never sealed): not stuck on a clock, and one tap
+                        // retries the same stored message.
+                        message.deliveryStatus == DeliveryStatus.FAILED -> Icon(
+                            imageVector = Icons.Outlined.ErrorOutline,
+                            contentDescription = "Not sent. Tap to retry",
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier
+                                .size(16.dp)
+                                .clickable(onClick = onRetry)
                         )
                         message.isRead -> Icon(
                             imageVector = Icons.Filled.DoneAll,

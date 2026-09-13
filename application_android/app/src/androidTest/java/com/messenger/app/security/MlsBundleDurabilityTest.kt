@@ -37,6 +37,9 @@ import org.junit.Test
  * Uses a dedicated key so it can never disturb a real MLS snapshot.
  */
 class MlsBundleDurabilityTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         /** Deliberately not "mls2_snapshot": this test must never touch live state. */
@@ -56,14 +59,14 @@ class MlsBundleDurabilityTest {
     @Test
     fun phase1_writeThenDie() = runBlocking {
         val tm = tokenManager()
-        val result = tm.saveMlsBundle(TEST_KEY, PAYLOAD)
+        val result = tm.saveMlsBundle(PROBE_OWNER, TEST_KEY, PAYLOAD)
         assertTrue(
             "saveMlsBundle must report success for a committed write",
             result.isSuccess
         )
         // Same-process read-back: necessary but NOT sufficient. It would pass
         // under apply() too, which is the whole point of phase 2.
-        assertEquals(PAYLOAD, tm.loadMlsBundle(TEST_KEY).getOrNull())
+        assertEquals(PAYLOAD, tm.loadMlsBundle(PROBE_OWNER, TEST_KEY).getOrNull())
     }
 
     /**
@@ -73,7 +76,7 @@ class MlsBundleDurabilityTest {
     @Test
     fun phase2_readBackFromAFreshProcess() = runBlocking {
         val tm = tokenManager()
-        val loaded = tm.loadMlsBundle(TEST_KEY).getOrNull()
+        val loaded = tm.loadMlsBundle(PROBE_OWNER, TEST_KEY).getOrNull()
         assertNotNull(
             "the bundle written by phase 1 must survive process death - " +
                 "a null here means the write was never durable",
@@ -89,9 +92,9 @@ class MlsBundleDurabilityTest {
     @Test
     fun phase3_deleteThenDie() = runBlocking {
         val tm = tokenManager()
-        tm.saveMlsBundle(TEST_KEY, PAYLOAD).getOrThrow()
-        assertTrue(tm.deleteMlsBundle(TEST_KEY).isSuccess)
-        assertNull(tm.loadMlsBundle(TEST_KEY).getOrNull())
+        tm.saveMlsBundle(PROBE_OWNER, TEST_KEY, PAYLOAD).getOrThrow()
+        assertTrue(tm.deleteMlsBundle(PROBE_OWNER, TEST_KEY).isSuccess)
+        assertNull(tm.loadMlsBundle(PROBE_OWNER, TEST_KEY).getOrNull())
     }
 
     /**
@@ -109,9 +112,9 @@ class MlsBundleDurabilityTest {
         val tm = tokenManager()
         assertNull(
             "a committed delete must not reappear after process death",
-            tokenManager().loadMlsBundle(TEST_KEY).getOrNull()
+            tokenManager().loadMlsBundle(PROBE_OWNER, TEST_KEY).getOrNull()
         )
         // leave storage clean regardless of ordering
-        tm.deleteMlsBundle(TEST_KEY)
+        tm.deleteMlsBundle(PROBE_OWNER, TEST_KEY)
     }
 }

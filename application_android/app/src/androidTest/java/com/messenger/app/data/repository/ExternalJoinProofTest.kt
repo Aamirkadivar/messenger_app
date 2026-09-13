@@ -22,6 +22,9 @@ import java.io.File
  * snapshot is untouched - the host verifies its mtime and md5 either side.
  */
 class ExternalJoinProofTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "EXTPROOF"
@@ -71,11 +74,11 @@ class ExternalJoinProofTest {
         ok("GroupInfo came from the server epoch", srcEpoch == SERVER_EPOCH)
         ok("exactly four leaves expected", expectedLeaves.size == 4)
 
-        val gid = Base64.decode(tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
+        val gid = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
         ok("local GID matches server GID", gid.hex() == EXPECTED_GID)
 
         // ---- restore EMU-A in memory; nothing here is ever written back
-        val blob = Base64.decode(tm.loadMlsBundle("mls2_snapshot").getOrNull(), Base64.NO_WRAP)
+        val blob = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, "mls2_snapshot").getOrNull(), Base64.NO_WRAP)
         val c = MlsClient.restore(blob, user, dev)
         try {
             val stale = c.loadGroup(gid)

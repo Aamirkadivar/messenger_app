@@ -122,7 +122,8 @@ func TestArchive_MigrationProducesCascadingConstraints(t *testing.T) {
 
 // ---------------------------------------------------------------- device gate
 
-func deviceGateApp(t *testing.T, db *gorm.DB, userID uuid.UUID) *fiber.App {
+func deviceGateApp(t *testing.T, db *gorm.DB, userID uuid.UUID,
+	sessionFor map[string]uuid.UUID, fallback uuid.UUID) *fiber.App {
 	t.Helper()
 	prev := database.DB
 	database.DB = db
@@ -130,8 +131,18 @@ func deviceGateApp(t *testing.T, db *gorm.DB, userID uuid.UUID) *fiber.App {
 
 	app := fiber.New()
 	// Stand in for AuthMiddleware: the gate is being tested, not JWT parsing.
+	// Phase 44 made the session the authority, so the claims carry the session
+	// belonging to whichever device the request names; an unproven device falls
+	// back to the caller's real session, which is what a client asserting some
+	// other device's id would actually present.
 	app.Use(func(c *fiber.Ctx) error {
-		c.Locals(middleware.ContextKeyUser, &middleware.JWTClaims{UserID: userID})
+		sid, ok := sessionFor[c.Get("X-Device-Id")]
+		if !ok {
+			sid = fallback
+		}
+		c.Locals(middleware.ContextKeyUser, &middleware.JWTClaims{
+			UserID: userID, SessionID: sid,
+		})
 		return c.Next()
 	})
 	app.Use(middleware.RequireDeviceIdentity())
@@ -147,21 +158,23 @@ func TestArchive_DeviceIdentityGate(t *testing.T) {
 	}
 
 	userID := uuid.New()
-	db.Exec(`INSERT INTO users (id) VALUES (?) ON CONFLICT DO NOTHING`, userID)
+	// Full row: sessions carry an FK to users, so an id-only insert silently
+	// failed on the NOT NULL columns and left nothing to reference.
+	db.Exec(`INSERT INTO users (id, username, email, password_hash, created_at, updated_at)
+		VALUES (?, ?, ?, 'x', now(), now()) ON CONFLICT DO NOTHING`,
+		userID, "u"+userID.String()[:8], userID.String()[:8]+"@test.local")
 
 	now := time.Now()
 	live := "device-live"
 	revoked := "device-revoked"
-	db.Exec(`DELETE FROM e2ee_devices WHERE user_id = ?`, userID)
-	db.Create(&models.E2EEDevice{
-		ID: uuid.New(), UserID: userID, DeviceID: live, CreatedAt: now, UpdatedAt: now,
-	})
-	db.Create(&models.E2EEDevice{
-		ID: uuid.New(), UserID: userID, DeviceID: revoked, RevokedAt: &now,
-		CreatedAt: now, UpdatedAt: now,
-	})
+	db.Exec(`DELETE FROM e2_ee_devices WHERE user_id = ?`, userID)
+	sessionFor := map[string]uuid.UUID{}
+	sessionFor[live] = seedVerifiedDeviceSession(t, db, userID, live)
+	revokedRow := seedVerifiedDevice(t, db, userID, revoked)
+	sessionFor[revoked] = seedBoundSession(t, db, userID, revokedRow)
+	db.Model(&models.E2EEDevice{}).Where("id = ?", revokedRow).Update("revoked_at", now)
 
-	app := deviceGateApp(t, db, userID)
+	app := deviceGateApp(t, db, userID, sessionFor, sessionFor[live])
 
 	cases := []struct {
 		name     string
@@ -173,6 +186,20 @@ func TestArchive_DeviceIdentityGate(t *testing.T) {
 		{"revoked device is refused", revoked, http.StatusForbidden},
 		{"registered live device passes", live, http.StatusOK},
 	}
+	// Phase 44: a token with no proven device reaches nothing. This is the
+	// property that makes "authenticated account + X-Device-Id" insufficient.
+	t.Run("authenticated but unbound session is refused", func(t *testing.T) {
+		app2 := deviceGateApp(t, db, userID, map[string]uuid.UUID{}, uuid.Nil)
+		req := httptest.NewRequest(http.MethodGet, "/archives", nil)
+		req.Header.Set("X-Device-Id", live)
+		resp, err := app2.Test(req, -1)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("unbound session status %d, want 401 or 403", resp.StatusCode)
+		}
+	})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/archives", nil)
@@ -192,7 +219,7 @@ func TestArchive_DeviceIdentityGate(t *testing.T) {
 	// The unknown device must NOT have been created as a side effect - that is
 	// the specific difference from the permissive global DeviceRevocationGuard.
 	var n int64
-	db.Raw(`SELECT COUNT(*) FROM e2ee_devices WHERE user_id = ? AND device_id = ?`,
+	db.Raw(`SELECT COUNT(*) FROM e2_ee_devices WHERE user_id = ? AND device_id = ?`,
 		userID, "device-never-seen").Scan(&n)
 	if n != 0 {
 		t.Fatalf("archive gate must never auto-register a device, found %d", n)

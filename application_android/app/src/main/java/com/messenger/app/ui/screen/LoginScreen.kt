@@ -469,6 +469,13 @@ fun RegisterScreen(
         if (state.isRegistered) onRegisterSuccess()
     }
 
+    // Registered, but the sign-in that followed needs a 2FA code. Go back to the
+    // sign-in screen, which is the only place that renders the OTP field - and
+    // which shares this AuthViewModel, so the challenge survives the hop.
+    LaunchedEffect(state.needsTwoFactor) {
+        if (state.needsTwoFactor) onNavigateToLogin()
+    }
+
     AuthBackground {
         GlassSurface(
             shape = CardShape,

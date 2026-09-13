@@ -57,20 +57,20 @@ class HistoryRecoveryHardeningTest {
     private open class Store : HistoryKeyringStore {
         var blob: ByteArray? = null
         var cache: ByteArray? = null
-        override suspend fun saveHistoryKeyring(sealed: ByteArray) =
+        override suspend fun saveHistoryKeyring(owner: String, sealed: ByteArray) =
             Result.success(Unit).also { blob = sealed.copyOf() }
-        override suspend fun loadHistoryKeyring() = Result.success(blob?.copyOf())
-        override suspend fun deleteHistoryKeyring() = Result.success(Unit).also { blob = null }
-        override suspend fun saveHistoryKeyringCache(plain: ByteArray) =
+        override suspend fun loadHistoryKeyring(owner: String) = Result.success(blob?.copyOf())
+        override suspend fun deleteHistoryKeyring(owner: String) = Result.success(Unit).also { blob = null }
+        override suspend fun saveHistoryKeyringCache(owner: String, plain: ByteArray) =
             Result.success(Unit).also { cache = plain.copyOf() }
-        override suspend fun loadHistoryKeyringCache() = Result.success(cache?.copyOf())
-        override suspend fun deleteHistoryKeyringCache() = Result.success(Unit).also { cache = null }
+        override suspend fun loadHistoryKeyringCache(owner: String) = Result.success(cache?.copyOf())
+        override suspend fun deleteHistoryKeyringCache(owner: String) = Result.success(Unit).also { cache = null }
 
         private var generation: Long? = null
-        override suspend fun saveHistoryKeyringGeneration(generation: Long) =
+        override suspend fun saveHistoryKeyringGeneration(owner: String, generation: Long) =
             Result.success(Unit).also { this.generation = generation }
-        override suspend fun loadHistoryKeyringGeneration() = Result.success(generation)
-        override suspend fun deleteHistoryKeyringGeneration() =
+        override suspend fun loadHistoryKeyringGeneration(owner: String) = Result.success(generation)
+        override suspend fun deleteHistoryKeyringGeneration(owner: String) =
             Result.success(Unit).also { generation = null }
     }
 
@@ -81,7 +81,7 @@ class HistoryRecoveryHardeningTest {
      * slip past the guard.
      */
     private class ThrowingStore : Store() {
-        override suspend fun loadHistoryKeyring(): Result<ByteArray?> =
+        override suspend fun loadHistoryKeyring(owner: String): Result<ByteArray?> =
             throw IllegalStateException("keystore unavailable")
     }
 
@@ -180,7 +180,7 @@ class HistoryRecoveryHardeningTest {
         val lazySync: dagger.Lazy<HistoryKeyringRecoverySync> =
             if (lazyThrows) dagger.Lazy { throw IllegalStateException("recovery unavailable") }
             else dagger.Lazy { sync }
-        val archiveSync = ArchiveSync(archiver, server, Tokens(token), feature, lazySync)
+        val archiveSync = ArchiveSync(archiver, server, Tokens(token), feature, lazySync, keyring)
     }
 
     // ============================================================ 1. fail closed

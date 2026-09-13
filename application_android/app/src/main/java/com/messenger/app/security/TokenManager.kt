@@ -5,18 +5,54 @@ import android.content.SharedPreferences
 import android.util.Base64
 import com.messenger.app.data.encryption.DoubleRatchet
 import com.messenger.app.data.encryption.history.HistoryKeyringStore
+import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
  * Interface for JWT token management
  */
+/** A refresh that has been sent but not yet confirmed installed. */
+data class PendingRefresh(
+    val userId: String,
+    val refreshToken: String,
+    val requestId: String,
+    val startedAtMillis: Long
+)
+
 interface TokenManager {
     suspend fun saveAccessToken(token: String): Result<Unit>
     suspend fun getAccessToken(): Result<String?>
     suspend fun saveRefreshToken(token: String): Result<Unit>
     suspend fun getRefreshToken(): Result<String?>
     suspend fun saveAccessTokenExpiresAt(expiresAt: Long): Result<Unit>
+
+    /**
+     * Records that a logical refresh is in flight, BEFORE the request is sent.
+     *
+     * Kept in the same encrypted preferences file as the credentials themselves
+     * so it survives process death: the lost-response case this exists for is
+     * precisely the one where the app may not live to see the reply. A
+     * request_id held only in memory would be regenerated on the retry and the
+     * committed successor would be unrecoverable.
+     */
+    suspend fun savePendingRefresh(userId: String, refreshToken: String, requestId: String): Result<Unit>
+
+    /** The in-flight refresh, if any. Null once it has been installed or cleared. */
+    suspend fun getPendingRefresh(): Result<PendingRefresh?>
+
+    suspend fun clearPendingRefresh(): Result<Unit>
+
+    /**
+     * Installs a successor credential and clears the pending record in ONE
+     * atomic preferences commit.
+     *
+     * The unsafe alternative - delete old, save new - has a window in which a
+     * crash loses both. Here the client always holds either the old credential
+     * plus its pending request_id (so the retry can recover the successor), or
+     * the successor with no pending state. Never neither.
+     */
+    suspend fun installRefreshedTokens(accessToken: String, refreshToken: String, expiresAt: Long): Result<Unit>
     suspend fun getAccessTokenExpiresAt(): Result<Long?>
     suspend fun saveCurrentUserId(userId: String): Result<Unit>
     suspend fun getCurrentUserId(): Result<String?>
@@ -25,44 +61,56 @@ interface TokenManager {
     suspend fun getE2EEPrivateKey(userId: String): Result<String?>
     suspend fun getE2EEPublicKey(userId: String): Result<String?>
 
+    // K_device: this installation's own device-identity keypair.
+    //
+    // Stored under different preference keys from the account keypair above, and
+    // that separation is the point. The account key is carried inside the vault,
+    // so every device that unlocks the vault receives the same one - proving
+    // possession of it proves possession of the ACCOUNT, which is why revoking a
+    // device never took it away. K_device is generated here, never written into
+    // VaultPlaintext, and never overwritten by saveE2EEKeys().
+    suspend fun saveDeviceKeys(userId: String, publicHex: String, privateHex: String): Result<Unit>
+    suspend fun getDeviceKeyPrivate(userId: String): Result<String?>
+    suspend fun getDeviceKeyPublic(userId: String): Result<String?>
+
     /** This device's group Sender Keys for [chatId], as "version:keyHex" (latest pointer + versioned copies). */
-    suspend fun saveGroupSenderKey(chatId: String, versionAndKey: String): Result<Unit>
-    suspend fun getGroupSenderKey(chatId: String): Result<String?>
+    suspend fun saveGroupSenderKey(owner: String, chatId: String, versionAndKey: String): Result<Unit>
+    suspend fun getGroupSenderKey(owner: String, chatId: String): Result<String?>
     /** All persisted own Sender Key versions for [chatId]: version -> hex. */
-    suspend fun loadGroupSenderKeys(chatId: String): Result<Map<Int, String>>
+    suspend fun loadGroupSenderKeys(owner: String, chatId: String): Result<Map<Int, String>>
 
     /** Other members' Sender Keys: persist "senderId|version" -> hex for offline decrypt. */
-    suspend fun savePeerSenderKey(chatId: String, senderId: String, version: Int, keyHex: String): Result<Unit>
-    suspend fun loadPeerSenderKeys(chatId: String): Result<Map<String, String>>
+    suspend fun savePeerSenderKey(owner: String, chatId: String, senderId: String, version: Int, keyHex: String): Result<Unit>
+    suspend fun loadPeerSenderKeys(owner: String, chatId: String): Result<Map<String, String>>
 
     /**
      * The last-seen E2EE public key for a direct chat's other participant,
      * used to detect a WhatsApp-style "security code changed" event when it
      * differs from what the server now reports.
      */
-    suspend fun saveKnownPublicKey(chatId: String, publicKeyHex: String): Result<Unit>
-    suspend fun getKnownPublicKey(chatId: String): Result<String?>
-    suspend fun savePendingPublicKey(chatId: String, publicKeyHex: String): Result<Unit>
-    suspend fun getPendingPublicKey(chatId: String): Result<String?>
-    suspend fun clearPendingPublicKey(chatId: String): Result<Unit>
-    suspend fun deleteDirectRatchet(chatId: String): Result<Unit>
-    suspend fun markSafetyVerified(chatId: String, pubHex: String): Result<Unit>
-    suspend fun clearSafetyVerified(chatId: String): Result<Unit>
-    suspend fun isSafetyVerified(chatId: String): Result<Boolean>
+    suspend fun saveKnownPublicKey(owner: String, chatId: String, publicKeyHex: String): Result<Unit>
+    suspend fun getKnownPublicKey(owner: String, chatId: String): Result<String?>
+    suspend fun savePendingPublicKey(owner: String, chatId: String, publicKeyHex: String): Result<Unit>
+    suspend fun getPendingPublicKey(owner: String, chatId: String): Result<String?>
+    suspend fun clearPendingPublicKey(owner: String, chatId: String): Result<Unit>
+    suspend fun deleteDirectRatchet(owner: String, chatId: String): Result<Unit>
+    suspend fun markSafetyVerified(owner: String, chatId: String, pubHex: String): Result<Unit>
+    suspend fun clearSafetyVerified(owner: String, chatId: String): Result<Unit>
+    suspend fun isSafetyVerified(owner: String, chatId: String): Result<Boolean>
 
     /** Stable per-install device id for E2EE device registry. */
     suspend fun getOrCreateDeviceId(): Result<String>
 
     /** Export group sender keys for vault: "chatId|version" -> key hex. */
-    suspend fun exportVaultSenderKeys(): Result<Map<String, String>>
+    suspend fun exportVaultSenderKeys(owner: String): Result<Map<String, String>>
 
     /** Export cached direct-chat peer pubs for vault: chatId -> pub hex. */
-    suspend fun exportVaultPeerPubs(): Result<Map<String, String>>
+    suspend fun exportVaultPeerPubs(owner: String): Result<Map<String, String>>
 
-    suspend fun restoreVaultSenderKeys(keys: Map<String, String>): Result<Unit>
-    suspend fun restoreVaultPeerPubs(pubs: Map<String, String>): Result<Unit>
-    suspend fun exportVaultPeerSenderKeys(): Result<Map<String, String>>
-    suspend fun restoreVaultPeerSenderKeys(keys: Map<String, String>): Result<Unit>
+    suspend fun restoreVaultSenderKeys(owner: String, keys: Map<String, String>): Result<Unit>
+    suspend fun restoreVaultPeerPubs(owner: String, pubs: Map<String, String>): Result<Unit>
+    suspend fun exportVaultPeerSenderKeys(owner: String): Result<Map<String, String>>
+    suspend fun restoreVaultPeerSenderKeys(owner: String, keys: Map<String, String>): Result<Unit>
 
     /**
      * MLS restore bundles. Neither BouncyCastle nor mlspp can serialize a live
@@ -70,24 +118,24 @@ interface TokenManager {
      * (identity keys, published KeyPackage + init key, Welcome) plus the
      * commits the Delivery Service retains. Keystore-wrapped like the ratchets.
      */
-    suspend fun saveMlsBundle(key: String, json: String): Result<Unit>
+    suspend fun saveMlsBundle(owner: MlsOwner, key: String, json: String): Result<Unit>
 
     /**
      * Reads a bundle. Fails - rather than reporting absence - when a stored
      * bundle cannot be unwrapped, so callers can tell "no state yet" apart from
      * "state exists but is unreadable". Conflating the two destroys MLS groups.
      */
-    suspend fun loadMlsBundle(key: String): Result<String?>
+    suspend fun loadMlsBundle(owner: MlsOwner, key: String): Result<String?>
 
     /** Whether a bundle is stored, without needing to unwrap it. */
-    suspend fun hasMlsBundle(key: String): Result<Boolean>
-    suspend fun listMlsBundles(prefix: String): Result<Map<String, String>>
-    suspend fun deleteMlsBundle(key: String): Result<Unit>
+    suspend fun hasMlsBundle(owner: MlsOwner, key: String): Result<Boolean>
+    suspend fun listMlsBundles(owner: MlsOwner, prefix: String): Result<Map<String, String>>
+    suspend fun deleteMlsBundle(owner: MlsOwner, key: String): Result<Unit>
 
-    suspend fun saveDirectRatchet(chatId: String, json: String): Result<Unit>
-    suspend fun loadDirectRatchet(chatId: String): Result<String?>
-    suspend fun exportVaultDirectRatchets(): Result<Map<String, String>>
-    suspend fun restoreVaultDirectRatchets(sessions: Map<String, String>): Result<Unit>
+    suspend fun saveDirectRatchet(owner: String, chatId: String, json: String): Result<Unit>
+    suspend fun loadDirectRatchet(owner: String, chatId: String): Result<String?>
+    suspend fun exportVaultDirectRatchets(owner: String): Result<Map<String, String>>
+    suspend fun restoreVaultDirectRatchets(owner: String, sessions: Map<String, String>): Result<Unit>
 
     suspend fun clearTokens(): Result<Unit>
     suspend fun isAccessTokenExpired(): Result<Boolean>
@@ -113,6 +161,12 @@ class TokenManagerImpl(
         private const val KEY_HISTORY_KEYRING_GEN = "history_keyring_gen_v1"
         private const val KEY_ACCESS_TOKEN_ENCRYPTED = "access_token_enc"
         private const val KEY_REFRESH_TOKEN = "refresh_token"
+        // Pending-refresh record. Same encrypted preferences file and same
+        // Keystore alias as the credentials it describes - no new store.
+        private const val KEY_PENDING_REFRESH_TOKEN = "pending_refresh_token"
+        private const val KEY_PENDING_REQUEST_ID = "pending_refresh_request_id"
+        private const val KEY_PENDING_REFRESH_USER = "pending_refresh_user"
+        private const val KEY_PENDING_REFRESH_AT = "pending_refresh_started_at"
         private const val KEY_EXPIRES_AT = "access_token_expires_at"
         private const val KEY_CURRENT_USER_ID = "current_user_id"
         private const val KEY_E2EE_DEVICE_ID = "e2ee_device_id"
@@ -120,6 +174,59 @@ class TokenManagerImpl(
         private const val KEY_ALIAS_TOKEN = "messenger_token_key"
         private const val KS_WRAP_PREFIX = "ks1:"
     }
+
+    // ------------------------------------------------------------ account namespace
+    //
+    // Every account-sensitive durable value is filed under the account that owns
+    // it. The v1 keys - group_senderkey_$chatId, peer_senderkey_..., known_pubkey_,
+    // pending_pubkey_, verified_pubkey_, dr3_$chatId - were keyed by chat id
+    // alone, and the three history-keyring slots were not keyed at all, so two
+    // accounts on one device shared one slot. That is V-2, and it was runtime
+    // proven: account B loaded account A's Sender Key, ratchet session, pinned
+    // peer identity, safety verification and plaintext history keyring.
+    //
+    // The Keystore wrap is not an account boundary. It uses one device-level
+    // alias, so every account on the device can unwrap every other account's
+    // value. Ownership has to be in the key.
+    //
+    // "acct2_" is a version boundary rather than decoration: no argument to
+    // [scopedKey] can reproduce a v1 key, so the legacy entries are unreachable
+    // by construction. They are never read, never migrated and never used as a
+    // fallback - login order must not be able to claim secrets whose owner
+    // cannot be established. This is the same ruling getOrCreateDeviceId already
+    // makes for its own pre-scoping value.
+    private fun ownerTag(owner: String): String {
+        val id = owner.trim()
+        require(id.isNotEmpty()) {
+            "account-scoped durable key requested with no owner"
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(id.toByteArray(Charsets.UTF_8))
+        return digest.take(16).joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * The MLS namespace.
+     *
+     * MLS state belongs to an account AND a device, so it cannot reuse
+     * [scopedKey], whose owner is an account alone. Gate 26 proved the cost of
+     * getting this wrong: account B observed the group and epoch account A had
+     * built, because every MLS slot was keyed by chat id.
+     *
+     * "mls2_" is a version boundary, not decoration. The pre-ownership keys all
+     * begin "mls1_", and no argument to this function can reproduce one - so the
+     * legacy entries are unreachable by construction, never read, never
+     * migrated, and never claimed by whoever logs in first. clearTokens() still
+     * deletes the mls1_ prefix, which is now hygiene rather than the isolation
+     * mechanism: mls2_ state deliberately SURVIVES logout, because it belongs to
+     * its owner and only that owner can address it again.
+     */
+    private fun mlsKey(owner: MlsOwner, logicalKey: String): String =
+        "mls2_${owner.tag}_$logicalKey"
+
+    /** The one place an account-sensitive durable key may be constructed. */
+    private fun scopedKey(owner: String, logicalKey: String): String =
+        "acct2_${ownerTag(owner)}_$logicalKey"
 
     private val sharedPreferences: SharedPreferences by lazy {
         context.getSharedPreferences(SHARED_PREFS_NAME, Context.MODE_PRIVATE)
@@ -281,32 +388,74 @@ class TokenManagerImpl(
         }
     }
 
-    override suspend fun saveGroupSenderKey(chatId: String, versionAndKey: String): Result<Unit> =
+    override suspend fun saveDeviceKeys(userId: String, publicHex: String, privateHex: String): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
-                val sep = versionAndKey.indexOf(':')
-                val edit = sharedPreferences.edit()
-                wrapSecret(versionAndKey).getOrNull()?.let { edit.putString("group_senderkey_$chatId", it) }
-                    ?: edit.putString("group_senderkey_$chatId", versionAndKey)
-                if (sep > 0) {
-                    val version = versionAndKey.substring(0, sep).toIntOrNull()
-                    val hex = versionAndKey.substring(sep + 1)
-                    if (version != null && hex.isNotBlank()) {
-                        val stored = wrapSecret(hex).getOrNull() ?: hex
-                        edit.putString("group_senderkey_$chatId|$version", stored)
-                    }
+                val wrapped = wrapSecret(privateHex)
+                if (wrapped.isFailure) return@withContext Result.failure(
+                    wrapped.exceptionOrNull() ?: Exception("Failed to wrap device private key")
+                )
+                with(sharedPreferences.edit()) {
+                    putString("e2ee_device_pub_$userId", publicHex)
+                    putString("e2ee_device_priv_$userId", wrapped.getOrNull())
+                    apply()
                 }
-                edit.apply()
-                pruneOldSenderKeysLocked(chatId)
                 Result.success(Unit)
             } catch (e: Exception) {
                 Result.failure(e)
             }
         }
 
-    override suspend fun getGroupSenderKey(chatId: String): Result<String?> = withContext(Dispatchers.IO) {
+    override suspend fun getDeviceKeyPrivate(userId: String): Result<String?> = withContext(Dispatchers.IO) {
         try {
-            val all = loadGroupSenderKeysInternal(chatId)
+            val stored = sharedPreferences.getString("e2ee_device_priv_$userId", null)
+            if (stored.isNullOrEmpty()) return@withContext Result.success(null)
+            val plain = unwrapSecret(stored)
+            if (plain != null && !stored.startsWith(KS_WRAP_PREFIX)) {
+                wrapSecret(plain).getOrNull()?.let { wrapped ->
+                    sharedPreferences.edit().putString("e2ee_device_priv_$userId", wrapped).apply()
+                }
+            }
+            Result.success(plain)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun getDeviceKeyPublic(userId: String): Result<String?> = withContext(Dispatchers.IO) {
+        try {
+            Result.success(sharedPreferences.getString("e2ee_device_pub_$userId", null))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun saveGroupSenderKey(owner: String, chatId: String, versionAndKey: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val sep = versionAndKey.indexOf(':')
+                val edit = sharedPreferences.edit()
+                wrapSecret(versionAndKey).getOrNull()?.let { edit.putString(scopedKey(owner, "group_senderkey_$chatId"), it) }
+                    ?: edit.putString(scopedKey(owner, "group_senderkey_$chatId"), versionAndKey)
+                if (sep > 0) {
+                    val version = versionAndKey.substring(0, sep).toIntOrNull()
+                    val hex = versionAndKey.substring(sep + 1)
+                    if (version != null && hex.isNotBlank()) {
+                        val stored = wrapSecret(hex).getOrNull() ?: hex
+                        edit.putString(scopedKey(owner, "group_senderkey_$chatId|$version"), stored)
+                    }
+                }
+                edit.apply()
+                pruneOldSenderKeysLocked(owner, chatId)
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun getGroupSenderKey(owner: String, chatId: String): Result<String?> = withContext(Dispatchers.IO) {
+        try {
+            val all = loadGroupSenderKeysInternal(owner, chatId)
             val latest = all.maxByOrNull { it.key }
             Result.success(latest?.let { "${it.key}:${it.value}" })
         } catch (e: Exception) {
@@ -314,16 +463,17 @@ class TokenManagerImpl(
         }
     }
 
-    override suspend fun loadGroupSenderKeys(chatId: String): Result<Map<Int, String>> =
+    override suspend fun loadGroupSenderKeys(owner: String, chatId: String): Result<Map<Int, String>> =
         withContext(Dispatchers.IO) {
             try {
-                Result.success(loadGroupSenderKeysInternal(chatId))
+                Result.success(loadGroupSenderKeysInternal(owner, chatId))
             } catch (e: Exception) {
                 Result.failure(e)
             }
         }
 
     override suspend fun savePeerSenderKey(
+        owner: String,
         chatId: String,
         senderId: String,
         version: Int,
@@ -335,7 +485,7 @@ class TokenManagerImpl(
             }
             val stored = wrapSecret(keyHex).getOrNull() ?: keyHex
             sharedPreferences.edit()
-                .putString("peer_senderkey_$chatId|$senderId|$version", stored)
+                .putString(scopedKey(owner, "peer_senderkey_$chatId|$senderId|$version"), stored)
                 .apply()
             Result.success(Unit)
         } catch (e: Exception) {
@@ -343,11 +493,11 @@ class TokenManagerImpl(
         }
     }
 
-    override suspend fun loadPeerSenderKeys(chatId: String): Result<Map<String, String>> =
+    override suspend fun loadPeerSenderKeys(owner: String, chatId: String): Result<Map<String, String>> =
         withContext(Dispatchers.IO) {
             try {
                 val out = mutableMapOf<String, String>()
-                val prefix = "peer_senderkey_$chatId|"
+                val prefix = scopedKey(owner, "peer_senderkey_$chatId|")
                 for ((key, value) in sharedPreferences.all) {
                     if (key !is String || value !is String || !key.startsWith(prefix)) continue
                     val rest = key.removePrefix(prefix) // senderId|version
@@ -360,9 +510,9 @@ class TokenManagerImpl(
             }
         }
 
-    private suspend fun loadGroupSenderKeysInternal(chatId: String): Map<Int, String> {
+    private suspend fun loadGroupSenderKeysInternal(owner: String, chatId: String): Map<Int, String> {
         val out = mutableMapOf<Int, String>()
-        val prefix = "group_senderkey_$chatId"
+        val prefix = scopedKey(owner, "group_senderkey_$chatId")
         val migrations = mutableListOf<Pair<String, String>>()
         for ((key, value) in sharedPreferences.all) {
             if (key !is String || value !is String || value.isBlank()) continue
@@ -395,8 +545,8 @@ class TokenManagerImpl(
         return out
     }
 
-    private fun pruneOldSenderKeysLocked(chatId: String) {
-        val prefix = "group_senderkey_$chatId|"
+    private fun pruneOldSenderKeysLocked(owner: String, chatId: String) {
+        val prefix = scopedKey(owner, "group_senderkey_$chatId|")
         val versions = mutableListOf<Int>()
         for ((key, _) in sharedPreferences.all) {
             if (key !is String || !key.startsWith(prefix)) continue
@@ -405,15 +555,15 @@ class TokenManagerImpl(
         if (versions.size <= 64) return
         val drop = versions.sorted().dropLast(64)
         val edit = sharedPreferences.edit()
-        drop.forEach { v -> edit.remove("group_senderkey_$chatId|$v") }
+        drop.forEach { v -> edit.remove(scopedKey(owner, "group_senderkey_$chatId|$v")) }
         edit.apply()
     }
 
-    override suspend fun saveKnownPublicKey(chatId: String, publicKeyHex: String): Result<Unit> =
+    override suspend fun saveKnownPublicKey(owner: String, chatId: String, publicKeyHex: String): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
                 with(sharedPreferences.edit()) {
-                    putString("known_pubkey_$chatId", publicKeyHex)
+                    putString(scopedKey(owner, "known_pubkey_$chatId"), publicKeyHex)
                     apply()
                 }
                 Result.success(Unit)
@@ -422,73 +572,73 @@ class TokenManagerImpl(
             }
         }
 
-    override suspend fun getKnownPublicKey(chatId: String): Result<String?> = withContext(Dispatchers.IO) {
+    override suspend fun getKnownPublicKey(owner: String, chatId: String): Result<String?> = withContext(Dispatchers.IO) {
         try {
-            Result.success(sharedPreferences.getString("known_pubkey_$chatId", null))
+            Result.success(sharedPreferences.getString(scopedKey(owner, "known_pubkey_$chatId"), null))
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    override suspend fun savePendingPublicKey(chatId: String, publicKeyHex: String): Result<Unit> =
+    override suspend fun savePendingPublicKey(owner: String, chatId: String, publicKeyHex: String): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
-                sharedPreferences.edit().putString("pending_pubkey_$chatId", publicKeyHex).apply()
+                sharedPreferences.edit().putString(scopedKey(owner, "pending_pubkey_$chatId"), publicKeyHex).apply()
                 Result.success(Unit)
             } catch (e: Exception) {
                 Result.failure(e)
             }
         }
 
-    override suspend fun getPendingPublicKey(chatId: String): Result<String?> = withContext(Dispatchers.IO) {
+    override suspend fun getPendingPublicKey(owner: String, chatId: String): Result<String?> = withContext(Dispatchers.IO) {
         try {
-            Result.success(sharedPreferences.getString("pending_pubkey_$chatId", null))
+            Result.success(sharedPreferences.getString(scopedKey(owner, "pending_pubkey_$chatId"), null))
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    override suspend fun clearPendingPublicKey(chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
+    override suspend fun clearPendingPublicKey(owner: String, chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            sharedPreferences.edit().remove("pending_pubkey_$chatId").apply()
+            sharedPreferences.edit().remove(scopedKey(owner, "pending_pubkey_$chatId")).apply()
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    override suspend fun deleteDirectRatchet(chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
+    override suspend fun deleteDirectRatchet(owner: String, chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            sharedPreferences.edit().remove("dr3_$chatId").apply()
+            sharedPreferences.edit().remove(scopedKey(owner, "dr3_$chatId")).apply()
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    override suspend fun markSafetyVerified(chatId: String, pubHex: String): Result<Unit> =
+    override suspend fun markSafetyVerified(owner: String, chatId: String, pubHex: String): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
-                sharedPreferences.edit().putString("verified_pubkey_$chatId", pubHex).apply()
+                sharedPreferences.edit().putString(scopedKey(owner, "verified_pubkey_$chatId"), pubHex).apply()
                 Result.success(Unit)
             } catch (e: Exception) {
                 Result.failure(e)
             }
         }
 
-    override suspend fun clearSafetyVerified(chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
+    override suspend fun clearSafetyVerified(owner: String, chatId: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            sharedPreferences.edit().remove("verified_pubkey_$chatId").apply()
+            sharedPreferences.edit().remove(scopedKey(owner, "verified_pubkey_$chatId")).apply()
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    override suspend fun isSafetyVerified(chatId: String): Result<Boolean> = withContext(Dispatchers.IO) {
+    override suspend fun isSafetyVerified(owner: String, chatId: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            val known = sharedPreferences.getString("known_pubkey_$chatId", null)
-            val verified = sharedPreferences.getString("verified_pubkey_$chatId", null)
+            val known = sharedPreferences.getString(scopedKey(owner, "known_pubkey_$chatId"), null)
+            val verified = sharedPreferences.getString(scopedKey(owner, "verified_pubkey_$chatId"), null)
             Result.success(!known.isNullOrBlank() && known.equals(verified, ignoreCase = true))
         } catch (e: Exception) {
             Result.failure(e)
@@ -531,13 +681,13 @@ class TokenManagerImpl(
         }
     }
 
-    override suspend fun exportVaultSenderKeys(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+    override suspend fun exportVaultSenderKeys(owner: String): Result<Map<String, String>> = withContext(Dispatchers.IO) {
         try {
             val out = mutableMapOf<String, String>()
             for ((key, value) in sharedPreferences.all) {
                 if (key !is String || value !is String) continue
-                if (!key.startsWith("group_senderkey_")) continue
-                val rest = key.removePrefix("group_senderkey_")
+                if (!key.startsWith(scopedKey(owner, "group_senderkey_"))) continue
+                val rest = key.removePrefix(scopedKey(owner, "group_senderkey_"))
                 val plain = unwrapSecret(value) ?: continue
                 if (rest.contains('|')) {
                     val sep = rest.lastIndexOf('|')
@@ -559,13 +709,13 @@ class TokenManagerImpl(
         }
     }
 
-    override suspend fun exportVaultPeerPubs(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+    override suspend fun exportVaultPeerPubs(owner: String): Result<Map<String, String>> = withContext(Dispatchers.IO) {
         try {
             val out = mutableMapOf<String, String>()
             for ((key, value) in sharedPreferences.all) {
                 if (key !is String || value !is String) continue
-                if (!key.startsWith("known_pubkey_")) continue
-                val chatId = key.removePrefix("known_pubkey_")
+                if (!key.startsWith(scopedKey(owner, "known_pubkey_"))) continue
+                val chatId = key.removePrefix(scopedKey(owner, "known_pubkey_"))
                 if (value.isNotBlank()) out[chatId] = value
             }
             Result.success(out)
@@ -574,7 +724,7 @@ class TokenManagerImpl(
         }
     }
 
-    override suspend fun restoreVaultSenderKeys(keys: Map<String, String>): Result<Unit> =
+    override suspend fun restoreVaultSenderKeys(owner: String, keys: Map<String, String>): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
                 val edit = sharedPreferences.edit()
@@ -584,15 +734,15 @@ class TokenManagerImpl(
                     val chatId = composite.substring(0, sep)
                     val version = composite.substring(sep + 1)
                     val wrappedHex = wrapSecret(keyHex).getOrNull() ?: keyHex
-                    edit.putString("group_senderkey_$chatId|$version", wrappedHex)
+                    edit.putString(scopedKey(owner, "group_senderkey_$chatId|$version"), wrappedHex)
                     val verInt = version.toIntOrNull()
                     if (verInt != null) {
-                        val existingStored = sharedPreferences.getString("group_senderkey_$chatId", null)
+                        val existingStored = sharedPreferences.getString(scopedKey(owner, "group_senderkey_$chatId"), null)
                         val existingPlain = existingStored?.let { unwrapSecret(it) }
                         val existingVer = existingPlain?.substringBefore(':')?.toIntOrNull() ?: -1
                         if (verInt >= existingVer) {
                             val latest = wrapSecret("$version:$keyHex").getOrNull() ?: "$version:$keyHex"
-                            edit.putString("group_senderkey_$chatId", latest)
+                            edit.putString(scopedKey(owner, "group_senderkey_$chatId"), latest)
                         }
                     }
                 }
@@ -603,12 +753,12 @@ class TokenManagerImpl(
             }
         }
 
-    override suspend fun restoreVaultPeerPubs(pubs: Map<String, String>): Result<Unit> =
+    override suspend fun restoreVaultPeerPubs(owner: String, pubs: Map<String, String>): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
                 val edit = sharedPreferences.edit()
                 pubs.forEach { (chatId, pub) ->
-                    if (pub.isNotBlank()) edit.putString("known_pubkey_$chatId", pub)
+                    if (pub.isNotBlank()) edit.putString(scopedKey(owner, "known_pubkey_$chatId"), pub)
                 }
                 edit.apply()
                 Result.success(Unit)
@@ -617,14 +767,14 @@ class TokenManagerImpl(
             }
         }
 
-    override suspend fun exportVaultPeerSenderKeys(): Result<Map<String, String>> =
+    override suspend fun exportVaultPeerSenderKeys(owner: String): Result<Map<String, String>> =
         withContext(Dispatchers.IO) {
             try {
                 val out = mutableMapOf<String, String>()
                 for ((key, value) in sharedPreferences.all) {
                     if (key !is String || value !is String) continue
-                    if (!key.startsWith("peer_senderkey_")) continue
-                    val rest = key.removePrefix("peer_senderkey_")
+                    if (!key.startsWith(scopedKey(owner, "peer_senderkey_"))) continue
+                    val rest = key.removePrefix(scopedKey(owner, "peer_senderkey_"))
                     val hex = unwrapSecret(value) ?: continue
                     if (hex.isNotBlank()) out[rest] = hex
                 }
@@ -634,14 +784,14 @@ class TokenManagerImpl(
             }
         }
 
-    override suspend fun restoreVaultPeerSenderKeys(keys: Map<String, String>): Result<Unit> =
+    override suspend fun restoreVaultPeerSenderKeys(owner: String, keys: Map<String, String>): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
                 val edit = sharedPreferences.edit()
                 keys.forEach { (composite, hex) ->
                     if (composite.count { it == '|' } < 2 || hex.isBlank()) return@forEach
                     val stored = wrapSecret(hex).getOrNull() ?: hex
-                    edit.putString("peer_senderkey_$composite", stored)
+                    edit.putString(scopedKey(owner, "peer_senderkey_$composite"), stored)
                 }
                 edit.apply()
                 Result.success(Unit)
@@ -693,10 +843,10 @@ class TokenManagerImpl(
      * `commit()` blocks until the write is on disk and reports whether it
      * worked. We are already on [Dispatchers.IO], so blocking here is correct.
      */
-    override suspend fun saveMlsBundle(key: String, json: String): Result<Unit> = withContext(Dispatchers.IO) {
+    override suspend fun saveMlsBundle(owner: MlsOwner, key: String, json: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val wrapped = wrapSecret(json).getOrElse { json }
-            val committed = sharedPreferences.edit().putString("mls1_$key", wrapped).commit()
+            val committed = sharedPreferences.edit().putString(mlsKey(owner, key), wrapped).commit()
             if (!committed) {
                 Result.failure(
                     IllegalStateException(
@@ -728,9 +878,9 @@ class TokenManagerImpl(
      *
      * The stored value is left untouched on failure so recovery stays possible.
      */
-    override suspend fun loadMlsBundle(key: String): Result<String?> = withContext(Dispatchers.IO) {
+    override suspend fun loadMlsBundle(owner: MlsOwner, key: String): Result<String?> = withContext(Dispatchers.IO) {
         try {
-            val stored = sharedPreferences.getString("mls1_$key", null)
+            val stored = sharedPreferences.getString(mlsKey(owner, key), null)
                 ?: return@withContext Result.success(null)
             val plain = unwrapSecret(stored)
                 ?: return@withContext Result.failure(
@@ -750,22 +900,23 @@ class TokenManagerImpl(
      * unwrapped. Lets a caller tell "absent" from "unreadable" without a read
      * that might itself fail.
      */
-    override suspend fun hasMlsBundle(key: String): Result<Boolean> = withContext(Dispatchers.IO) {
+    override suspend fun hasMlsBundle(owner: MlsOwner, key: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            Result.success(!sharedPreferences.getString("mls1_$key", null).isNullOrBlank())
+            Result.success(!sharedPreferences.getString(mlsKey(owner, key), null).isNullOrBlank())
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    override suspend fun listMlsBundles(prefix: String): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+    override suspend fun listMlsBundles(owner: MlsOwner, prefix: String): Result<Map<String, String>> = withContext(Dispatchers.IO) {
         try {
-            val full = "mls1_$prefix"
+            val full = mlsKey(owner, prefix)
+            val ownerPrefix = mlsKey(owner, "")
             val out = mutableMapOf<String, String>()
             for ((key, value) in sharedPreferences.all) {
                 if (key !is String || value !is String) continue
                 if (!key.startsWith(full)) continue
-                val id = key.removePrefix("mls1_")
+                val id = key.removePrefix(ownerPrefix)
                 if (id.isBlank()) continue
                 val plain = unwrapSecret(value) ?: continue
                 if (plain.isNotBlank()) out[id] = plain
@@ -783,9 +934,9 @@ class TokenManagerImpl(
      * a caller that has been told the state was discarded would find it back on
      * the next start.
      */
-    override suspend fun deleteMlsBundle(key: String): Result<Unit> = withContext(Dispatchers.IO) {
+    override suspend fun deleteMlsBundle(owner: MlsOwner, key: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            val committed = sharedPreferences.edit().remove("mls1_$key").commit()
+            val committed = sharedPreferences.edit().remove(mlsKey(owner, key)).commit()
             if (!committed) {
                 Result.failure(
                     IllegalStateException("MLS bundle '$key' was not removed from storage")
@@ -798,32 +949,32 @@ class TokenManagerImpl(
         }
     }
 
-    override suspend fun saveDirectRatchet(chatId: String, json: String): Result<Unit> = withContext(Dispatchers.IO) {
+    override suspend fun saveDirectRatchet(owner: String, chatId: String, json: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val wrapped = wrapSecret(json).getOrElse { json }
-            sharedPreferences.edit().putString("dr3_$chatId", wrapped).apply()
+            sharedPreferences.edit().putString(scopedKey(owner, "dr3_$chatId"), wrapped).apply()
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    override suspend fun loadDirectRatchet(chatId: String): Result<String?> = withContext(Dispatchers.IO) {
+    override suspend fun loadDirectRatchet(owner: String, chatId: String): Result<String?> = withContext(Dispatchers.IO) {
         try {
-            val stored = sharedPreferences.getString("dr3_$chatId", null) ?: return@withContext Result.success(null)
+            val stored = sharedPreferences.getString(scopedKey(owner, "dr3_$chatId"), null) ?: return@withContext Result.success(null)
             Result.success(unwrapSecret(stored) ?: stored)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    override suspend fun exportVaultDirectRatchets(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+    override suspend fun exportVaultDirectRatchets(owner: String): Result<Map<String, String>> = withContext(Dispatchers.IO) {
         try {
             val out = mutableMapOf<String, String>()
             for ((key, value) in sharedPreferences.all) {
                 if (key !is String || value !is String) continue
-                if (!key.startsWith("dr3_")) continue
-                val chatId = key.removePrefix("dr3_")
+                if (!key.startsWith(scopedKey(owner, "dr3_"))) continue
+                val chatId = key.removePrefix(scopedKey(owner, "dr3_"))
                 if (chatId.isBlank()) continue
                 val plain = unwrapSecret(value) ?: continue
                 if (plain.isNotBlank()) out[chatId] = plain
@@ -834,12 +985,12 @@ class TokenManagerImpl(
         }
     }
 
-    override suspend fun restoreVaultDirectRatchets(sessions: Map<String, String>): Result<Unit> = withContext(Dispatchers.IO) {
+    override suspend fun restoreVaultDirectRatchets(owner: String, sessions: Map<String, String>): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             for ((chatId, json) in sessions) {
                 if (chatId.isBlank() || json.isBlank()) continue
-                val existing = loadDirectRatchet(chatId).getOrNull().orEmpty()
-                saveDirectRatchet(chatId, DoubleRatchet.preferSessionJson(existing, json))
+                val existing = loadDirectRatchet(owner, chatId).getOrNull().orEmpty()
+                saveDirectRatchet(owner, chatId, DoubleRatchet.preferSessionJson(existing, json))
             }
             Result.success(Unit)
         } catch (e: Exception) {
@@ -886,6 +1037,115 @@ class TokenManagerImpl(
         return keyStoreManager.decryptData(stored.removePrefix(KS_WRAP_PREFIX), KEY_ALIAS_TOKEN).getOrNull()
     }
 
+
+    // ------------------------------------------------ Gate 17 pending refresh
+
+    override suspend fun savePendingRefresh(
+        userId: String,
+        refreshToken: String,
+        requestId: String
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            // The refresh token is wrapped exactly like the live credential: it
+            // IS a live credential until the successor is installed.
+            val wrapped = wrapSecret(refreshToken)
+            if (wrapped.isFailure) return@withContext Result.failure(
+                wrapped.exceptionOrNull() ?: Exception("Failed to wrap pending refresh token")
+            )
+            with(sharedPreferences.edit()) {
+                putString(KEY_PENDING_REFRESH_TOKEN, wrapped.getOrNull())
+                putString(KEY_PENDING_REQUEST_ID, requestId)
+                putString(KEY_PENDING_REFRESH_USER, userId)
+                putLong(KEY_PENDING_REFRESH_AT, System.currentTimeMillis())
+                apply()
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun getPendingRefresh(): Result<PendingRefresh?> = withContext(Dispatchers.IO) {
+        try {
+            val stored = sharedPreferences.getString(KEY_PENDING_REFRESH_TOKEN, null)
+                ?: return@withContext Result.success(null)
+            val requestId = sharedPreferences.getString(KEY_PENDING_REQUEST_ID, null)
+                ?: return@withContext Result.success(null)
+            val userId = sharedPreferences.getString(KEY_PENDING_REFRESH_USER, null)
+                ?: return@withContext Result.success(null)
+            val plain = unwrapSecret(stored) ?: return@withContext Result.success(null)
+            Result.success(
+                PendingRefresh(
+                    userId = userId,
+                    refreshToken = plain,
+                    requestId = requestId,
+                    startedAtMillis = sharedPreferences.getLong(KEY_PENDING_REFRESH_AT, 0L)
+                )
+            )
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun clearPendingRefresh(): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            with(sharedPreferences.edit()) {
+                remove(KEY_PENDING_REFRESH_TOKEN)
+                remove(KEY_PENDING_REQUEST_ID)
+                remove(KEY_PENDING_REFRESH_USER)
+                remove(KEY_PENDING_REFRESH_AT)
+                apply()
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun installRefreshedTokens(
+        accessToken: String,
+        refreshToken: String,
+        expiresAt: Long
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val wrappedRefresh = wrapSecret(refreshToken)
+            if (wrappedRefresh.isFailure) return@withContext Result.failure(
+                wrappedRefresh.exceptionOrNull() ?: Exception("Failed to wrap refresh token")
+            )
+            // The access token uses the Keystore path the existing saver uses,
+            // so its storage format is unchanged.
+            val hasKey = keyStoreManager.containsKey(KEY_ALIAS_TOKEN)
+            if (hasKey.isFailure || hasKey.getOrNull() != true) {
+                val gen = keyStoreManager.generateEncryptionKey(KEY_ALIAS_TOKEN)
+                if (gen.isFailure) return@withContext Result.failure(
+                    gen.exceptionOrNull() ?: Exception("Failed to create token key")
+                )
+            }
+            val encAccess = keyStoreManager.encryptData(accessToken, KEY_ALIAS_TOKEN)
+            if (encAccess.isFailure) return@withContext Result.failure(
+                encAccess.exceptionOrNull() ?: Exception("Failed to encrypt access token")
+            )
+
+            // ONE editor, ONE apply: successor installed and pending record
+            // cleared together. A crash either side of this leaves a coherent
+            // state - old credential plus pending request_id, or successor with
+            // no pending state - but never both lost.
+            with(sharedPreferences.edit()) {
+                putString(KEY_ACCESS_TOKEN_ENCRYPTED, encAccess.getOrNull())
+                putString(KEY_REFRESH_TOKEN, wrappedRefresh.getOrNull())
+                putLong(KEY_EXPIRES_AT, expiresAt)
+                remove(KEY_PENDING_REFRESH_TOKEN)
+                remove(KEY_PENDING_REQUEST_ID)
+                remove(KEY_PENDING_REFRESH_USER)
+                remove(KEY_PENDING_REFRESH_AT)
+                apply()
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
     // ---------------------------------------------------------------- HistoryKeyringStore
     //
     // A separate, FAIL-CLOSED path. It shares the preferences file and the Keystore alias with the
@@ -899,9 +1159,9 @@ class TokenManagerImpl(
     //
     // Two copies are kept, both through the same fail-closed helpers below:
     //
-    //   KEY_HISTORY_KEYRING       the MK-sealed keyring. Recovery copy and source of truth;
+    //   scopedKey(owner, KEY_HISTORY_KEYRING)       the MK-sealed keyring. Recovery copy and source of truth;
     //                             reading it usefully requires an unlocked vault.
-    //   KEY_HISTORY_KEYRING_CACHE the keyring's plain encoding, protected by the Keystore alone,
+    //   scopedKey(owner, KEY_HISTORY_KEYRING_CACHE) the keyring's plain encoding, protected by the Keystore alone,
     //                             so an ordinary restart can read archived history with no
     //                             password prompt.
     //
@@ -909,23 +1169,23 @@ class TokenManagerImpl(
     // cold-start access; it is never written unprotected, and a device whose Keystore is
     // compromised loses those roots whichever copy is stored.
 
-    override suspend fun saveHistoryKeyring(sealed: ByteArray): Result<Unit> =
-        putSecretBytes(KEY_HISTORY_KEYRING, sealed, "history keyring")
+    override suspend fun saveHistoryKeyring(owner: String, sealed: ByteArray): Result<Unit> =
+        putSecretBytes(scopedKey(owner, KEY_HISTORY_KEYRING), sealed, "history keyring")
 
-    override suspend fun loadHistoryKeyring(): Result<ByteArray?> =
-        getSecretBytes(KEY_HISTORY_KEYRING, "history keyring")
+    override suspend fun loadHistoryKeyring(owner: String): Result<ByteArray?> =
+        getSecretBytes(scopedKey(owner, KEY_HISTORY_KEYRING), "history keyring")
 
-    override suspend fun deleteHistoryKeyring(): Result<Unit> =
-        removeSecret(KEY_HISTORY_KEYRING, "history keyring")
+    override suspend fun deleteHistoryKeyring(owner: String): Result<Unit> =
+        removeSecret(scopedKey(owner, KEY_HISTORY_KEYRING), "history keyring")
 
-    override suspend fun saveHistoryKeyringCache(plain: ByteArray): Result<Unit> =
-        putSecretBytes(KEY_HISTORY_KEYRING_CACHE, plain, "history keyring cache")
+    override suspend fun saveHistoryKeyringCache(owner: String, plain: ByteArray): Result<Unit> =
+        putSecretBytes(scopedKey(owner, KEY_HISTORY_KEYRING_CACHE), plain, "history keyring cache")
 
-    override suspend fun loadHistoryKeyringCache(): Result<ByteArray?> =
-        getSecretBytes(KEY_HISTORY_KEYRING_CACHE, "history keyring cache")
+    override suspend fun loadHistoryKeyringCache(owner: String): Result<ByteArray?> =
+        getSecretBytes(scopedKey(owner, KEY_HISTORY_KEYRING_CACHE), "history keyring cache")
 
-    override suspend fun deleteHistoryKeyringCache(): Result<Unit> =
-        removeSecret(KEY_HISTORY_KEYRING_CACHE, "history keyring cache")
+    override suspend fun deleteHistoryKeyringCache(owner: String): Result<Unit> =
+        removeSecret(scopedKey(owner, KEY_HISTORY_KEYRING_CACHE), "history keyring cache")
 
     /**
      * The generation marker.
@@ -935,21 +1195,21 @@ class TokenManagerImpl(
      * re-validated, which is exactly the failure the marker exists to detect.
      * Stored big-endian so the bytes order the same way the number does.
      */
-    override suspend fun saveHistoryKeyringGeneration(generation: Long): Result<Unit> {
+    override suspend fun saveHistoryKeyringGeneration(owner: String, generation: Long): Result<Unit> {
         val bytes = ByteArray(8) { i -> ((generation ushr (56 - 8 * i)) and 0xFF).toByte() }
-        return putSecretBytes(KEY_HISTORY_KEYRING_GEN, bytes, "history keyring generation")
+        return putSecretBytes(scopedKey(owner, KEY_HISTORY_KEYRING_GEN), bytes, "history keyring generation")
     }
 
-    override suspend fun loadHistoryKeyringGeneration(): Result<Long?> =
-        getSecretBytes(KEY_HISTORY_KEYRING_GEN, "history keyring generation").map { raw ->
+    override suspend fun loadHistoryKeyringGeneration(owner: String): Result<Long?> =
+        getSecretBytes(scopedKey(owner, KEY_HISTORY_KEYRING_GEN), "history keyring generation").map { raw ->
             if (raw == null || raw.size != 8) return@map null
             var v = 0L
             for (b in raw) v = (v shl 8) or (b.toLong() and 0xFF)
             if (v < 0) null else v
         }
 
-    override suspend fun deleteHistoryKeyringGeneration(): Result<Unit> =
-        removeSecret(KEY_HISTORY_KEYRING_GEN, "history keyring generation")
+    override suspend fun deleteHistoryKeyringGeneration(owner: String): Result<Unit> =
+        removeSecret(scopedKey(owner, KEY_HISTORY_KEYRING_GEN), "history keyring generation")
 
     /**
      * Keystore-wraps and commits, or fails. There is deliberately no `getOrElse { plaintext }`

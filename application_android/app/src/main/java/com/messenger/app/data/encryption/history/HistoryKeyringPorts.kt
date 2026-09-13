@@ -48,13 +48,13 @@ interface HistoryKeyringVault {
  * whose Keystore is compromised loses the roots it holds regardless of which copy is stored.
  */
 interface HistoryKeyringStore {
-    suspend fun saveHistoryKeyring(sealed: ByteArray): Result<Unit>
-    suspend fun loadHistoryKeyring(): Result<ByteArray?>
-    suspend fun deleteHistoryKeyring(): Result<Unit>
+    suspend fun saveHistoryKeyring(owner: String, sealed: ByteArray): Result<Unit>
+    suspend fun loadHistoryKeyring(owner: String): Result<ByteArray?>
+    suspend fun deleteHistoryKeyring(owner: String): Result<Unit>
 
-    suspend fun saveHistoryKeyringCache(plain: ByteArray): Result<Unit>
-    suspend fun loadHistoryKeyringCache(): Result<ByteArray?>
-    suspend fun deleteHistoryKeyringCache(): Result<Unit>
+    suspend fun saveHistoryKeyringCache(owner: String, plain: ByteArray): Result<Unit>
+    suspend fun loadHistoryKeyringCache(owner: String): Result<ByteArray?>
+    suspend fun deleteHistoryKeyringCache(owner: String): Result<Unit>
 
     /**
      * The keyring generation marker.
@@ -70,7 +70,7 @@ interface HistoryKeyringStore {
      * AFTER both writes have landed, so a cache whose stamp does not equal the
      * marker is provably not known to match the authoritative copy.
      */
-    suspend fun saveHistoryKeyringGeneration(generation: Long): Result<Unit>
-    suspend fun loadHistoryKeyringGeneration(): Result<Long?>
-    suspend fun deleteHistoryKeyringGeneration(): Result<Unit>
+    suspend fun saveHistoryKeyringGeneration(owner: String, generation: Long): Result<Unit>
+    suspend fun loadHistoryKeyringGeneration(owner: String): Result<Long?>
+    suspend fun deleteHistoryKeyringGeneration(owner: String): Result<Unit>
 }

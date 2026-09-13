@@ -30,6 +30,10 @@ import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
 
+import java.util.Base64
+import com.messenger.app.data.encryption.E2ECrypto
+import com.messenger.app.data.model.E2EEDeviceChallengeRequest
+
 /**
  * Creates / unlocks the password-wrapped E2EE vault after login so a new
  * device can restore identity keys instead of overwriting them.
@@ -604,10 +608,10 @@ class E2EEVaultRepository @Inject constructor(
             val plaintext = VaultCrypto.VaultPlaintext(
                 identityPubHex = pub,
                 identityPrivHex = priv,
-                ownSenderKeys = tokenManager.exportVaultSenderKeys().getOrElse { emptyMap() },
-                peerPubs = tokenManager.exportVaultPeerPubs().getOrElse { emptyMap() },
-                peerSenderKeys = tokenManager.exportVaultPeerSenderKeys().getOrElse { emptyMap() },
-                directRatchets = tokenManager.exportVaultDirectRatchets().getOrElse { emptyMap() }
+                ownSenderKeys = tokenManager.exportVaultSenderKeys(userId).getOrElse { emptyMap() },
+                peerPubs = tokenManager.exportVaultPeerPubs(userId).getOrElse { emptyMap() },
+                peerSenderKeys = tokenManager.exportVaultPeerSenderKeys(userId).getOrElse { emptyMap() },
+                directRatchets = tokenManager.exportVaultDirectRatchets(userId).getOrElse { emptyMap() }
             )
             if (!isRewrapOfSessionMk(mk, "refreshVaultContents")) return false
             val sealed = VaultCrypto.resealVault(userId, mk, plaintext, next)
@@ -668,23 +672,23 @@ class E2EEVaultRepository @Inject constructor(
         val local = VaultCrypto.VaultPlaintext(
             identityPubHex = pub,
             identityPrivHex = priv,
-            ownSenderKeys = tokenManager.exportVaultSenderKeys().getOrElse { emptyMap() },
-            peerPubs = tokenManager.exportVaultPeerPubs().getOrElse { emptyMap() },
-            peerSenderKeys = tokenManager.exportVaultPeerSenderKeys().getOrElse { emptyMap() },
-            directRatchets = tokenManager.exportVaultDirectRatchets().getOrElse { emptyMap() }
+            ownSenderKeys = tokenManager.exportVaultSenderKeys(userId).getOrElse { emptyMap() },
+            peerPubs = tokenManager.exportVaultPeerPubs(userId).getOrElse { emptyMap() },
+            peerSenderKeys = tokenManager.exportVaultPeerSenderKeys(userId).getOrElse { emptyMap() },
+            directRatchets = tokenManager.exportVaultDirectRatchets(userId).getOrElse { emptyMap() }
         )
         val merged = VaultCrypto.mergePlaintext(local, unlocked.plaintext)
         if (merged.ownSenderKeys.isNotEmpty()) {
-            tokenManager.restoreVaultSenderKeys(merged.ownSenderKeys)
+            tokenManager.restoreVaultSenderKeys(userId, merged.ownSenderKeys)
         }
         if (merged.peerPubs.isNotEmpty()) {
-            tokenManager.restoreVaultPeerPubs(merged.peerPubs)
+            tokenManager.restoreVaultPeerPubs(userId, merged.peerPubs)
         }
         if (merged.peerSenderKeys.isNotEmpty()) {
-            tokenManager.restoreVaultPeerSenderKeys(merged.peerSenderKeys)
+            tokenManager.restoreVaultPeerSenderKeys(userId, merged.peerSenderKeys)
         }
-        tokenManager.restoreVaultDirectRatchets(merged.directRatchets)
-        chatRepository.adoptDirectRatchetsFromVault(merged.directRatchets)
+        tokenManager.restoreVaultDirectRatchets(userId, merged.directRatchets)
+        chatRepository.adoptDirectRatchetsFromVault(userId, merged.directRatchets)
         rememberSession(mk, dto.vaultVersion, dto)
         Log.i(TAG, "Merged remote vault v${dto.vaultVersion}")
         return true
@@ -802,14 +806,24 @@ class E2EEVaultRepository @Inject constructor(
             return VaultSyncResult.Failed("Missing local E2EE keys")
         }
 
-        val ownSenderKeys = tokenManager.exportVaultSenderKeys().getOrElse { emptyMap() }
-        val peerPubs = tokenManager.exportVaultPeerPubs().getOrElse { emptyMap() }
-        val peerSenderKeys = tokenManager.exportVaultPeerSenderKeys().getOrElse { emptyMap() }
-        val directRatchets = tokenManager.exportVaultDirectRatchets().getOrElse { emptyMap() }
+        val ownSenderKeys = tokenManager.exportVaultSenderKeys(userId).getOrElse { emptyMap() }
+        val peerPubs = tokenManager.exportVaultPeerPubs(userId).getOrElse { emptyMap() }
+        val peerSenderKeys = tokenManager.exportVaultPeerSenderKeys(userId).getOrElse { emptyMap() }
+        val directRatchets = tokenManager.exportVaultDirectRatchets(userId).getOrElse { emptyMap() }
 
         val built = VaultCrypto.createVault(
             userId, password, pub, priv, ownSenderKeys, peerPubs, peerSenderKeys, directRatchets = directRatchets
         ) ?: return VaultSyncResult.Failed("Vault create failed")
+
+        // BEFORE the write. PUT /e2ee/vault is device-gated from Phase 67, and this
+        // is the FIRST vault a new account ever has - so without enrolling here the
+        // create would be refused, and the enrolment that would have fixed it runs
+        // only on paths that assume a vault already exists. K_device needs no vault,
+        // so enrolling first is both possible and the correct order. This is the
+        // concrete resolution of the Phase 60 deadlock on Android.
+        if (!registerDevice(token)) {
+            return VaultSyncResult.Failed("Device enrolment required before vault creation")
+        }
 
         val rkSalt = built.rkSalt
         val rkWrap = built.rkWrappedMaster
@@ -917,18 +931,18 @@ class E2EEVaultRepository @Inject constructor(
         }
         tokenManager.saveE2EEKeys(userId, plain.identityPubHex, plain.identityPrivHex)
         if (plain.ownSenderKeys.isNotEmpty()) {
-            tokenManager.restoreVaultSenderKeys(plain.ownSenderKeys)
+            tokenManager.restoreVaultSenderKeys(userId, plain.ownSenderKeys)
         }
         if (plain.peerPubs.isNotEmpty()) {
-            tokenManager.restoreVaultPeerPubs(plain.peerPubs)
+            tokenManager.restoreVaultPeerPubs(userId, plain.peerPubs)
         }
         if (plain.peerSenderKeys.isNotEmpty()) {
-            tokenManager.restoreVaultPeerSenderKeys(plain.peerSenderKeys)
+            tokenManager.restoreVaultPeerSenderKeys(userId, plain.peerSenderKeys)
         }
         if (plain.directRatchets.isNotEmpty()) {
-            tokenManager.restoreVaultDirectRatchets(plain.directRatchets)
-            chatRepository.adoptDirectRatchetsFromVault(
-                tokenManager.exportVaultDirectRatchets().getOrElse { plain.directRatchets }
+            tokenManager.restoreVaultDirectRatchets(userId, plain.directRatchets)
+            chatRepository.adoptDirectRatchetsFromVault(userId, 
+                tokenManager.exportVaultDirectRatchets(userId).getOrElse { plain.directRatchets }
             )
         }
         chatRepository.ensureKeysPublished(token, allowTakeover = false)
@@ -937,17 +951,45 @@ class E2EEVaultRepository @Inject constructor(
     }
 
     /**
-     * The earliest point at which account identity, device identity and MK are
-     * all available - so it is the earliest point history keyring recovery can
-     * run. Fire-and-forget on the existing refresh scope: recovery is a
-     * synchronisation feature and must never delay or fail an unlock.
+     * The earliest point at which account identity and MK are available - but NOT
+     * yet the earliest point recovery can run, which is why enrolment is awaited
+     * inside the coroutine below.
      *
-     * Idempotent and one-shot per session inside ensureRecovered, and a complete
-     * no-op while the archive feature flag is off.
+     * ORDERING, AND WHY IT IS EXPLICIT. `GET /e2ee/history-keyring` is
+     * device-gated: Phase 44 resolves authorization through the session's bound
+     * device, and a session acquires that binding only by completing device
+     * registration. Recovery used to launch here as pure fire-and-forget while
+     * registration ran separately afterwards, so on a real device the keyring
+     * request lost the race and came back 403 - the gate working correctly, seven
+     * milliseconds before the device became verified. Nothing retried it,
+     * because the only production trigger is this function and it had already
+     * fired.
+     *
+     * The dependency is therefore made explicit rather than left to timing:
+     * enrolment is awaited, and recovery runs only if it succeeded. This is the
+     * single launch point for recovery, so every unlock, create, pairing and
+     * reset path inherits the ordering without changing any of them.
+     *
+     * Still fire-and-forget with respect to the CALLER: recovery is a
+     * synchronisation feature and must never delay or fail an unlock. Still
+     * idempotent and one-shot per session inside ensureRecovered, and still a
+     * complete no-op while the archive feature flag is off.
      */
     private fun recoverHistoryKeyringInBackground() {
         pendingHistoryRecovery?.cancel()
         pendingHistoryRecovery = refreshScope.launch {
+            val token = tokenManager.getAccessToken().getOrNull()?.takeIf { it.isNotBlank() }
+            if (token == null) {
+                Log.d(TAG, "history keyring recovery skipped: no session")
+                return@launch
+            }
+            // Fail closed. An unverified device must not reach a device-gated
+            // endpoint at all - not to avoid a 403, but because asking is
+            // meaningless until this install has proven who it is.
+            if (!registerDevice(token)) {
+                Log.d(TAG, "history keyring recovery skipped: device not verified")
+                return@launch
+            }
             runCatching { historyRecovery.get().ensureRecovered() }
                 .onFailure { Log.w(TAG, "history keyring recovery not completed: ${it.message}") }
         }
@@ -1162,11 +1204,11 @@ class E2EEVaultRepository @Inject constructor(
             password = password,
             pubHex = pub,
             privHex = priv,
-            ownSenderKeys = tokenManager.exportVaultSenderKeys().getOrElse { emptyMap() },
-            peerPubs = tokenManager.exportVaultPeerPubs().getOrElse { emptyMap() },
-            peerSenderKeys = tokenManager.exportVaultPeerSenderKeys().getOrElse { emptyMap() },
+            ownSenderKeys = tokenManager.exportVaultSenderKeys(userId).getOrElse { emptyMap() },
+            peerPubs = tokenManager.exportVaultPeerPubs(userId).getOrElse { emptyMap() },
+            peerSenderKeys = tokenManager.exportVaultPeerSenderKeys(userId).getOrElse { emptyMap() },
             vaultVersion = next,
-            directRatchets = tokenManager.exportVaultDirectRatchets().getOrElse { emptyMap() },
+            directRatchets = tokenManager.exportVaultDirectRatchets(userId).getOrElse { emptyMap() },
         ) ?: return E2EEResetResult.Aborted("Could not create the new vault", "mint")
 
         // 6. POINT OF NO RETURN.
@@ -1528,10 +1570,10 @@ class E2EEVaultRepository @Inject constructor(
         val plaintext = VaultCrypto.VaultPlaintext(
             identityPubHex = pub,
             identityPrivHex = priv,
-            ownSenderKeys = tokenManager.exportVaultSenderKeys().getOrElse { emptyMap() },
-            peerPubs = tokenManager.exportVaultPeerPubs().getOrElse { emptyMap() },
-            peerSenderKeys = tokenManager.exportVaultPeerSenderKeys().getOrElse { emptyMap() },
-            directRatchets = tokenManager.exportVaultDirectRatchets().getOrElse { emptyMap() }
+            ownSenderKeys = tokenManager.exportVaultSenderKeys(userId).getOrElse { emptyMap() },
+            peerPubs = tokenManager.exportVaultPeerPubs(userId).getOrElse { emptyMap() },
+            peerSenderKeys = tokenManager.exportVaultPeerSenderKeys(userId).getOrElse { emptyMap() },
+            directRatchets = tokenManager.exportVaultDirectRatchets(userId).getOrElse { emptyMap() }
         )
         val sealed = VaultCrypto.resealVault(userId, mk, plaintext, next) ?: return false
         val put = chatApiService.putE2EEVault(
@@ -1565,25 +1607,127 @@ class E2EEVaultRepository @Inject constructor(
         return false
     }
 
-    private suspend fun registerDevice(token: String) {
-        val userId = tokenManager.getCurrentUserId().getOrNull() ?: return
-        val deviceId = tokenManager.getOrCreateDeviceId().getOrNull() ?: return
-        val pub = tokenManager.getE2EEPublicKey(userId).getOrNull().orEmpty()
-        if (pub.isBlank()) return
+    /**
+     * Enrols this install as a verified device (Phase 44).
+     *
+     * Registration is no longer an assertion. Phase 43 showed that a device row created from a
+     * self-chosen id authorized nothing worth having: an account token alone could mint an identity
+     * and read the MK-sealed history keyring with it, and evade a revocation by minting another.
+     * The server now seals a random challenge to the key being registered and only marks the device
+     * verified - and binds this session to it - once the decrypted challenge comes back.
+     *
+     * The proof needs the identity PRIVATE key, which lives in the vault, so this is a no-op while
+     * the vault is locked. That is correct: a locked install has nothing to prove with, and the
+     * existing callers all run again after unlock.
+     *
+     * The sealed challenge has the same wire shape as the pairing payload, so it is opened with the
+     * existing [VaultCrypto.openPairingMk] rather than a second box implementation.
+     */
+    /**
+     * Generates K_device the first time this installation enrols, and returns it.
+     *
+     * Deliberately derived from nothing: not from the account key, not from the
+     * vault, not from recovery material. A device identity that can be recomputed
+     * from account material is an account identity under another name, which is
+     * the defect this replaces. It also means enrolment needs no vault - which is
+     * what lets a brand-new device enrol before any vault exists.
+     */
+    private suspend fun ensureDeviceKey(userId: String): Pair<String, String>? {
+        val pub = tokenManager.getDeviceKeyPublic(userId).getOrNull().orEmpty()
+        val priv = tokenManager.getDeviceKeyPrivate(userId).getOrNull().orEmpty()
+        if (pub.isNotBlank() && priv.isNotBlank()) return pub to priv
 
+        val kp = E2ECrypto.generateKeyPair()
+        if (kp == null) {
+            Log.w(TAG, "Could not generate K_device")
+            return null
+        }
+        if (tokenManager.saveDeviceKeys(userId, kp.publicHex, kp.privateHex).isFailure) {
+            Log.w(TAG, "Could not persist K_device")
+            return null
+        }
+        Log.d(TAG, "Generated K_device for this installation")
+        return kp.publicHex to kp.privateHex
+    }
+
+    private suspend fun registerDevice(token: String): Boolean {
+        val userId = tokenManager.getCurrentUserId().getOrNull() ?: return false
+        val deviceId = tokenManager.getOrCreateDeviceId().getOrNull() ?: return false
+        // Phase 67: the proof presents K_device, never the account-wide key that
+        // the vault hands to every device that unlocks it.
+        val deviceKeys = ensureDeviceKey(userId)
+        if (deviceKeys == null) {
+            Log.d(TAG, "Device enrolment deferred: no device keypair")
+            return false
+        }
+        val (pub, priv) = deviceKeys
+        val privBytes = runCatching { hexToBytes(priv) }.getOrNull()
+        if (privBytes == null || privBytes.size != 32) return false
+
+        // Step one: a challenge sealed to this key. Nothing is registered by asking.
+        val challenge = runCatching {
+            chatApiService.createE2EEDeviceChallenge(
+                bearer(token), E2EEDeviceChallengeRequest(deviceId = deviceId, publicKey = pub)
+            )
+        }.getOrElse {
+            Log.w(TAG, "Device challenge failed", it)
+            return false
+        }
+        if (!challenge.isSuccessful) {
+            Log.w(TAG, "Device challenge HTTP ${challenge.code()}")
+            return false
+        }
+        val body = challenge.body() ?: return false
+        val senderPub = runCatching { hexToBytes(body.senderPubHex) }.getOrNull() ?: return false
+        val sealed = runCatching { Base64.getDecoder().decode(body.sealedB64) }.getOrNull() ?: return false
+
+        // Step two: open it locally. This is the entire proof.
+        val proof = VaultCrypto.openPairingMk(privBytes, senderPub, sealed)
+        if (proof == null || proof.isEmpty()) {
+            Log.w(TAG, "Device challenge did not open")
+            return false
+        }
+        val proofB64 = Base64.getEncoder().encodeToString(proof)
+        com.messenger.app.data.encryption.history.HistoryCrypto.bestEffortWipe(proof)
+
+        // Step three: redeem it.
         val name = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android"
-        val body = E2EEDeviceRegisterRequest(
-            deviceId = deviceId,
-            name = name,
-            platform = "android",
-            publicKey = pub
-        )
-        runCatching {
-            chatApiService.registerE2EEDevice(bearer(token), body)
+        // The redemption result IS the answer: verified means the server accepted
+        // the proof and bound this session to the device. Anything else - a
+        // refusal, a transport failure - leaves the device unverified, and the
+        // caller must treat it that way.
+        return runCatching {
+            chatApiService.registerE2EEDevice(
+                bearer(token),
+                E2EEDeviceRegisterRequest(
+                    deviceId = deviceId,
+                    name = name,
+                    platform = "android",
+                    publicKey = pub,
+                    challengeId = body.challengeId,
+                    proofB64 = proofB64
+                )
+            )
         }.onFailure { Log.w(TAG, "Device register failed", it) }
-            .onSuccess { r ->
-                if (!r.isSuccessful) Log.w(TAG, "Device register HTTP ${r.code()}")
-                else Log.d(TAG, "E2EE device registered")
+            .map { r ->
+                if (!r.isSuccessful) {
+                    Log.w(TAG, "Device register HTTP ${r.code()}")
+                    false
+                } else {
+                    Log.d(TAG, "E2EE device verified")
+                    true
+                }
             }
+            .getOrDefault(false)
+    }
+
+    /** Strict hex -> bytes. Any odd length or non-hex digit is a failure, never a partial decode. */
+    private fun hexToBytes(hex: String): ByteArray {
+        val h = hex.trim()
+        require(h.length % 2 == 0) { "hex must have an even length" }
+        return ByteArray(h.length / 2) { i ->
+            val v = h.substring(i * 2, i * 2 + 2).toInt(16)
+            v.toByte()
+        }
     }
 }

@@ -14,6 +14,9 @@ import org.junit.runner.RunWith
  */
 @RunWith(AndroidJUnit4::class)
 class MlsGroupCryptoTest {
+    private val TEST_OWNER =
+        com.messenger.app.security.MlsOwner("mls-crypto-test", "dev")
+
 
     @Test
     fun suiteIsAvailableOnAndroid() {
@@ -63,19 +66,19 @@ class MlsGroupCryptoTest {
         assertEquals("both sides must agree on the epoch", aliceGroup.epoch, bobGroup.epoch)
 
         // Alice → Bob.
-        val toBob = MlsGroupCrypto.protect(aliceGroup, "hello bob".toByteArray())
-        val gotByBob = MlsGroupCrypto.unprotect(bobGroup, toBob)
+        val toBob = MlsGroupCrypto.protect(TEST_OWNER, aliceGroup, "hello bob".toByteArray())
+        val gotByBob = MlsGroupCrypto.unprotect(TEST_OWNER, bobGroup, toBob)
         assertNotNull("Bob must decrypt Alice's message", gotByBob)
         assertEquals("hello bob", String(gotByBob!!))
         assertEquals(
             "unprotect must be idempotent — the UI decrypts the same blob more than once",
             "hello bob",
-            String(MlsGroupCrypto.unprotect(bobGroup, toBob)!!)
+            String(MlsGroupCrypto.unprotect(TEST_OWNER, bobGroup, toBob)!!)
         )
 
         // Bob → Alice.
-        val toAlice = MlsGroupCrypto.protect(bobGroup, "hi alice".toByteArray())
-        val gotByAlice = MlsGroupCrypto.unprotect(aliceGroup, toAlice)
+        val toAlice = MlsGroupCrypto.protect(TEST_OWNER, bobGroup, "hi alice".toByteArray())
+        val gotByAlice = MlsGroupCrypto.unprotect(TEST_OWNER, aliceGroup, toAlice)
         assertNotNull("Alice must decrypt Bob's message", gotByAlice)
         assertEquals("hi alice", String(gotByAlice!!))
     }
@@ -105,7 +108,7 @@ class MlsGroupCryptoTest {
         val welcome = added.welcome
 
         // A message sent before the restart.
-        val sealed = MlsGroupCrypto.protect(aliceGroup, "sent before restart".toByteArray())
+        val sealed = MlsGroupCrypto.protect(TEST_OWNER, aliceGroup, "sent before restart".toByteArray())
 
         // ---- restart: nothing but the serialized strings survive ----
         val restoredIdentity = MlsGroupCrypto.decodeIdentity(identityJson)
@@ -116,13 +119,13 @@ class MlsGroupCryptoTest {
         val rebuilt = MlsGroupCrypto.joinFromWelcome(restoredKp!!, restoredIdentity!!, welcome)
         assertEquals("rebuilt group must be at the same epoch", aliceGroup.epoch, rebuilt.epoch)
 
-        val opened = MlsGroupCrypto.unprotect(rebuilt, sealed)
+        val opened = MlsGroupCrypto.unprotect(TEST_OWNER, rebuilt, sealed)
         assertNotNull("rebuilt session must decrypt a pre-restart message", opened)
         assertEquals("sent before restart", String(opened!!))
 
         // And it keeps working forward.
-        val after = MlsGroupCrypto.protect(aliceGroup, "after restart".toByteArray())
-        assertEquals("after restart", String(MlsGroupCrypto.unprotect(rebuilt, after)!!))
+        val after = MlsGroupCrypto.protect(TEST_OWNER, aliceGroup, "after restart".toByteArray())
+        assertEquals("after restart", String(MlsGroupCrypto.unprotect(TEST_OWNER, rebuilt, after)!!))
     }
 
     /**
@@ -168,13 +171,13 @@ class MlsGroupCryptoTest {
         )
 
         // And the rejoined device can actually talk to the group.
-        val fromCarol = MlsGroupCrypto.protect(rejoined.group, "carol is back".toByteArray())
-        val seenByAlice = MlsGroupCrypto.unprotect(aliceGroup, fromCarol)
+        val fromCarol = MlsGroupCrypto.protect(TEST_OWNER, rejoined.group, "carol is back".toByteArray())
+        val seenByAlice = MlsGroupCrypto.unprotect(TEST_OWNER, aliceGroup, fromCarol)
         assertNotNull("alice must read the rejoiner's message", seenByAlice)
         assertEquals("carol is back", String(seenByAlice!!))
 
-        val fromAlice = MlsGroupCrypto.protect(aliceGroup, "welcome back".toByteArray())
-        val seenByCarol = MlsGroupCrypto.unprotect(rejoined.group, fromAlice)
+        val fromAlice = MlsGroupCrypto.protect(TEST_OWNER, aliceGroup, "welcome back".toByteArray())
+        val seenByCarol = MlsGroupCrypto.unprotect(TEST_OWNER, rejoined.group, fromAlice)
         assertNotNull("rejoiner must read alice's message", seenByCarol)
         assertEquals("welcome back", String(seenByCarol!!))
     }
@@ -187,10 +190,10 @@ class MlsGroupCryptoTest {
         val group = MlsGroupCrypto.createGroup("chat-secure".toByteArray(), alice)
         val outsiderGroup = MlsGroupCrypto.createGroup("chat-secure".toByteArray(), mallory)
 
-        val ct = MlsGroupCrypto.protect(group, "members only".toByteArray())
+        val ct = MlsGroupCrypto.protect(TEST_OWNER, group, "members only".toByteArray())
         assertNull(
             "an outsider group must not open member traffic",
-            MlsGroupCrypto.unprotect(outsiderGroup, ct)
+            MlsGroupCrypto.unprotect(TEST_OWNER, outsiderGroup, ct)
         )
     }
 
@@ -200,7 +203,7 @@ class MlsGroupCryptoTest {
         val group = MlsGroupCrypto.createGroup("test-group".toByteArray(), alice)
         assertEquals(0L, group.epoch)
 
-        val ct = MlsGroupCrypto.protect(group, "hello mls".toByteArray())
+        val ct = MlsGroupCrypto.protect(TEST_OWNER, group, "hello mls".toByteArray())
         assertTrue("ciphertext must not be empty", ct.isNotEmpty())
         // The plaintext must not appear in the ciphertext.
         assertTrue(

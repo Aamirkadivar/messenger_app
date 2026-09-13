@@ -14,11 +14,18 @@ import (
 // Clients send X-Device-Id (stable per-install id). If the row is revoked,
 // all further access is denied until that device is deleted and re-linked.
 //
-// An unknown id from an authenticated user is auto-registered. The FN1 fan-out
-// only seals message copies for devices in this registry, so an active but
-// unregistered device (fresh install that restored a session and never hit a
-// vault-unlock path) receives messages it can never decrypt — including its
-// own sends. Self-registration here makes that state impossible to stay in.
+// An unknown id is passed through UNTOUCHED. It is deliberately not registered
+// here, and Phase 43 is why: this guard runs before RequireDeviceIdentity in the
+// same chain, so a row created here satisfied the strict check a moment later.
+// An attacker holding only an account token could therefore mint a device
+// identity and immediately read history with it - and, by inventing a fresh id,
+// walk straight past a revocation of their own device.
+//
+// Registration now happens only through POST /e2ee/devices, which demands proof
+// of possession of the device key. That is also what keeps the FN1 fan-out
+// correct: a device that never registers receives no sealed copies, which is the
+// right outcome for an identity nobody has proven, and both clients already call
+// the registration endpoint on connect.
 func DeviceRevocationGuard() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		deviceID := c.Get("X-Device-Id")
@@ -35,16 +42,9 @@ func DeviceRevocationGuard() fiber.Handler {
 		}
 		now := time.Now()
 		if !ok {
-			if len(deviceID) <= 128 {
-				_ = database.DB.Create(&models.E2EEDevice{
-					ID:         uuid.New(),
-					UserID:     userID,
-					DeviceID:   deviceID,
-					LastSeenAt: &now,
-					CreatedAt:  now,
-					UpdatedAt:  now,
-				}).Error
-			}
+			// Unknown: nothing is created and nothing is asserted. Device-gated
+			// routes deny this below in RequireDeviceIdentity; ordinary messaging
+			// is unaffected, exactly as when no header is sent at all.
 			return c.Next()
 		}
 		if d.RevokedAt != nil {

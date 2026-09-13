@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // GroupService handles group chat operations
@@ -59,6 +61,71 @@ func (s *GroupService) notify(eventType string, data fiber.Map) {
 		return
 	}
 	s.hub.Broadcast <- payload
+}
+
+// evictFromChatRoom ends userID's live subscription to chatID's room - see
+// Hub.EvictFromRoom - under the canonical chat id rooms are joined with.
+// Called by every path that ends a group membership.
+func evictFromChatRoom(hub *websocket.Hub, chatID string, userID uuid.UUID) {
+	id, err := uuid.Parse(chatID)
+	if err != nil {
+		return
+	}
+	hub.EvictFromRoom(userID, id.String())
+}
+
+// errLifecycleRefused ends a membership transaction whose checks refused the
+// change. The handler maps the reason it recorded to a response once the
+// transaction has rolled back (the pattern the pairing handlers use).
+var errLifecycleRefused = errors.New("group membership change refused")
+
+// msgOwnerCannotLeave refuses the group owner's attempt to leave, by any route.
+// Nothing can hand ownership on - no endpoint changes owner_id after
+// CreateGroup - so an owner who left would take the owner-only operations,
+// deleting the group above all, away for good. The owner can still delete it.
+const msgOwnerCannotLeave = "The group owner cannot leave the group"
+
+// lockGroup takes the row lock on chatID's chats row for the rest of tx and
+// returns the row (found is false when there is none, and then nothing is
+// locked: there is no live group to protect).
+//
+// Every transaction that changes who is in a group, or who administers it,
+// takes this lock FIRST - before any check. The only-admin decision is a read
+// followed by a write; without the lock two admins could each read that the
+// other is still in charge and both go, leaving the group with nobody able to
+// administer it. With it, the second waits here and then reads what the first
+// committed (read committed: each statement sees data committed before it
+// began). A check made before the lock would still race.
+func lockGroup(tx *gorm.DB, chatID string) (models.Chat, bool, error) {
+	var chat models.Chat
+	res := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", chatID).Limit(1).Find(&chat)
+	return chat, res.RowsAffected > 0, res.Error
+}
+
+// lastActiveAdmin reports whether userID is the only admin of chatID who has not
+// left - the one account whose departure, or stepping down, would leave the
+// group with nobody able to administer it. Departed admins hold no authority, so
+// they cannot stand in for one who does. A failed lookup answers true: the
+// callers refuse, rather than risk stranding the group.
+//
+// db is the caller's transaction, already holding lockGroup: the answer is only
+// good while nothing else can change the group's admins.
+func lastActiveAdmin(db *gorm.DB, chatID string, userID uuid.UUID) bool {
+	var self, others int64
+	if err := db.Model(&models.ChatParticipant{}).
+		Where("chat_id = ? AND user_id = ? AND role = ? AND left_at IS NULL", chatID, userID, "admin").
+		Count(&self).Error; err != nil {
+		return true
+	}
+	if self == 0 {
+		return false
+	}
+	if err := db.Model(&models.ChatParticipant{}).
+		Where("chat_id = ? AND user_id <> ? AND role = ? AND left_at IS NULL", chatID, userID, "admin").
+		Count(&others).Error; err != nil {
+		return true
+	}
+	return others == 0
 }
 
 // CreateGroup handles creating a new group chat
@@ -221,9 +288,10 @@ func (s *GroupService) GetGroupInfo(c *fiber.Ctx) error {
 	chatID := c.Params("chat_id")
 	userID := middleware.GetCurrentUserID(c)
 
-	// Verify user is a participant
+	// Verify user is a participant. Someone who left keeps their row (left_at
+	// records the departure), so the row alone is not membership.
 	var participant models.ChatParticipant
-	if err := database.DB.Where("chat_id = ? AND user_id = ?", chatID, userID).First(&participant).Error; err != nil {
+	if err := database.DB.Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, userID).First(&participant).Error; err != nil {
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{
 			"error":   "forbidden",
 			"message": "You are not a member of this group",
@@ -486,9 +554,9 @@ func (s *GroupService) AddMembers(c *fiber.Ctx) error {
 		})
 	}
 
-	// Check if user is admin
+	// Check if user is an admin who is still in the group
 	var participant models.ChatParticipant
-	if err := database.DB.Where("chat_id = ? AND user_id = ? AND role = ?", chatID, userID, "admin").First(&participant).Error; err != nil {
+	if err := database.DB.Where("chat_id = ? AND user_id = ? AND role = ? AND left_at IS NULL", chatID, userID, "admin").First(&participant).Error; err != nil {
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{
 			"error":   "forbidden",
 			"message": "Only group admins can add members",
@@ -542,54 +610,92 @@ func (s *GroupService) RemoveMember(c *fiber.Ctx) error {
 	userID := middleware.GetCurrentUserID(c)
 	memberID := c.Params("member_id")
 
-	// Check if user is admin
-	var participant models.ChatParticipant
-	if err := database.DB.Where("chat_id = ? AND user_id = ? AND role = ?", chatID, userID, "admin").First(&participant).Error; err != nil {
-		return c.Status(http.StatusForbidden).JSON(fiber.Map{
-			"error":   "forbidden",
-			"message": "Only group admins can remove members",
+	// Compare and match ids in canonical form. Postgres reads any spelling of a
+	// uuid (upper case, braces, no hyphens), while chats.id is text and the owner
+	// and self checks below compare strings - another spelling would skip those
+	// checks yet still match the rows the removal writes.
+	if id, err := uuid.Parse(chatID); err == nil {
+		chatID = id.String()
+	}
+	if id, err := uuid.Parse(memberID); err == nil {
+		memberID = id.String()
+	}
+
+	// Removing yourself is leaving the group, so it is LeaveGroup - the same
+	// last-admin rule, archive cleanup and events - and this endpoint cannot be
+	// used to leave in a way LeaveGroup would refuse. It stays an admin's
+	// endpoint: anyone else gets the refusal they always got, and uses LeaveGroup.
+	if userID.String() == memberID {
+		var self models.ChatParticipant
+		if err := database.DB.Where("chat_id = ? AND user_id = ? AND role = ? AND left_at IS NULL", chatID, userID, "admin").First(&self).Error; err != nil {
+			return c.Status(http.StatusForbidden).JSON(fiber.Map{
+				"error":   "forbidden",
+				"message": "Only group admins can remove members",
+			})
+		}
+		return s.LeaveGroup(c)
+	}
+
+	// Decided under the group lock (see lockGroup): an admin removed, or gone, a
+	// moment ago must not remove anyone - two admins removing each other at once
+	// would otherwise both succeed and leave nobody in charge.
+	var status int
+	var refusal fiber.Map
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		chat, found, err := lockGroup(tx, chatID)
+		if err != nil {
+			return err
+		}
+
+		// Check if user is an admin who is still in the group
+		var participant models.ChatParticipant
+		if err := tx.Where("chat_id = ? AND user_id = ? AND role = ? AND left_at IS NULL", chatID, userID, "admin").First(&participant).Error; err != nil {
+			status, refusal = http.StatusForbidden, fiber.Map{
+				"error":   "forbidden",
+				"message": "Only group admins can remove members",
+			}
+			return errLifecycleRefused
+		}
+
+		// The owner cannot be removed by another admin - otherwise any admin could
+		// evict the group's creator and take it over.
+		if found && chat.OwnerID.String() == memberID {
+			status, refusal = http.StatusForbidden, fiber.Map{
+				"error":   "forbidden",
+				"message": "The group owner cannot be removed",
+			}
+			return errLifecycleRefused
+		}
+
+		// Remove the member, dropping their archives for this chat in the same
+		// transaction - see the note in LeaveGroup.
+		//
+		// Only an active row is marked: left_at is the member's departure, and the
+		// boundary of the history they may still read (GetMessages), so removing
+		// someone who already left must not move it.
+		if err := tx.Model(&models.ChatParticipant{}).
+			Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, memberID).
+			Update("left_at", time.Now()).Error; err != nil {
+			return err
+		}
+		// memberID arrives as a path param; a malformed one simply purges
+		// nothing rather than failing the removal.
+		if parsed, err := uuid.Parse(memberID); err == nil {
+			return models.PurgeArchivesForParticipant(tx, chatID, parsed)
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, errLifecycleRefused) {
+			return c.Status(status).JSON(refusal)
+		}
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "internal error",
+			"message": "Failed to remove member",
 		})
 	}
 
-	// The owner cannot be removed by another admin - otherwise any admin could
-	// evict the group's creator and take it over.
-	var chat models.Chat
-	if err := database.DB.Where("id = ?", chatID).First(&chat).Error; err == nil {
-		if chat.OwnerID.String() == memberID && userID.String() != memberID {
-			return c.Status(http.StatusForbidden).JSON(fiber.Map{
-				"error":   "forbidden",
-				"message": "The group owner cannot be removed",
-			})
-		}
-	}
-
-	// Can't remove yourself unless you're transferring ownership
-	if userID.String() == memberID {
-		// Left the group
-		database.DB.Model(&models.ChatParticipant{}).
-			Where("chat_id = ? AND user_id = ?", chatID, userID).
-			Update("left_at", time.Now())
-	} else {
-		// Remove the member, dropping their archives for this chat in the same
-		// transaction - see the note in LeaveGroup.
-		if err := database.DB.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Model(&models.ChatParticipant{}).
-				Where("chat_id = ? AND user_id = ?", chatID, memberID).
-				Update("left_at", time.Now()).Error; err != nil {
-				return err
-			}
-			// memberID arrives as a path param; a malformed one simply purges
-			// nothing rather than failing the removal.
-			if parsed, err := uuid.Parse(memberID); err == nil {
-				return models.PurgeArchivesForParticipant(tx, chatID, parsed)
-			}
-			return nil
-		}); err != nil {
-			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-				"error":   "internal error",
-				"message": "Failed to remove member",
-			})
-		}
+	if parsed, err := uuid.Parse(memberID); err == nil {
+		evictFromChatRoom(s.hub, chatID, parsed)
 	}
 
 	s.bumpKeyEpoch(chatID)
@@ -619,6 +725,12 @@ func (s *GroupService) UpdateMemberRole(c *fiber.Ctx) error {
 	memberID := c.Params("member_id")
 	userID := middleware.GetCurrentUserID(c)
 
+	// Canonical form, so the owner check below compares like with like - see
+	// RemoveMember.
+	if id, err := uuid.Parse(memberID); err == nil {
+		memberID = id.String()
+	}
+
 	var req UpdateMemberRoleRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
@@ -635,45 +747,74 @@ func (s *GroupService) UpdateMemberRole(c *fiber.Ctx) error {
 		})
 	}
 
-	// Caller must be an active admin of this group.
-	var caller models.ChatParticipant
-	if err := database.DB.
-		Where("chat_id = ? AND user_id = ? AND role = ? AND left_at IS NULL", chatID, userID, "admin").
-		First(&caller).Error; err != nil {
-		return c.Status(http.StatusForbidden).JSON(fiber.Map{
-			"error":   "forbidden",
-			"message": "Only group admins can change member roles",
-		})
-	}
+	// Every check and the write happen under the group lock (see lockGroup): two
+	// admins demoting each other at once would otherwise both succeed and leave
+	// nobody in charge, and a caller demoted a moment ago must not act.
+	var status int
+	var refusal fiber.Map
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		chat, found, err := lockGroup(tx, chatID)
+		if err != nil {
+			return err
+		}
 
-	var chat models.Chat
-	if err := database.DB.Where("id = ?", chatID).First(&chat).Error; err != nil {
-		return c.Status(http.StatusNotFound).JSON(fiber.Map{
-			"error":   "group not found",
-			"message": "Group not found",
-		})
-	}
-	if chat.OwnerID.String() == memberID {
-		return c.Status(http.StatusForbidden).JSON(fiber.Map{
-			"error":   "forbidden",
-			"message": "The group owner's role cannot be changed",
-		})
-	}
+		// Caller must be an active admin of this group.
+		var caller models.ChatParticipant
+		if err := tx.
+			Where("chat_id = ? AND user_id = ? AND role = ? AND left_at IS NULL", chatID, userID, "admin").
+			First(&caller).Error; err != nil {
+			status, refusal = http.StatusForbidden, fiber.Map{
+				"error":   "forbidden",
+				"message": "Only group admins can change member roles",
+			}
+			return errLifecycleRefused
+		}
 
-	// Target must actually still be in the group.
-	var target models.ChatParticipant
-	if err := database.DB.
-		Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, memberID).
-		First(&target).Error; err != nil {
-		return c.Status(http.StatusNotFound).JSON(fiber.Map{
-			"error":   "not found",
-			"message": "That person is not a member of this group",
-		})
-	}
+		if !found {
+			status, refusal = http.StatusNotFound, fiber.Map{
+				"error":   "group not found",
+				"message": "Group not found",
+			}
+			return errLifecycleRefused
+		}
+		if chat.OwnerID.String() == memberID {
+			status, refusal = http.StatusForbidden, fiber.Map{
+				"error":   "forbidden",
+				"message": "The group owner's role cannot be changed",
+			}
+			return errLifecycleRefused
+		}
 
-	if err := database.DB.Model(&models.ChatParticipant{}).
-		Where("chat_id = ? AND user_id = ?", chatID, memberID).
-		Update("role", role).Error; err != nil {
+		// Target must actually still be in the group.
+		var target models.ChatParticipant
+		if err := tx.
+			Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, memberID).
+			First(&target).Error; err != nil {
+			status, refusal = http.StatusNotFound, fiber.Map{
+				"error":   "not found",
+				"message": "That person is not a member of this group",
+			}
+			return errLifecycleRefused
+		}
+
+		// The last active admin cannot step down: that would leave nobody able to
+		// administer the group - the rule LeaveGroup applies to leaving. Only the
+		// caller can be that admin; demoting anyone else leaves the caller in place.
+		if role == "member" && lastActiveAdmin(tx, chatID, target.UserID) {
+			status, refusal = http.StatusForbidden, fiber.Map{
+				"error":   "forbidden",
+				"message": "A group must keep at least one active admin",
+			}
+			return errLifecycleRefused
+		}
+
+		return tx.Model(&models.ChatParticipant{}).
+			Where("chat_id = ? AND user_id = ?", chatID, memberID).
+			Update("role", role).Error
+	}); err != nil {
+		if errors.Is(err, errLifecycleRefused) {
+			return c.Status(status).JSON(refusal)
+		}
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 			"error":   "internal error",
 			"message": "Failed to update member role",
@@ -725,9 +866,20 @@ func (s *GroupService) DeleteGroup(c *fiber.Ctx) error {
 			"message": "Only the group owner can delete this group",
 		})
 	}
-
 	now := time.Now()
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		// The group lock first, as every membership change takes it (see
+		// lockGroup) - one lock order, so this cannot deadlock against a leave.
+		if _, _, err := lockGroup(tx, chatID); err != nil {
+			return err
+		}
+		// ...and the owner must still be in the group, checked under that lock.
+		// Leaving does not change owner_id, so the match above alone would let an
+		// owner who left - even a moment ago - delete the group for everyone.
+		var participant models.ChatParticipant
+		if err := tx.Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, userID).First(&participant).Error; err != nil {
+			return errLifecycleRefused
+		}
 		if err := tx.Model(&models.ChatParticipant{}).
 			Where("chat_id = ? AND left_at IS NULL", chatID).
 			Update("left_at", now).Error; err != nil {
@@ -740,6 +892,12 @@ func (s *GroupService) DeleteGroup(c *fiber.Ctx) error {
 		}
 		return tx.Where("id = ?", chatID).Delete(&models.Chat{}).Error
 	})
+	if errors.Is(err, errLifecycleRefused) {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": "Only the group owner can delete this group",
+		})
+	}
 	if err != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 			"error":   "internal error",
@@ -759,36 +917,68 @@ func (s *GroupService) LeaveGroup(c *fiber.Ctx) error {
 	chatID := c.Params("chat_id")
 	userID := middleware.GetCurrentUserID(c)
 
-	// Check if user is a member
-	var participant models.ChatParticipant
-	if err := database.DB.Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, userID).First(&participant).Error; err != nil {
-		return c.Status(http.StatusNotFound).JSON(fiber.Map{
-			"error":   "not found",
-			"message": "You are not a member of this group",
-		})
+	// Canonical form: the group lock below is taken on chats.id, which is text,
+	// so another spelling of the id would find no row to lock.
+	if id, err := uuid.Parse(chatID); err == nil {
+		chatID = id.String()
 	}
 
-	// Check if user is the owner
-	if participant.Role == "admin" {
-		// Find another admin to transfer ownership
-		var owner models.ChatParticipant
-		if err := database.DB.Where("chat_id = ? AND role = ? AND user_id != ?", chatID, "admin", userID).First(&owner).Error; err != nil {
-			return c.Status(http.StatusForbidden).JSON(fiber.Map{
-				"error":   "forbidden",
-				"message": "Group owner cannot leave while still being the only admin. Transfer ownership first.",
-			})
-		}
-		// Transfer ownership
-		database.DB.Model(&models.ChatParticipant{}).
-			Where("chat_id = ? AND user_id = ?", chatID, owner.UserID).
-			Update("role", "admin")
-	}
-
-	// Leave the group. The departing member's encrypted history archives for
-	// this chat go in the same transaction: left_at is an UPDATE, so no foreign
-	// key can observe the departure, and an archive left behind would keep a
-	// decryptable copy of a chat the user is no longer in.
+	// The membership check, the only-admin rule and the departure are one
+	// transaction opened by the group lock (see lockGroup): the last two admins
+	// leaving at once must not both see the other still in charge and both go.
+	var status int
+	var refusal fiber.Map
 	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		chat, found, err := lockGroup(tx, chatID)
+		if err != nil {
+			return err
+		}
+
+		// Check if user is a member
+		var participant models.ChatParticipant
+		if err := tx.Where("chat_id = ? AND user_id = ? AND left_at IS NULL", chatID, userID).First(&participant).Error; err != nil {
+			status, refusal = http.StatusNotFound, fiber.Map{
+				"error":   "not found",
+				"message": "You are not a member of this group",
+			}
+			return errLifecycleRefused
+		}
+
+		// Check if user is the owner
+		if participant.Role == "admin" {
+			// Find another admin to transfer ownership - one who is still in the
+			// group: a departed admin holds no authority and cannot stand in.
+			var owner models.ChatParticipant
+			if err := tx.Where("chat_id = ? AND role = ? AND user_id != ? AND left_at IS NULL", chatID, "admin", userID).First(&owner).Error; err != nil {
+				status, refusal = http.StatusForbidden, fiber.Map{
+					"error":   "forbidden",
+					"message": "Group owner cannot leave while still being the only admin. Transfer ownership first.",
+				}
+				return errLifecycleRefused
+			}
+			// Transfer ownership
+			if err := tx.Model(&models.ChatParticipant{}).
+				Where("chat_id = ? AND user_id = ?", chatID, owner.UserID).
+				Update("role", "admin").Error; err != nil {
+				return err
+			}
+		}
+
+		// The owner may not leave the group while they are its owner (see
+		// msgOwnerCannotLeave). Checked after the only-admin rule, so an owner who
+		// is also the only admin keeps getting that existing, more specific answer.
+		if found && chat.OwnerID == userID {
+			status, refusal = http.StatusForbidden, fiber.Map{
+				"error":   "forbidden",
+				"message": msgOwnerCannotLeave,
+			}
+			return errLifecycleRefused
+		}
+
+		// Leave the group. The departing member's encrypted history archives for
+		// this chat go in the same transaction: left_at is an UPDATE, so no foreign
+		// key can observe the departure, and an archive left behind would keep a
+		// decryptable copy of a chat the user is no longer in.
 		if err := tx.Model(&models.ChatParticipant{}).
 			Where("chat_id = ? AND user_id = ?", chatID, userID).
 			Update("left_at", time.Now()).Error; err != nil {
@@ -796,11 +986,16 @@ func (s *GroupService) LeaveGroup(c *fiber.Ctx) error {
 		}
 		return models.PurgeArchivesForParticipant(tx, chatID, userID)
 	}); err != nil {
+		if errors.Is(err, errLifecycleRefused) {
+			return c.Status(status).JSON(refusal)
+		}
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 			"error":   "internal error",
 			"message": "Failed to leave group",
 		})
 	}
+
+	evictFromChatRoom(s.hub, chatID, userID)
 
 	s.bumpKeyEpoch(chatID)
 
@@ -827,9 +1022,9 @@ func (s *GroupService) UpdateGroup(c *fiber.Ctx) error {
 		})
 	}
 
-	// Check if user is admin
+	// Check if user is an admin who is still in the group
 	var participant models.ChatParticipant
-	if err := database.DB.Where("chat_id = ? AND user_id = ? AND role = ?", chatID, userID, "admin").First(&participant).Error; err != nil {
+	if err := database.DB.Where("chat_id = ? AND user_id = ? AND role = ? AND left_at IS NULL", chatID, userID, "admin").First(&participant).Error; err != nil {
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{
 			"error":   "forbidden",
 			"message": "Only group admins can update group info",

@@ -209,5 +209,9 @@ func (h *AuthService) ClaimQRLogin(c *fiber.Ctx) error {
 	// Same tokens a password login would issue. The E2EE vault still has to be
 	// unlocked separately on this device — signing in never grants message
 	// access on its own.
-	return issueLoginTokens(c, user, cfg)
+	// No recovery authority: QR sign-in is approved by a device that is already
+	// signed in, so it proves nothing about the password or the second factor -
+	// and it is unavailable to the very user this policy exists for, the one who
+	// has lost every device.
+	return issueLoginTokens(c, user, cfg, false)
 }

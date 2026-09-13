@@ -81,6 +81,7 @@ func (iv *deleteInterleaver) resume() { close(iv.release) }
 // so the interleavings under test are the handlers' own, not the guard's.
 func gate14Devices(userID uuid.UUID) (*fiber.App, *E2EEHandler) {
 	app, h := gate13App(userID)
+	app.Post("/devices/challenge", h.CreateDeviceChallenge)
 	app.Post("/devices", h.RegisterDevice)
 	app.Get("/devices", h.ListDevices)
 	app.Post("/devices/:device_id/revoke", h.RevokeDevice)

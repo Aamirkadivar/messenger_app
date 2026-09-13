@@ -1,6 +1,7 @@
 #include "authservice.h"
 #include <QCryptographicHash>
 #include "../crypto/doubleratchet.h"
+#include "../crypto/historykeyringhttp.h"
 #include "../utils/pairingqr.h"
 #include <QNetworkRequest>
 #include <QNetworkReply>
@@ -106,6 +107,145 @@ QString AuthService::authToken() const {
     return CredentialManager::instance().getToken(QStringLiteral("access_token"));
 }
 
+namespace {
+// The AAD domain Android uses for the device-local keyring copy
+// (E2EEVaultRepository.historyKeyringAad). Binding the account means one account's keyring cannot
+// be opened as another's, and the domain is distinct from the vault body's and the recovery blob's.
+QByteArray historyKeyringAad(const QString& userId) {
+    return QStringLiteral("history-keyring|%1|%2|%3")
+        .arg(userId)
+        .arg(1) // keyring AAD version, pinned in Phase 32
+        .arg(QLatin1String(VaultCrypto::SUITE_VAULT_AEAD))
+        .toUtf8();
+}
+
+// The AAD domain for the SERVER-STORED recovery blob
+// (Android's E2EEVaultRepository.historyKeyringRecoveryAad).
+//
+// Deliberately distinct from the local copy's: the two protect the same plaintext but live in
+// different places with different exposure, and a shared domain would let one be substituted for
+// the other. Both are sealed under MK, so only the domain keeps a vault body, a local keyring and a
+// recovery blob from ever being confused.
+QByteArray historyKeyringRecoveryAad(const QString& userId) {
+    return QStringLiteral("history_keyring_recovery_v1|%1|%2")
+        .arg(userId, QLatin1String(VaultCrypto::SUITE_VAULT_AEAD))
+        .toUtf8();
+}
+} // namespace
+
+bool AuthService::sealHistoryKeyring(const QByteArray& plaintext, QByteArray& sealedOut) const {
+    // No master key means the vault is locked. Fail rather than persist anything unsealed.
+    if (m_sessionMk.isEmpty() || m_currentUserId.isEmpty()) return false;
+    sealedOut = VaultCrypto::sealXChaCha(m_sessionMk, plaintext, historyKeyringAad(m_currentUserId));
+    return !sealedOut.isEmpty();
+}
+
+bool AuthService::openHistoryKeyring(const QByteArray& sealed, QByteArray& plainOut) const {
+    if (m_sessionMk.isEmpty() || m_currentUserId.isEmpty()) return false;
+    plainOut = VaultCrypto::openXChaCha(m_sessionMk, sealed, historyKeyringAad(m_currentUserId));
+    return !plainOut.isEmpty();
+}
+
+bool AuthService::sealHistoryKeyringForRecovery(const QByteArray& plaintext,
+                                                QByteArray& sealedOut) const {
+    if (m_sessionMk.isEmpty() || m_currentUserId.isEmpty()) return false;
+    sealedOut = VaultCrypto::sealXChaCha(m_sessionMk, plaintext,
+                                         historyKeyringRecoveryAad(m_currentUserId));
+    return !sealedOut.isEmpty();
+}
+
+bool AuthService::openHistoryKeyringFromRecovery(const QByteArray& sealed,
+                                                 QByteArray& plainOut) const {
+    if (m_sessionMk.isEmpty() || m_currentUserId.isEmpty()) return false;
+    plainOut = VaultCrypto::openXChaCha(m_sessionMk, sealed,
+                                        historyKeyringRecoveryAad(m_currentUserId));
+    return !plainOut.isEmpty();
+}
+
+HistoryKeyringRepository* AuthService::historyKeyring() {
+    if (m_currentUserId.isEmpty()) return nullptr;
+    if (!m_historyKeyring) {
+        m_keyringProtector = std::make_unique<DpapiProtector>();
+        m_keyringStore = std::make_unique<RegistryHistoryKeyringStore>(m_keyringProtector.get());
+        m_historyKeyring = std::make_unique<HistoryKeyringRepository>(
+            m_keyringStore.get(),
+            [this](const QByteArray& plain, QByteArray& out) {
+                return sealHistoryKeyring(plain, out);
+            },
+            [this](const QByteArray& sealed, QByteArray& out) {
+                return openHistoryKeyring(sealed, out);
+            },
+            nullptr, // default CSPRNG root generation
+            // Lets a locked vault be refused before any root material is drawn.
+            [this]() { return isVaultUnlocked(); });
+    }
+    return m_historyKeyring.get();
+}
+
+bool AuthService::ensureHistoryRoot(const QString& chatId, HistoryRootEntry& out, QString* error) {
+    HistoryKeyringRepository* repo = historyKeyring();
+    if (!repo) {
+        if (error) *error = QStringLiteral("no signed-in account");
+        return false;
+    }
+    // m_currentUserId, never a caller-supplied id: that is the whole point of this wrapper.
+    return repo->ensureRoot(m_currentUserId, chatId, out, error);
+}
+
+bool AuthService::loadHistoryKeyring(HistoryKeyring& out, QString* error) {
+    HistoryKeyringRepository* repo = historyKeyring();
+    if (!repo) {
+        if (error) *error = QStringLiteral("no signed-in account");
+        return false;
+    }
+    return repo->load(m_currentUserId, out, error);
+}
+
+bool AuthService::findHistoryRoot(const QString& chatId, int rootVersion,
+                                 HistoryRootEntry& out, QString* error) {
+    HistoryKeyring keyring;
+    if (!loadHistoryKeyring(keyring, error)) return false;
+    if (!keyring.find(chatId, rootVersion, out)) {
+        if (error) {
+            *error = QStringLiteral("this device does not hold root version %1 for the chat")
+                         .arg(rootVersion);
+        }
+        return false;
+    }
+    return true;
+}
+
+HistoryArchiver AuthService::historyArchiver() {
+    // All three ports come from this service, so the archiver inherits the account authority the
+    // keyring wrappers already enforce - there is no way for a caller to substitute an identity.
+    return HistoryArchiver(
+        [this](const QString& chatId, HistoryRootEntry& out, QString* err) {
+            return ensureHistoryRoot(chatId, out, err);
+        },
+        [this](const QString& chatId, int rootVersion, HistoryRootEntry& out, QString* err) {
+            return findHistoryRoot(chatId, rootVersion, out, err);
+        },
+        [this]() { return m_currentUserId; });
+}
+
+ArchiveRepository AuthService::archiveRepository() {
+    // The same authenticated exchange the keyring uses; one JSON transport for both Layer B paths.
+    return ArchiveRepository(makeKeyringExchange(
+        m_networkManager,
+        [this]() { return authToken(); },
+        [this]() { return getOrCreateDeviceId(); }));
+}
+
+HistoryKeyringTransport AuthService::historyKeyringTransport() {
+    // authToken() rather than m_accessToken directly, so a session restored from the credential
+    // store is authenticated too. The device id comes from the one per-install source already used
+    // for X-Device-Id on every other request.
+    return HistoryKeyringTransport(makeKeyringExchange(
+        m_networkManager,
+        [this]() { return authToken(); },
+        [this]() { return getOrCreateDeviceId(); }));
+}
+
 void AuthService::login(const QString& email, const QString& password) {
     m_pendingVaultPassword = password;
     QString url = Config::apiBaseUrl() + QStringLiteral("/auth/login");
@@ -137,6 +277,12 @@ void AuthService::registerUser(const QString& username, const QString& email, co
     connect(reply, &QNetworkReply::finished, this, &AuthService::onRegisterReplyFinished);
 }
 
+void AuthService::clearPendingRefresh() {
+    CredentialManager::instance().deleteToken(QStringLiteral("pending_refresh_user"));
+    CredentialManager::instance().deleteToken(QStringLiteral("pending_refresh_token"));
+    CredentialManager::instance().deleteToken(QStringLiteral("pending_refresh_request_id"));
+}
+
 void AuthService::logout() {
     m_accessToken.clear();
     m_refreshToken.clear();
@@ -153,6 +299,9 @@ void AuthService::logout() {
     CredentialManager::instance().deleteToken(QStringLiteral("access_token"));
     CredentialManager::instance().deleteToken(QStringLiteral("refresh_token"));
     CredentialManager::instance().deleteToken(QStringLiteral("current_user"));
+    // Any in-flight refresh belongs to the session being torn down.
+    clearPendingRefresh();
+    m_refreshInFlight = false;
 
     // Notify QML bindings (isLoggedIn/currentUserId/currentUsername) so the UI
     // actually returns to the login screen - without these the property
@@ -297,10 +446,53 @@ void AuthService::regenerateTotpBackupCodes(const QString& password, const QStri
 }
 
 void AuthService::refreshToken() {
-    QString refreshTokenVal = CredentialManager::instance().getToken(QStringLiteral("refresh_token"));
+    // Single-flight. A second caller while a rotation is on the wire must NOT
+    // start its own: two overlapping rotations send two request_ids for one
+    // credential, the second is a new logical refresh, and once the first
+    // successor has been spent the server reads the other as a fork and revokes
+    // the session. The WebSocket reconnect loop and the UI can both ask, so this
+    // is a live possibility rather than a theoretical one.
+    if (m_refreshInFlight) {
+        return;
+    }
+
+    // Resume an interrupted refresh rather than beginning a new one.
+    //
+    // The pending record is the old credential plus the request_id it was sent
+    // with. If a previous attempt reached the server and its reply was lost, the
+    // server has already consumed that token and cached the successor for 60
+    // seconds under that id; resending both is the only way to recover it. A
+    // fresh id would start a second logical refresh instead.
+    //
+    // Scoped to the account, so a record left by a previous user is never
+    // replayed on behalf of the current one.
+    const QString currentUser = m_currentUserId;
+    QString pendingUser  = CredentialManager::instance().getToken(QStringLiteral("pending_refresh_user"));
+    QString pendingToken = CredentialManager::instance().getToken(QStringLiteral("pending_refresh_token"));
+    QString pendingReqId = CredentialManager::instance().getToken(QStringLiteral("pending_refresh_request_id"));
+
+    const bool resumable = !pendingToken.isEmpty() && !pendingReqId.isEmpty()
+                           && pendingUser == currentUser;
+
+    QString refreshTokenVal = resumable
+        ? pendingToken
+        : CredentialManager::instance().getToken(QStringLiteral("refresh_token"));
     if (refreshTokenVal.isEmpty()) {
         emit loginFailed(QStringLiteral("No refresh token"));
         return;
+    }
+
+    QString requestId = resumable
+        ? pendingReqId
+        : QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    if (!resumable) {
+        // Persist BEFORE sending. The window this closes is exactly the one
+        // where the server commits and the reply never arrives, which the
+        // process may not survive.
+        CredentialManager::instance().saveToken(QStringLiteral("pending_refresh_user"), currentUser);
+        CredentialManager::instance().saveToken(QStringLiteral("pending_refresh_token"), refreshTokenVal);
+        CredentialManager::instance().saveToken(QStringLiteral("pending_refresh_request_id"), requestId);
     }
 
     QString url = Config::apiBaseUrl() + QStringLiteral("/auth/refresh");
@@ -311,7 +503,9 @@ void AuthService::refreshToken() {
 
     QJsonObject data;
     data[QStringLiteral("refresh_token")] = refreshTokenVal;
+    data[QStringLiteral("request_id")] = requestId;
 
+    m_refreshInFlight = true;
     QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(data).toJson());
     connect(reply, &QNetworkReply::finished, this, &AuthService::onRefreshReplyFinished);
 }
@@ -324,6 +518,38 @@ QString AuthService::e2eePrivateKey() const {
 QString AuthService::e2eePublicKey() const {
     if (m_currentUserId.isEmpty()) return QString();
     return CredentialManager::instance().getToken(QStringLiteral("e2ee_pub_%1").arg(m_currentUserId));
+}
+
+QString AuthService::e2eeDevicePrivateKey() const {
+    if (m_currentUserId.isEmpty()) return QString();
+    return CredentialManager::instance().getToken(
+        QStringLiteral("e2ee_device_priv_%1").arg(m_currentUserId));
+}
+
+QString AuthService::e2eeDevicePublicKey() const {
+    if (m_currentUserId.isEmpty()) return QString();
+    return CredentialManager::instance().getToken(
+        QStringLiteral("e2ee_device_pub_%1").arg(m_currentUserId));
+}
+
+void AuthService::ensureDeviceKey() {
+    if (m_currentUserId.isEmpty()) return;
+    if (!e2eeDevicePrivateKey().isEmpty() && !e2eeDevicePublicKey().isEmpty()) return;
+
+    // Deliberately NOT derived from anything. Not from the account key, not from
+    // the vault, not from the recovery key - a device identity that can be
+    // recomputed from account material is an account identity wearing a different
+    // name, which is the whole defect this replaces.
+    QString pub, priv;
+    if (!Encryption::boxKeyPair(pub, priv)) {
+        qWarning() << "[E2EE] Failed to generate a device keypair";
+        return;
+    }
+    CredentialManager::instance().saveToken(
+        QStringLiteral("e2ee_device_priv_%1").arg(m_currentUserId), priv);
+    CredentialManager::instance().saveToken(
+        QStringLiteral("e2ee_device_pub_%1").arg(m_currentUserId), pub);
+    qDebug() << "[E2EE] Generated K_device for" << m_currentUserId;
 }
 
 void AuthService::ensureE2EEKeysAndPublish(bool allowTakeover) {
@@ -457,6 +683,13 @@ void AuthService::uploadNewVault() {
         finishLoginAfterVault();
         return;
     }
+
+    // BEFORE the write, not after. PUT /e2ee/vault is device-gated from Phase 67,
+    // and enrolment used to run only in this request's success handler - so on a
+    // fresh account the create would be refused and the enrolment that would have
+    // fixed it would never run. K_device needs no vault, so enrolling first is
+    // both possible and the correct order.
+    registerE2EEDevice();
 
     VaultCrypto::BuiltVault built;
     if (!VaultCrypto::createVault(m_currentUserId, m_pendingVaultPassword, pub, priv, built, 1,
@@ -663,31 +896,74 @@ void AuthService::restoreVaultMaterial(const VaultCrypto::VaultPlaintext& plain)
 }
 
 void AuthService::registerE2EEDevice() {
-    if (m_currentUserId.isEmpty() || m_accessToken.isEmpty()) return;
-    const QString pub = e2eePublicKey();
-    if (pub.isEmpty()) return;
+    if (m_currentUserId.isEmpty() || authToken().isEmpty()) return;
 
-    QJsonObject body;
-    body[QStringLiteral("device_id")] = getOrCreateDeviceId();
-    body[QStringLiteral("name")] = QSysInfo::prettyProductName();
-    body[QStringLiteral("platform")] = QStringLiteral("windows");
-    body[QStringLiteral("public_key")] = pub;
+    // Phase 44: registration is no longer an assertion. The server issues a challenge sealed to the
+    // key being registered and only marks the device verified - and binds this session to it - once
+    // the challenge comes back opened. A device that cannot open it never becomes authorized, which
+    // is what stops a stolen token from minting an identity and reading history with it.
+    //
+    // Phase 67: the proof now uses K_device, which this machine generates for itself and which does
+    // not live in the vault. So enrolment no longer waits for an unlock - and that is what dissolves
+    // the Phase 60 deadlock, where the vault could not be created because the device was not
+    // authorized and the device could not be authorized because the vault was locked.
+    ensureDeviceKey();
+    const DeviceEnrollment::Result r = deviceEnrollment().enroll(
+        getOrCreateDeviceId(), QSysInfo::prettyProductName(), QStringLiteral("windows"));
 
-    QUrl url(Config::apiBaseUrl() + QStringLiteral("/e2ee/devices"));
-    QNetworkRequest request(url);
-    request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json").toUtf8());
-    request.setRawHeader("Authorization", ("Bearer " + m_accessToken).toUtf8());
-    request.setRawHeader("X-Device-Id", getOrCreateDeviceId().toUtf8());
+    switch (r.outcome) {
+    case DeviceEnrollment::Outcome::Ok:
+        qDebug() << "[E2EE] Device verified" << (r.created ? "(new)" : "(existing)");
+        emit deviceEnrolled();
+        break;
+    case DeviceEnrollment::Outcome::Locked:
+        qDebug() << "[E2EE] Device enrolment deferred: vault locked";
+        break;
+    case DeviceEnrollment::Outcome::Refused:
+        qWarning() << "[E2EE] Device enrolment refused by the server";
+        break;
+    default:
+        qWarning() << "[E2EE] Device enrolment did not complete";
+        break;
+    }
+}
 
-    QNetworkReply* reply = m_networkManager->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, reply, [reply]() {
-        if (reply->error() != QNetworkReply::NoError) {
-            qWarning() << "[E2EE] Device register failed:" << reply->errorString();
-        } else {
-            qDebug() << "[E2EE] Device registered";
-        }
-        reply->deleteLater();
-    });
+DeviceEnrollment AuthService::deviceEnrollment() {
+    return DeviceEnrollment(
+        makeKeyringExchange(m_networkManager,
+                            [this]() { return authToken(); },
+                            [this]() { return getOrCreateDeviceId(); }),
+        [this]() { return e2eeDevicePublicKey(); },
+        [this]() { return e2eeDevicePrivateKey(); });
+}
+
+HistoryKeyringRecovery AuthService::historyKeyringRecovery() {
+    return HistoryKeyringRecovery(
+        historyKeyringTransport(),
+        historyKeyring(),
+        [this](const QByteArray& sealed, QByteArray& plainOut) {
+            return openHistoryKeyringFromRecovery(sealed, plainOut);
+        },
+        [this]() { return m_currentUserId; });
+}
+
+void AuthService::recoverHistoryKeyring() {
+    // The earliest point at which account identity, a verified device and MK are all available is
+    // after unlock, which is where this is called from. One attempt per session: recovery is
+    // convergent, so repeating it merges the same roots and changes nothing.
+    if (m_historyRecoveryAttempted) return;
+    if (m_sessionMk.isEmpty() || m_currentUserId.isEmpty()) return;
+    m_historyRecoveryAttempted = true;
+
+    const HistoryKeyringRecovery::Result r = historyKeyringRecovery().recover();
+    if (!r.ok()) {
+        // A transient failure must not disable recovery for the whole session.
+        m_historyRecoveryAttempted = false;
+        qWarning() << "[E2EE] History keyring recovery incomplete:" << r.error;
+        return;
+    }
+    qDebug() << "[E2EE] History keyring recovery:" << r.recoveredEntries << "entries seen,"
+             << (r.imported ? "roots imported" : "already current");
 }
 
 void AuthService::rememberSession(const QByteArray& mk, int version, const QJsonObject& vaultJson) {
@@ -695,12 +971,28 @@ void AuthService::rememberSession(const QByteArray& mk, int version, const QJson
     m_sessionVaultVersion = version;
     m_sessionVaultMeta = vaultJson;
     if (m_vaultPullTimer) m_vaultPullTimer->start();
+
+    // LAST, and in this order, deliberately.
+    //
+    // Enrolment needs the identity private key, which only exists once the vault is open, and
+    // recovery needs BOTH a verified device (the keyring endpoint is device-gated) and MK (to open
+    // the blob). This is the first moment all three are true, so it is the first moment either can
+    // succeed. Running them before the assignments above would race a locked vault.
+    registerE2EEDevice();
+    recoverHistoryKeyring();
 }
 
 void AuthService::clearVaultSession() {
     if (m_vaultRefreshTimer) m_vaultRefreshTimer->stop();
     if (m_vaultPullTimer) m_vaultPullTimer->stop();
+    // Drop the opened keyring: it is plaintext roots held for the account being torn down, and the
+    // next account must not find them sitting in memory. The durable copies are account-scoped and
+    // stay put, so this costs only a re-read. The repository itself is kept - it holds no secret of
+    // its own once this is called.
+    if (m_historyKeyring) m_historyKeyring->forgetInMemory();
     m_sessionMk.clear();
+    // The next sign-in is a different session and must recover again.
+    m_historyRecoveryAttempted = false;
     m_sessionVaultVersion = 0;
     m_sessionVaultMeta = QJsonObject();
     m_pairingEphPriv.clear();
@@ -1715,6 +2007,8 @@ void AuthService::onRefreshReplyFinished() {
     QNetworkReply* reply = qobject_cast<QNetworkReply*>(sender());
     if (!reply) return;
 
+    m_refreshInFlight = false;
+
     if (reply->error() == QNetworkReply::NoError) {
         QJsonObject obj = QJsonDocument::fromJson(reply->readAll()).object();
 
@@ -1723,17 +2017,25 @@ void AuthService::onRefreshReplyFinished() {
         QJsonObject tokensObj = tokensVal.isObject() ? tokensVal.toObject() : obj;
         m_accessToken = tokensObj.value(QStringLiteral("access_token")).toString();
         QString newRefresh = tokensObj.value(QStringLiteral("refresh_token")).toString();
+
+        // Successor first, pending record last. The order matters: if the process
+        // dies midway the client still holds the old credential and its
+        // request_id, so the retry recovers the same successor from the cache.
+        // It must never end up having discarded both.
         if (!newRefresh.isEmpty()) {
             CredentialManager::instance().saveToken(QStringLiteral("refresh_token"), newRefresh);
         }
         CredentialManager::instance().saveToken(QStringLiteral("access_token"), m_accessToken);
+        clearPendingRefresh();
         emit tokenReady(m_accessToken);
     } else {
         int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         if (httpStatus == 401 || httpStatus == 403) {
-            // The server actually looked at the refresh token and rejected
-            // it (expired/revoked) - there's no way to recover without a
-            // fresh login.
+            // The server looked at the credential and refused it. Retrying cannot
+            // help - either the 60s replay window closed or the session is gone -
+            // so drop the pending record rather than resending an id the server
+            // has forgotten.
+            clearPendingRefresh();
             emit loginFailed(QStringLiteral("Session expired. Please log in again."));
             logout();
         } else {
@@ -1741,7 +2043,14 @@ void AuthService::onRefreshReplyFinished() {
             // refresh token is probably still fine, so don't wipe a good
             // session over a network blip. Whoever asked for the refresh
             // (WebSocketService's reconnect loop) will just try again later.
-            qWarning() << "[AuthService] Token refresh failed (network):" << reply->errorString();
+            // Never reached the server, or the reply was lost. KEEP the pending
+            // record: the next attempt must retry this same logical refresh with
+            // the same token and the same request_id, which is what recovers a
+            // rotation the server already committed. This preserves the existing
+            // behaviour of not wiping a good session over a network blip, and
+            // upgrades the retry from a fresh rotation to a recoverable one.
+            qWarning() << "[AuthService] Token refresh failed (network):" << reply->errorString()
+                       << "- pending refresh retained for retry";
         }
     }
     reply->deleteLater();

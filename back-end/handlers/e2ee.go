@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"time"
 
@@ -299,13 +300,6 @@ func (h *E2EEHandler) GetVaultVersions(c *fiber.Ctx) error {
 	})
 }
 
-type deviceBody struct {
-	DeviceID  string `json:"device_id"`
-	Name      string `json:"name"`
-	Platform  string `json:"platform"`
-	PublicKey string `json:"public_key"`
-}
-
 // ListDevices GET /e2ee/devices
 func (h *E2EEHandler) ListDevices(c *fiber.Ctx) error {
 	userID := middleware.GetCurrentUserID(c)
@@ -358,105 +352,6 @@ func (h *E2EEHandler) ListChatDevices(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"devices": out})
 }
 
-// RegisterDevice POST /e2ee/devices
-func (h *E2EEHandler) RegisterDevice(c *fiber.Ctx) error {
-	userID := middleware.GetCurrentUserID(c)
-	var body deviceBody
-	if err := c.BodyParser(&body); err != nil || body.DeviceID == "" {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "device_id required"})
-	}
-	now := time.Now()
-	var (
-		device  models.E2EEDevice
-		created bool
-		revoked bool
-	)
-	txErr := database.DB.Transaction(func(tx *gorm.DB) error {
-		var existing models.E2EEDevice
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("user_id = ? AND device_id = ?", userID, body.DeviceID).
-			First(&existing).Error
-
-		switch {
-		case err == nil:
-			// Authoritative state, re-read while holding the row lock. A
-			// revocation that committed before the lock was granted is visible
-			// here, so the pre-lock snapshot can no longer decide this branch.
-			if existing.RevokedAt != nil {
-				revoked = true
-				return errDeviceRevoked
-			}
-			// Column-scoped update, never a whole-struct Save: this statement
-			// writes only the fields registration owns, so revoked_at cannot be
-			// carried back to NULL from an in-memory copy. The redundant
-			// revoked_at IS NULL predicate keeps the precondition in the same
-			// statement as the write rather than only in the lock.
-			updates := map[string]interface{}{
-				"name":         body.Name,
-				"platform":     body.Platform,
-				"last_seen_at": now,
-				"updated_at":   now,
-			}
-			if body.PublicKey != "" {
-				updates["public_key"] = body.PublicKey
-			}
-			res := tx.Model(&models.E2EEDevice{}).
-				Where("id = ? AND revoked_at IS NULL", existing.ID).
-				Updates(updates)
-			if res.Error != nil {
-				return res.Error
-			}
-			if res.RowsAffected == 0 {
-				// Only reachable if the row stopped being active despite the
-				// lock; treat exactly as a revoked device rather than guessing.
-				revoked = true
-				return errDeviceRevoked
-			}
-			existing.Name = body.Name
-			existing.Platform = body.Platform
-			if body.PublicKey != "" {
-				existing.PublicKey = body.PublicKey
-			}
-			existing.LastSeenAt = &now
-			existing.UpdatedAt = now
-			device = existing
-			return nil
-
-		case errors.Is(err, gorm.ErrRecordNotFound):
-			d := models.E2EEDevice{
-				ID:         uuid.New(),
-				UserID:     userID,
-				DeviceID:   body.DeviceID,
-				Name:       body.Name,
-				Platform:   body.Platform,
-				PublicKey:  body.PublicKey,
-				LastSeenAt: &now,
-				CreatedAt:  now,
-				UpdatedAt:  now,
-			}
-			if err := tx.Create(&d).Error; err != nil {
-				return err
-			}
-			device = d
-			created = true
-			return nil
-
-		default:
-			return err
-		}
-	})
-
-	if revoked {
-		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "device revoked"})
-	}
-	if txErr != nil {
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "failed to register device"})
-	}
-	if created {
-		return c.Status(http.StatusCreated).JSON(fiber.Map{"device": device})
-	}
-	return c.JSON(fiber.Map{"device": device})
-}
 
 // RevokeDevice POST /e2ee/devices/:device_id/revoke
 func (h *E2EEHandler) RevokeDevice(c *fiber.Ctx) error {
@@ -468,15 +363,50 @@ func (h *E2EEHandler) RevokeDevice(c *fiber.Ctx) error {
 	// removes that whole class. Absence of a revoked_at IS NULL predicate is
 	// deliberate: re-revoking an existing device stays a 200 as before.
 	now := time.Now()
-	res := database.DB.Model(&models.E2EEDevice{}).
-		Where("user_id = ? AND device_id = ?", userID, deviceID).
-		Updates(map[string]interface{}{"revoked_at": now, "updated_at": now})
-	if res.Error != nil {
+	var (
+		affected   int64
+		revokedIDs []uuid.UUID
+	)
+	// The device flag and the sessions it authorizes are written in ONE
+	// transaction. Revocation only reaches a credential if the sessions row
+	// itself changes: the refresh CAS re-reads that row under lock, so a
+	// concurrent refresh either precedes this commit or observes it. Flipping
+	// only devices.revoked_at and hoping the refresh path reads it would be
+	// write skew.
+	txErr := database.DB.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&models.E2EEDevice{}).
+			Where("user_id = ? AND device_id = ?", userID, deviceID).
+			Updates(map[string]interface{}{"revoked_at": now, "updated_at": now})
+		if res.Error != nil {
+			return res.Error
+		}
+		affected = res.RowsAffected
+		if affected == 0 {
+			return nil
+		}
+		var dev models.E2EEDevice
+		if err := tx.Where("user_id = ? AND device_id = ?", userID, deviceID).
+			First(&dev).Error; err != nil {
+			return err
+		}
+		if err := tx.Raw(`SELECT id FROM sessions
+		                   WHERE user_id = ? AND device_id = ? AND revoked_at IS NULL`,
+			userID, dev.ID).Scan(&revokedIDs).Error; err != nil {
+			return err
+		}
+		// Scoped strictly to this device. Sessions with a NULL device belong to
+		// logins that never had an association and must not be swept: revoking
+		// one device may not sign a user out everywhere.
+		_, err := revokeSessionsForDevice(tx, userID, dev.ID, "device_revoke")
+		return err
+	})
+	if txErr != nil {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "lookup failed"})
 	}
-	if res.RowsAffected == 0 {
+	if affected == 0 {
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
+	kickSessions(revokedIDs)
 	if h.hub != nil {
 		h.hub.KickDevice(userID, deviceID)
 	}
@@ -500,6 +430,7 @@ func (h *E2EEHandler) DeleteDevice(c *fiber.Ctx) error {
 	// codebase: there is no cascade, cleanup job, or account-teardown path, so
 	// refusing here makes the tombstone permanent.
 	var found, revoked bool
+	var kicked []uuid.UUID
 	txErr := database.DB.Transaction(func(tx *gorm.DB) error {
 		var d models.E2EEDevice
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -515,6 +446,31 @@ func (h *E2EEHandler) DeleteDevice(c *fiber.Ctx) error {
 			revoked = true
 			return errDeviceRevoked
 		}
+		// Sessions first, delete second, both inside this transaction. The FK is
+		// ON DELETE SET NULL, and the guard trigger permits device_id -> NULL
+		// only on an ALREADY-REVOKED session.
+		//
+		// The ordering is load-bearing in both directions. Revoking first is what
+		// destroys refresh_hash and purges the response cache, so neither a
+		// credential nor a cached lost-response successor can outlive the device.
+		// And because the FK action is an ordinary UPDATE subject to that
+		// trigger, the DELETE below is REFUSED outright if any session is still
+		// live - the device cannot be removed out from under a working
+		// credential, it fails closed instead. Detachment is a consequence of
+		// deletion, never a means of preserving a live session.
+		//
+		// The sessions themselves are deliberately retained as revoked history:
+		// consumed_refresh references them with RESTRICT and is Gate 17's fork
+		// evidence, which must outlive the device that produced it.
+		if err := tx.Raw(`SELECT id FROM sessions
+		                   WHERE user_id = ? AND device_id = ? AND revoked_at IS NULL`,
+			userID, d.ID).Scan(&kicked).Error; err != nil {
+			return err
+		}
+		if _, err := revokeSessionsForDevice(tx, userID, d.ID, "device_delete"); err != nil {
+			return err
+		}
+
 		res := tx.Where("id = ? AND revoked_at IS NULL", d.ID).Delete(&models.E2EEDevice{})
 		if res.Error != nil {
 			return res.Error
@@ -538,8 +494,19 @@ func (h *E2EEHandler) DeleteDevice(c *fiber.Ctx) error {
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
 	if txErr != nil {
+		// A RESTRICT violation means something still references this device.
+		// Report it as a conflict rather than leaking a generic 500: the caller
+		// can act on "still in use", but not on "internal error".
+		if name, isConstraint := constraintViolation(txErr); isConstraint {
+			log.Printf("[e2ee] device delete blocked by %s", name)
+			return c.Status(http.StatusConflict).JSON(fiber.Map{
+				"error":   "device in use",
+				"message": "This device still has references that must be removed first.",
+			})
+		}
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "failed to delete device"})
 	}
+	kickSessions(kicked)
 	return c.JSON(fiber.Map{"message": "device deleted"})
 }
 

@@ -28,9 +28,14 @@ const (
 
 // Client represents a connected WebSocket client
 type Client struct {
-	ID       string
-	UserID   uuid.UUID
-	DeviceID string
+	ID     string
+	UserID uuid.UUID
+	// SessionID ties this socket to the session that authorized it, so
+	// revocation can close it. DeviceID cannot serve that purpose: it is
+	// client-asserted and is empty for every session created by login, 2FA or
+	// QR claim, which is to say almost all of them.
+	SessionID string
+	DeviceID  string
 	Conn     *websocket.Conn
 	Send     chan []byte
 	Rooms    map[string]bool
@@ -44,6 +49,28 @@ type Client struct {
 	// connection - and every reconnect drops the user offline long enough
 	// to make an incoming call ring against nobody.
 	writeMu sync.Mutex
+	// dropOnce makes disconnecting a client that cannot keep up idempotent.
+	dropOnce sync.Once
+}
+
+// dropSlowClient disconnects a client whose send buffer is full.
+//
+// It never touches client.Send. That channel is closed exactly once, by
+// Unregister, after the client has left the registry - the hub used to close it
+// right here while the client was still registered, so the next frame for it
+// was a send on a closed channel and its Unregister a second close: either one
+// panics the hub goroutine and takes the whole server down. Closing the
+// connection instead makes the read loop exit and Unregister run normally.
+//
+// Nothing is lost by dropping the frame: every message is persisted before it
+// is broadcast, and a reconnecting client catches up with GET /messages ?after=.
+func dropSlowClient(client *Client) {
+	client.dropOnce.Do(func() {
+		log.Printf("hub: client %s cannot keep up - disconnecting; it will catch up over HTTP", client.ID)
+		if client.Conn != nil {
+			go func() { _ = client.Conn.Close() }()
+		}
+	})
 }
 
 // writeMessage is the single serialized path for writing to a client.
@@ -175,7 +202,7 @@ func (h *Hub) Run() {
 					select {
 					case client.Send <- message:
 					default:
-						close(client.Send)
+						dropSlowClient(client)
 					}
 				})
 			} else if roomScopedTypes[wsMsg.Type] {
@@ -189,7 +216,7 @@ func (h *Hub) Run() {
 							select {
 							case client.Send <- message:
 							default:
-								close(client.Send)
+								dropSlowClient(client)
 							}
 						})
 					}
@@ -245,6 +272,57 @@ func (h *Hub) LeaveRoom(client *Client, room string) {
 	}
 }
 
+// EvictFromRoom ends every live subscription userID holds on room. A join is
+// authorized once, when it is made (canJoinRoom), so whoever ends a membership
+// calls this: without it, a socket that joined while its user was a member keeps
+// receiving the chat - and relaying typing into it - until it reconnects.
+func (h *Hub) EvictFromRoom(userID uuid.UUID, room string) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for _, c := range h.UserClients[userID] {
+		delete(c.Rooms, room)
+	}
+	if roomMembers, ok := h.Rooms[room]; ok {
+		delete(roomMembers, userID)
+	}
+}
+
+// inRoom reports whether this connection has joined room.
+func (h *Hub) inRoom(client *Client, room string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return client.Rooms[room]
+}
+
+// canJoinRoom is the authorization for subscribing to a chat's room: the room
+// must name a chat the user participates in. A group member who left stays
+// out; a direct chat's left_at only means "cleared from my list" (DeleteChat),
+// and a new message brings that chat back, so it does not bar the room.
+//
+// Room names that are not chat ids - the per-user "user:<id>" rooms the server
+// assigns on connect - can never be joined by a client. The returned room is
+// the canonical chat id, the same string SendMessage broadcasts under.
+var canJoinRoom = func(userID uuid.UUID, room string) (string, bool) {
+	chatID, err := uuid.Parse(room)
+	if err != nil {
+		return "", false
+	}
+	var n int64
+	if err := database.DB.Table("chat_participants cp").
+		Joins("JOIN chats c ON c.id = cp.chat_id::text").
+		Where("cp.chat_id = ? AND cp.user_id = ?", chatID, userID).
+		Where("(cp.left_at IS NULL OR c.type = ?)", "direct").
+		Count(&n).Error; err != nil {
+		log.Printf("ws: join authorization lookup failed for user %s: %v", userID, err)
+		return "", false
+	}
+	return chatID.String(), n > 0
+}
+
 // IsUserOnline checks if a user has any live connection.
 func (h *Hub) IsUserOnline(userID uuid.UUID) bool {
 	h.mu.RLock()
@@ -285,6 +363,33 @@ func (h *Hub) KickDevice(userID uuid.UUID, deviceID string) {
 	}
 }
 
+// KickSession closes every live WebSocket belonging to one session.
+//
+// This is the revocation path that actually covers everything. KickDevice
+// returns immediately when deviceID is empty, so it cannot see a session whose
+// device association is NULL - and that is every session login, 2FA and QR
+// claim produce. Keying on the session id closes those too.
+func (h *Hub) KickSession(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	h.mu.RLock()
+	var targets []*Client
+	for _, clients := range h.UserClients {
+		for _, c := range clients {
+			if c.SessionID == sessionID {
+				targets = append(targets, c)
+			}
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range targets {
+		_ = c.writeMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "session revoked"))
+		_ = c.Conn.Close()
+	}
+}
+
 // HandleWebSocket handles WebSocket connections
 func HandleWebSocket(hub *Hub) fiber.Handler {
 	return websocket.New(func(c *websocket.Conn) {
@@ -320,9 +425,10 @@ func HandleWebSocket(hub *Hub) fiber.Handler {
 
 		clientID := fmt.Sprintf("%s-%d", userID.String(), time.Now().UnixNano())
 		client := &Client{
-			ID:       clientID,
-			UserID:   userID,
-			DeviceID: deviceID,
+			ID:        clientID,
+			UserID:    userID,
+			SessionID: claims.SessionID.String(),
+			DeviceID:  deviceID,
 			Conn:     c,
 			Send:     make(chan []byte, 256),
 			Rooms:    make(map[string]bool),
@@ -386,9 +492,16 @@ func handleClientMessage(hub *Hub, client *Client, message []byte) {
 
 	switch wsMsg.Type {
 	case "join":
+		// A room is a subscription to a chat's ciphertext and events, so joining
+		// one is a read of that chat and needs the same authorization.
 		if data, ok := wsMsg.Data.(map[string]interface{}); ok {
 			if chatID, ok := data["chat_id"].(string); ok {
-				hub.JoinRoom(client, chatID)
+				room, allowed := canJoinRoom(client.UserID, chatID)
+				if !allowed {
+					log.Printf("ws: refused join of room %q by user %s: not a participant", chatID, client.UserID)
+					return
+				}
+				hub.JoinRoom(client, room)
 			}
 		}
 	case "leave":
@@ -397,9 +510,35 @@ func handleClientMessage(hub *Hub, client *Client, message []byte) {
 				hub.LeaveRoom(client, chatID)
 			}
 		}
-	case "message", "typing", "presence":
-		broadcastMsg, _ := json.Marshal(wsMsg)
-		hub.Broadcast <- broadcastMsg
+	case "typing":
+		// Relayed only into a room this connection is authorized for (join is
+		// checked above), and rebuilt from the three fields clients use with the
+		// sender stamped from the authenticated connection: a client names the
+		// chat and the state, never who is typing.
+		data, _ := wsMsg.Data.(map[string]interface{})
+		chatID, _ := data["chat_id"].(string)
+		if chatID == "" || !hub.inRoom(client, chatID) {
+			log.Printf("ws: dropped typing for room %q from user %s: not joined", chatID, client.UserID)
+			return
+		}
+		typing, _ := data["typing"].(bool)
+		frame, _ := json.Marshal(models.WebSocketMessage{
+			Type: "typing",
+			Data: map[string]interface{}{
+				"chat_id": chatID,
+				"user_id": client.UserID.String(),
+				"typing":  typing,
+			},
+			Timestamp: wsMsg.Timestamp,
+		})
+		hub.Broadcast <- frame
+	case "message", "presence":
+		// Not accepted from clients. A message exists only once POST /messages
+		// has authorized the sender, required ciphertext and persisted it - the
+		// hub then broadcasts THAT row. Relaying a client frame here was a second,
+		// unauthenticated path that let anyone push plaintext with any sender_id
+		// into any room. Presence is the server's own observation of connections.
+		log.Printf("ws: refused client-originated %q frame from user %s", wsMsg.Type, client.UserID)
 	default:
 		if CallSignalTypes[wsMsg.Type] {
 			handleCallSignal(hub, client, wsMsg)

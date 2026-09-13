@@ -1,7 +1,7 @@
 package com.messenger.app.data.repository
 
 import android.util.Log
-import com.messenger.app.data.local.dao.UserDao
+import com.messenger.app.data.local.dao.ScopedUserDao
 import com.messenger.app.data.local.entity.UserEntity
 import com.messenger.app.data.model.*
 import com.messenger.app.data.remote.api.AuthApiService
@@ -21,13 +21,31 @@ class AuthRepository(
     private val authApiService: AuthApiService,
     private val tokenManager: TokenManager,
     private val keyStoreManager: KeyStoreManager,
-    private val userDao: UserDao,
+    private val userDao: ScopedUserDao,
     /**
      * Session-scoped E2EE state to clear on logout. Lazy because the vault
      * repository sits downstream of this one in the graph; resolving it eagerly
      * would close a cycle.
      */
-    private val e2eeSession: dagger.Lazy<E2EEVaultRepository>? = null
+    private val e2eeSession: dagger.Lazy<E2EEVaultRepository>? = null,
+    /**
+     * Releases the outgoing account's cache handle on logout. Optional so
+     * existing constructions keep compiling; when absent the holder still
+     * re-resolves the account on the next access, so isolation does not depend
+     * on this being wired - it just closes the file promptly.
+     */
+    private val cacheHolder: com.messenger.app.data.local.AccountCacheHolder? = null,
+    /**
+     * Drops the outgoing account's in-memory conversation and crypto state.
+     * Optional so existing constructions keep compiling; ChatRepository also
+     * re-checks the signed-in account on every account-sensitive access, so
+     * isolation does not depend on this being wired - it just releases the
+     * state promptly rather than at next touch.
+     */
+    private val chatState: dagger.Lazy<ChatRepository>? = null,
+    // Optional so existing constructions keep compiling; when absent this
+    // repository simply has no refresh path of its own.
+    private val sessionRefresher: com.messenger.app.data.remote.SessionRefresher? = null
 ) {
     companion object {
         private const val TAG = "AuthRepository"
@@ -149,7 +167,11 @@ class AuthRepository(
         }
         saveAuthData(user, tokens)
         userDao.insertUser(
-            UserEntity(
+            // Owner is taken from the authenticated response itself, not from
+            // current_user_id read afterwards: it is the immutable identity this
+            // operation belongs to.
+            owner = user.id,
+            user = UserEntity(
                 id = user.id,
                 name = user.displayName ?: user.username,
                 username = user.username,
@@ -167,36 +189,37 @@ class AuthRepository(
     /**
      * Refresh access token using the stored refresh token.
      */
+    /**
+     * Refreshes via the shared [com.messenger.app.data.remote.SessionRefresher].
+     *
+     * This used to build its own request and store the result itself, which meant
+     * it could run concurrently with the OkHttp authenticator. Under the Gate 17
+     * server two overlapping rotations send two request_ids for one credential;
+     * the second is a new logical refresh, and once the first successor is spent
+     * the server reads it as a fork and revokes the session. Delegating keeps one
+     * single-flight lock and one request_id lifecycle for the whole app.
+     */
     suspend fun refreshToken(): Result<AuthResponse> = withContext(Dispatchers.IO) {
-        try {
-            val refreshTokenResult = tokenManager.getRefreshToken()
-            val refreshToken = refreshTokenResult.getOrNull()
-            if (refreshTokenResult.isFailure || refreshToken.isNullOrEmpty()) {
-                return@withContext Result.failure(Exception("No refresh token available"))
-            }
-
-            val response = authApiService.refreshToken(RefreshTokenRequest(refreshToken))
-            if (response.isSuccessful && response.body() != null) {
-                val authResponse = response.body()!!
-                val tokens = authResponse.tokens
-                    ?: return@withContext Result.failure(Exception("Refresh response missing tokens"))
-                val userId = authResponse.user?.id ?: tokenManager.getCurrentUserId().getOrNull().orEmpty()
-                tokenManager.saveAccessToken(tokens.accessToken)
-                tokenManager.saveRefreshToken(tokens.refreshToken)
-                tokenManager.saveAccessTokenExpiresAt(
-                    System.currentTimeMillis() + tokens.expiresIn * 1000
-                )
-                if (userId.isNotBlank()) tokenManager.saveCurrentUserId(userId)
+        val refresher = sessionRefresher
+            ?: return@withContext Result.failure(Exception("No session refresher configured"))
+        when (val outcome = refresher.refresh()) {
+            is com.messenger.app.data.remote.SessionRefresher.Outcome.Rotated -> {
                 Log.d(TAG, "Token refreshed successfully")
-                Result.success(authResponse)
-            } else {
-                clearAuthData()
-                Result.failure(Exception(extractError(response.errorBody())))
+                Result.success(AuthResponse(tokens = outcome.tokens))
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Token refresh error", e)
-            clearAuthData()
-            Result.failure(e)
+            is com.messenger.app.data.remote.SessionRefresher.Outcome.AlreadyFresh ->
+                // Another caller rotated while this one waited. Nothing to do and
+                // nothing to store; the stored credential is already current.
+                Result.failure(Exception("Refresh already performed by another caller"))
+            com.messenger.app.data.remote.SessionRefresher.Outcome.SessionOver -> {
+                clearAuthData()
+                Result.failure(Exception("Session expired"))
+            }
+            com.messenger.app.data.remote.SessionRefresher.Outcome.RetryLater ->
+                // Transport failure: the pending record is intact so the same
+                // logical refresh can be retried. Do NOT clear credentials over a
+                // network blip.
+                Result.failure(Exception("Refresh could not be completed; will retry"))
         }
     }
 
@@ -237,7 +260,28 @@ class AuthRepository(
         // flag, so it silently skips its own recovery for that whole session.
         runCatching { e2eeSession?.get()?.clearSessionSecrets() }
             .onFailure { Log.w(TAG, "could not clear E2EE session state on logout: ${it.message}") }
+        // Drop any in-flight refresh belonging to the outgoing session. The
+        // account check in SessionRefresher already refuses to replay another
+        // account's record, but leaving credential material behind after sign-out
+        // is its own problem.
+        runCatching { tokenManager.clearPendingRefresh() }
+            .onFailure { Log.w(TAG, "could not clear pending refresh on logout: ${it.message}") }
         tokenManager.clearTokens()
+        // Gate 19: release the outgoing account's cache FILE, but never delete
+        // it. Logging out ends access to that account's offline history; it does
+        // not end the history. Signing back in reopens the same namespace.
+        //
+        // Ordering matters: clearTokens() removes current_user_id first, so by
+        // the time anything asks the holder again there is no account and the
+        // scoped DAOs read as empty rather than as the previous account.
+        runCatching { cacheHolder?.deactivate() }
+            .onFailure { Log.w(TAG, "could not release account cache on logout: ${it.message}") }
+        // Gate 24.1: the database namespace is only half of it. ChatRepository is
+        // a @Singleton holding ratchet sessions, Sender Keys, peer keys and chat
+        // metadata in process memory, none of which is account-namespaced. Drop
+        // it here, before any next account can touch it.
+        runCatching { chatState?.get()?.clearAccountScopedState() }
+            .onFailure { Log.w(TAG, "could not clear chat state on logout: ${it.message}") }
     }
 
     private fun extractError(errorBody: ResponseBody?): String {

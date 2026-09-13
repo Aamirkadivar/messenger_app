@@ -32,6 +32,8 @@ class HistoryKeyringStoreTest {
     }
 
     private companion object {
+        /** These exercise the Keystore round trip; the slots are account-scoped now. */
+        const val OWNER = "history-keyring-store-test-account"
         val PAYLOAD = "gate3-checkpoint-c-keyring-canary".toByteArray(Charsets.UTF_8)
         val CACHE_PAYLOAD = "gate3-checkpoint-c-cache-canary".toByteArray(Charsets.UTF_8)
     }
@@ -39,8 +41,8 @@ class HistoryKeyringStoreTest {
     @After
     fun cleanUp() = runBlocking {
         val s = store()
-        s.deleteHistoryKeyring()
-        s.deleteHistoryKeyringCache()
+        s.deleteHistoryKeyring(OWNER)
+        s.deleteHistoryKeyringCache(OWNER)
         Unit
 
     }
@@ -48,8 +50,8 @@ class HistoryKeyringStoreTest {
     @Test
     fun authoritativeCopyRoundTripsThroughKeystore() = runBlocking {
         val s = store()
-        assertTrue(s.saveHistoryKeyring(PAYLOAD).isSuccess)
-        val loaded = s.loadHistoryKeyring().getOrThrow()
+        assertTrue(s.saveHistoryKeyring(OWNER, PAYLOAD).isSuccess)
+        val loaded = s.loadHistoryKeyring(OWNER).getOrThrow()
         assertNotNull(loaded)
         assertArrayEquals(PAYLOAD, loaded)
     }
@@ -57,26 +59,26 @@ class HistoryKeyringStoreTest {
     @Test
     fun cacheCopyRoundTripsThroughKeystore() = runBlocking {
         val s = store()
-        assertTrue(s.saveHistoryKeyringCache(CACHE_PAYLOAD).isSuccess)
-        assertArrayEquals(CACHE_PAYLOAD, s.loadHistoryKeyringCache().getOrThrow())
+        assertTrue(s.saveHistoryKeyringCache(OWNER, CACHE_PAYLOAD).isSuccess)
+        assertArrayEquals(CACHE_PAYLOAD, s.loadHistoryKeyringCache(OWNER).getOrThrow())
     }
 
     /** The two copies are independent: writing one must not disturb the other. */
     @Test
     fun theTwoCopiesAreIndependent() = runBlocking {
         val s = store()
-        s.saveHistoryKeyring(PAYLOAD).getOrThrow()
-        s.saveHistoryKeyringCache(CACHE_PAYLOAD).getOrThrow()
+        s.saveHistoryKeyring(OWNER, PAYLOAD).getOrThrow()
+        s.saveHistoryKeyringCache(OWNER, CACHE_PAYLOAD).getOrThrow()
 
-        assertArrayEquals(PAYLOAD, s.loadHistoryKeyring().getOrThrow())
-        assertArrayEquals(CACHE_PAYLOAD, s.loadHistoryKeyringCache().getOrThrow())
+        assertArrayEquals(PAYLOAD, s.loadHistoryKeyring(OWNER).getOrThrow())
+        assertArrayEquals(CACHE_PAYLOAD, s.loadHistoryKeyringCache(OWNER).getOrThrow())
 
-        s.deleteHistoryKeyringCache().getOrThrow()
-        assertNull("the cache must actually be gone", s.loadHistoryKeyringCache().getOrThrow())
+        s.deleteHistoryKeyringCache(OWNER).getOrThrow()
+        assertNull("the cache must actually be gone", s.loadHistoryKeyringCache(OWNER).getOrThrow())
         assertArrayEquals(
             "the authoritative copy must survive a cache delete",
             PAYLOAD,
-            s.loadHistoryKeyring().getOrThrow()
+            s.loadHistoryKeyring(OWNER).getOrThrow()
         )
 
     }
@@ -85,10 +87,10 @@ class HistoryKeyringStoreTest {
     @Test
     fun absentReadsAsSuccessNull() = runBlocking {
         val s = store()
-        s.deleteHistoryKeyring().getOrThrow()
-        s.deleteHistoryKeyringCache().getOrThrow()
-        val a = s.loadHistoryKeyring()
-        val c = s.loadHistoryKeyringCache()
+        s.deleteHistoryKeyring(OWNER).getOrThrow()
+        s.deleteHistoryKeyringCache(OWNER).getOrThrow()
+        val a = s.loadHistoryKeyring(OWNER)
+        val c = s.loadHistoryKeyringCache(OWNER)
         assertTrue(a.isSuccess)
         assertTrue(c.isSuccess)
         assertNull(a.getOrThrow())
@@ -107,9 +109,20 @@ class HistoryKeyringStoreTest {
     fun anUnwrappedValueIsRefusedNotTrusted() = runBlocking {
         val ctx = InstrumentationRegistry.getInstrumentation().targetContext
         val prefs = ctx.getSharedPreferences("messenger_secure_prefs", android.content.Context.MODE_PRIVATE)
-        prefs.edit().putString("history_keyring_cache_v1", "not-keystore-wrapped").commit()
+        // Other suites leave their own accounts' slots behind, and this test has
+        // to plant the corruption in THIS account's slot - not whichever one a
+        // scan happens to find first.
+        prefs.edit().clear().commit()
+        // The slot is account-scoped now, so the corruption has to be planted in
+        // THIS account's slot. Writing through the API first is how the test
+        // learns that key without hardcoding the namespace format - planting it
+        // under the old account-less name would prove nothing, because that name
+        // is quarantined and never read.
+        store().saveHistoryKeyringCache(OWNER, CACHE_PAYLOAD).getOrThrow()
+        val slot = prefs.all.keys.first { it.startsWith("acct2_") && it.endsWith("history_keyring_cache_v1") }
+        prefs.edit().putString(slot, "not-keystore-wrapped").commit()
 
-        val result = store().loadHistoryKeyringCache()
+        val result = store().loadHistoryKeyringCache(OWNER)
         assertTrue("an unwrapped keyring must be refused", result.isFailure)
         assertTrue(
             result.exceptionOrNull()!!.message!!.contains("not Keystore-wrapped")
@@ -119,11 +132,11 @@ class HistoryKeyringStoreTest {
     @Test
     fun deleteIsDurableAndRepeatable() = runBlocking {
         val s = store()
-        s.saveHistoryKeyringCache(CACHE_PAYLOAD).getOrThrow()
-        assertTrue(s.deleteHistoryKeyringCache().isSuccess)
-        assertNull(s.loadHistoryKeyringCache().getOrThrow())
+        s.saveHistoryKeyringCache(OWNER, CACHE_PAYLOAD).getOrThrow()
+        assertTrue(s.deleteHistoryKeyringCache(OWNER).isSuccess)
+        assertNull(s.loadHistoryKeyringCache(OWNER).getOrThrow())
         // Deleting again is a no-op, not an error.
-        assertTrue(s.deleteHistoryKeyringCache().isSuccess)
+        assertTrue(s.deleteHistoryKeyringCache(OWNER).isSuccess)
 
     }
 
@@ -133,7 +146,7 @@ class HistoryKeyringStoreTest {
         // length-limited in any surprising way.
         val big = ByteArray(64 * 1024) { (it % 251).toByte() }
         val s = store()
-        assertTrue(s.saveHistoryKeyringCache(big).isSuccess)
-        assertArrayEquals(big, s.loadHistoryKeyringCache().getOrThrow())
+        assertTrue(s.saveHistoryKeyringCache(OWNER, big).isSuccess)
+        assertArrayEquals(big, s.loadHistoryKeyringCache(OWNER).getOrThrow())
     }
 }

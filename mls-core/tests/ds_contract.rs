@@ -21,6 +21,16 @@ use std::collections::HashMap;
 
 use mls_core::client::ClientHandle;
 
+// Used only to construct the deliberately-invalid fixture below. The tests
+// themselves still drive everything through `mls_core`'s public API.
+use openmls::prelude::tls_codec::Serialize as _;
+use openmls::prelude::{
+    BasicCredential, Capabilities, Ciphersuite, CredentialWithKey, Extension, Extensions,
+    KeyPackage, LastResortExtension,
+};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_rust_crypto::OpenMlsRustCrypto;
+
 // ---------------------------------------------------------------- fake DS
 
 #[derive(Debug, PartialEq)]
@@ -628,16 +638,37 @@ fn own_other_device_reads_the_message() {
 //
 // These pin the contract the fix relies on: rejection never touches the group,
 // and a caller can find the bad package without staging anything.
+//
+// That original rejection turned out to be OUR bug, not the package's. OpenMLS
+// compared extension enum VARIANTS rather than numeric extension IDs, so a
+// GREASE extension a leaf legitimately declared as `Grease(id)` never matched
+// the `Unknown(id)` it actually used. Both comparison sites are corrected in the
+// vendored copy (third_party/openmls-0.8.1/PROVENANCE.md) and the captured
+// package now validates - as it always should have.
+//
+// The fixtures are therefore deliberately split, and must never again be the
+// same package:
+//
+//   * `legacy_mlspp_key_package()` - the real captured package. POSITIVE
+//     evidence: it must keep validating. This is the regression that guards
+//     GREASE interoperability with the Windows client.
+//   * `semantically_invalid_key_package()` - built here on purpose. NEGATIVE
+//     evidence: cryptographically sound, semantically refused.
+//
+// The batch-isolation contract itself is unchanged - all-or-nothing Add, no
+// epoch movement on rejection, caller can pre-filter - and is now carried by
+// the second fixture.
 
 /// A real KeyPackage captured from the deployment whose JOIN broke.
 ///
-/// Published by the Windows client's mlspp stack, it is structurally valid TLS -
-/// it deserializes cleanly - and is rejected only at the semantic step, with
-/// "A key package extension is not supported in the leaf's capabilities". That
-/// distinction is the whole point: a fixture that merely fails to PARSE passes
-/// these tests while leaving the real failure mode uncovered - exactly the
-/// mistake the first version of this file made, where two mutations of the
-/// validate path survived.
+/// Published by the Windows client's mlspp stack. It declares two GREASE
+/// extension IDs (0xdada, 0x1a1a) in its leaf capabilities and then uses both -
+/// 0xdada as a LeafNode extension, 0x1a1a as a KeyPackage extension. Declaring
+/// what it uses is exactly what RFC 9420 s7.2 asks of a non-default extension,
+/// and this is the shape the variant-comparison bug refused.
+///
+/// Kept byte-for-byte as captured: no synthetic fixture can stand in for real
+/// interop evidence.
 ///
 /// Public material only: a published KeyPackage is handed to any claimer on
 /// request and carries no private key.
@@ -655,7 +686,7 @@ const LEGACY_MLSPP_KEY_PACKAGE: &str = concat!(
     "cc0b3e5c43e6018a2ae27e09081f55b90ac871d937541c433bfa064a0d",
 );
 
-fn poison_key_package() -> Vec<u8> {
+fn legacy_mlspp_key_package() -> Vec<u8> {
     (0..LEGACY_MLSPP_KEY_PACKAGE.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&LEGACY_MLSPP_KEY_PACKAGE[i..i + 2], 16).expect("hex"))
@@ -665,6 +696,55 @@ fn poison_key_package() -> Vec<u8> {
 /// A package the core cannot use, for cases where the reason does not matter.
 fn unusable_key_package(good: &[u8]) -> Vec<u8> {
     good[..good.len() / 2].to_vec()
+}
+
+/// A KeyPackage that is cryptographically perfect and semantically invalid.
+///
+/// It carries a KeyPackage extension whose type its own leaf never declares in
+/// `capabilities.extensions`, so validation refuses it with "A key package
+/// extension is not supported in the leaf's capabilities" - the same failure the
+/// production JOIN hit, reproduced honestly rather than borrowed from a package
+/// that was actually fine.
+///
+/// It uses `last_resort`, a RECOGNISED extension type, and that choice is the
+/// whole point. RFC 9420 s13.4 requires a receiver to ignore *unknown*
+/// extensions in `KeyPackage.extensions`, so an undeclared unknown id (GREASE or
+/// otherwise) is no longer a rejection and cannot carry this contract. A
+/// recognised type is still bound by s10's requirement that what a KeyPackage
+/// uses be listed in `leaf_node.capabilities`, so this stays refused.
+///
+/// Everything else is valid - real signatures over real keys, a live lifetime,
+/// the supported protocol version, distinct init and encryption keys - so a test
+/// using it cannot pass for an accidental reason such as a truncated blob.
+fn semantically_invalid_key_package() -> Vec<u8> {
+    const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+    let provider = OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).expect("signer");
+    let credential = BasicCredential::new(b"deliberately-invalid".to_vec());
+
+    KeyPackage::builder()
+        .key_package_extensions(
+            Extensions::<KeyPackage>::from_vec(vec![Extension::LastResort(
+                LastResortExtension::new(),
+            )])
+            .expect("key package extension list"),
+        )
+        // The capabilities deliberately stay empty: last_resort is never declared.
+        .leaf_node_capabilities(Capabilities::builder().extensions(vec![]).build())
+        .build(
+            CIPHERSUITE,
+            &provider,
+            &signer,
+            CredentialWithKey {
+                credential: credential.into(),
+                signature_key: signer.to_public_vec().into(),
+            },
+        )
+        .expect("the package must BUILD; only its validation may fail")
+        .key_package()
+        .tls_serialize_detached()
+        .expect("serialize")
 }
 
 #[test]
@@ -826,13 +906,47 @@ fn independent_devices_get_independent_mls_identities() {
 }
 
 
+/// The captured mlspp package must VALIDATE.
+///
+/// This is the GREASE interoperability regression. Before the two OpenMLS
+/// comparison fixes this exact package was refused with "A key package extension
+/// is not supported in the leaf's capabilities", and that is what kept the
+/// Windows client out of Android groups. It declares the GREASE ids it uses, so
+/// there was never a conforming reason to reject it.
+///
+/// The assertion covers the full validate path, not merely deserialization: a
+/// package that only parses proves nothing about the defect this guards.
 #[test]
-fn the_real_legacy_package_is_well_formed_but_semantically_rejected() {
+fn the_real_legacy_mlspp_package_with_declared_grease_extensions_validates() {
+    let alice = Device::new("alice", "a1");
+    let raw = legacy_mlspp_key_package();
+
+    alice
+        .handle
+        .validate_key_package(&raw)
+        .expect("the captured mlspp package declares the GREASE ids it uses, so it must validate");
+
+    // Recovering the leaf signature key proves validation ran to completion
+    // rather than stopping somewhere harmless.
+    let key = alice
+        .handle
+        .key_package_signature_key(&raw)
+        .expect("a validated package must yield its leaf signature key");
+    assert_eq!(32, key.len(), "Ed25519 signature key, got {} bytes", key.len());
+}
+
+/// The negative half, kept next to it so the split stays visible: a package that
+/// is invalid for a real semantic reason must still be refused, and refused at
+/// the validate step rather than at parsing.
+///
+/// Together these two tests carry the distinction the old single fixture blurred.
+#[test]
+fn a_semantically_invalid_package_is_still_rejected() {
     let alice = Device::new("alice", "a1");
     let err = alice
         .handle
-        .validate_key_package(&poison_key_package())
-        .expect_err("the captured legacy package must be rejected");
+        .validate_key_package(&semantically_invalid_key_package())
+        .expect_err("an undeclared extension must still be refused");
     let msg = format!("{err}");
     assert!(
         msg.contains("invalid key package"),
@@ -842,22 +956,29 @@ fn the_real_legacy_package_is_well_formed_but_semantically_rejected() {
         !msg.contains("bad key package"),
         "this fixture must reach the validate step, not fail at deserialize: {msg}"
     );
+    assert!(
+        msg.contains("not supported in the leaf's capabilities"),
+        "it must fail for the intended reason, not an accidental one: {msg}"
+    );
 }
 
 #[test]
-fn a_legacy_package_must_not_poison_a_healthy_join() {
+fn an_invalid_package_must_not_poison_a_healthy_join() {
     let mut ds = FakeDs::new();
     let alice = Device::new("alice", "a1");
     let bob = Device::new("bob", "b1");
-    let gid = b"g-legacy-poison".to_vec();
+    let gid = b"g-invalid-poison".to_vec();
     alice.handle.create_group(&gid).expect("create");
 
     let bob_kp = bob.handle.key_package().expect("kp");
-    let batch = vec![poison_key_package(), bob_kp.clone()];
+    // The atomicity contract needs a genuinely invalid package. The captured
+    // mlspp package is no longer one - it validates - so it cannot carry this
+    // test any more.
+    let batch = vec![semantically_invalid_key_package(), bob_kp.clone()];
 
     assert!(
         alice.handle.add_members(&gid, &batch).is_err(),
-        "a batch containing the legacy package must be rejected wholesale"
+        "a batch containing an invalid package must be rejected wholesale"
     );
     assert_eq!(0, alice.handle.epoch(&gid).expect("epoch"), "no epoch change");
 
@@ -919,8 +1040,11 @@ fn signature_key_is_stable_per_device_and_unique_across_devices() {
 
     assert_eq!(a1, a2, "one device packages must share its signature key");
     assert_ne!(a1, b1, "two devices must not share a signature key");
+    // An unusable package must still yield nothing. The captured mlspp package
+    // no longer serves here: it validates, so it legitimately HAS a signature key
+    // (see the_real_legacy_mlspp_package_with_declared_grease_extensions_validates).
     assert!(
-        a.handle.key_package_signature_key(&poison_key_package()).is_err(),
+        a.handle.key_package_signature_key(&semantically_invalid_key_package()).is_err(),
         "an unusable package must not yield a signature key"
     );
 }
@@ -1002,7 +1126,11 @@ fn two_candidates_sharing_a_signature_key_do_not_block_the_others() {
 #[test]
 fn the_full_production_batch_shape_admits_the_healthy_device() {
     // The batch that failed in production: a legacy mlspp package, two orphans
-    // sharing one MLS identity, and the one clean device.
+    // sharing one MLS identity, and the one clean device - plus a deliberately
+    // invalid package, because the mlspp one no longer supplies the negative
+    // case. The filter must now separate three different things: a duplicate
+    // signature key, a genuinely invalid package, and packages that are simply
+    // fine (the mlspp package among them).
     let mut ds = FakeDs::new();
     let mehdi = Device::new("mehdi", "bd63c60a");
     let orphan = Device::new("orphan", "shared");
@@ -1010,16 +1138,33 @@ fn the_full_production_batch_shape_admits_the_healthy_device() {
     let gid = b"g-production".to_vec();
     mehdi.handle.create_group(&gid).expect("create");
 
+    let legacy = legacy_mlspp_key_package();
+    let invalid = semantically_invalid_key_package();
     let batch = vec![
-        poison_key_package(),
+        legacy.clone(),
         orphan.handle.key_package().unwrap(),
         koueosh.handle.key_package().unwrap(),
         orphan.handle.key_package().unwrap(),
+        invalid.clone(),
     ];
     assert!(mehdi.handle.add_members(&gid, &batch).is_err(), "unfiltered this is fatal");
 
     let usable = admissible(&mehdi, &gid, &batch);
-    assert_eq!(2, usable.len(), "one orphan and koueosh survive; the mlspp package does not");
+    assert_eq!(
+        3,
+        usable.len(),
+        "the mlspp package, one orphan and koueosh survive; the duplicate orphan and the          invalid package do not"
+    );
+    // The two halves of the filter, asserted separately so a future regression
+    // cannot hide behind the count alone.
+    assert!(
+        usable.contains(&legacy),
+        "the real mlspp package declares the GREASE ids it uses and must be admitted"
+    );
+    assert!(
+        !usable.contains(&invalid),
+        "the deliberately invalid package must still be filtered out"
+    );
 
     let expected = mehdi.handle.epoch(&gid).unwrap();
     let (commit, welcome) = mehdi.handle.add_members(&gid, &usable).expect("add");

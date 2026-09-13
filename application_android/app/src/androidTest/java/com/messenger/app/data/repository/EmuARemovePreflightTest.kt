@@ -4,11 +4,13 @@ import android.util.Base64
 import android.util.Log
 import androidx.test.platform.app.InstrumentationRegistry
 import com.messenger.app.BuildConfig
+import com.messenger.app.data.remote.SessionRefresher
 import com.messenger.app.data.remote.TokenRefreshAuthenticator
 import com.messenger.app.data.remote.api.AuthApiService
 import com.messenger.app.data.remote.api.ChatApiService
 import com.messenger.app.security.KeyStoreManagerImpl
 import com.messenger.app.security.TokenManagerImpl
+import javax.inject.Provider
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
@@ -28,6 +30,9 @@ import retrofit2.converter.kotlinx.serialization.asConverterFactory
  * The only HTTP is read-only verification (GET group).
  */
 class EmuARemovePreflightTest {
+    private val PROBE_OWNER =
+        com.messenger.app.security.MlsOwner("probe-account", "probe-device")
+
 
     private companion object {
         const val TAG = "R3PRE"
@@ -56,7 +61,7 @@ class EmuARemovePreflightTest {
             .client(OkHttpClient()).addConverterFactory(json.asConverterFactory(ct))
             .build().create(AuthApiService::class.java)
         val client = OkHttpClient.Builder()
-            .authenticator(TokenRefreshAuthenticator(tm) { authApi }).build()
+            .authenticator(TokenRefreshAuthenticator(SessionRefresher(tm, Provider { authApi }))).build()
         val api: ChatApiService = Retrofit.Builder().baseUrl(BuildConfig.API_BASE_URL)
             .client(client).addConverterFactory(json.asConverterFactory(ct))
             .build().create(ChatApiService::class.java)
@@ -88,7 +93,7 @@ class EmuARemovePreflightTest {
         val localEpoch = repo.epoch(CHAT)
         p("adder local epoch : $localEpoch")
         if (localEpoch != EXPECTED_EPOCH) { p("ABORT: local epoch != 10"); return@runBlocking }
-        val gid = Base64.decode(tm.loadMlsBundle("mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
+        val gid = Base64.decode(tm.loadMlsBundle(PROBE_OWNER, "mls2_gid_$CHAT").getOrNull(), Base64.NO_WRAP)
         if (gid.hex() != EXPECTED_GID) { p("ABORT: local GID mismatch"); return@runBlocking }
         p("GATE 2 local epoch 10 + GID : OK")
 

@@ -5,6 +5,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.SaveableStateHolder
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -100,7 +101,14 @@ fun MainNavGraph(
         }
 
         composable(Routes.REGISTER) {
-            val viewModel: AuthViewModel = hiltViewModel()
+            // Scoped to the LOGIN entry, so registration and sign-in share ONE
+            // AuthViewModel. A 2FA challenge raised by the sign-in that follows
+            // registration is held in that view model's login state; with a
+            // per-destination instance it would be discarded on the way back and
+            // the OTP field would open with nothing to verify. REGISTER is only
+            // ever reached from LOGIN, so this entry always exists.
+            val viewModel: AuthViewModel =
+                hiltViewModel(remember(it) { navController.getBackStackEntry(Routes.LOGIN) })
             RegisterScreen(
                 viewModel = viewModel,
                 onRegisterSuccess = {

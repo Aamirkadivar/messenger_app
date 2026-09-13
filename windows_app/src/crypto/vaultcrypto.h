@@ -49,6 +49,14 @@ public:
         QByteArray mk;
     };
 
+    /**
+     * RFC 5869 HKDF-SHA256, exposed so the history-archive adapter can derive per-message keys
+     * without a second HKDF implementation. This forwards to the existing file-local function;
+     * the algorithm is unchanged.
+     */
+    static QByteArray hkdfSha256(const QByteArray& ikm, const QByteArray& salt,
+                                 const QByteArray& info, int length);
+
     static QByteArray randomBytes(int n);
     static QByteArray derivePasswordKek(const QString& password, const QByteArray& salt, const ArgonParams& params);
     static QByteArray deriveRecoveryKek(const QByteArray& recoveryKey, const QByteArray& salt);

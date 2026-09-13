@@ -4,10 +4,13 @@ go 1.21
 
 require (
 	firebase.google.com/go/v4 v4.15.0
+	github.com/fasthttp/websocket v1.5.3
 	github.com/gofiber/fiber/v2 v2.52.0
 	github.com/gofiber/websocket/v2 v2.2.1
 	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/google/uuid v1.6.0
+	github.com/jackc/pgx/v5 v5.5.5
+	github.com/joho/godotenv v1.5.1
 	golang.org/x/crypto v0.24.0
 	google.golang.org/api v0.182.0
 	gorm.io/driver/postgres v1.5.9
@@ -25,9 +28,7 @@ require (
 	cloud.google.com/go/storage v1.40.0 // indirect
 	github.com/MicahParks/keyfunc v1.9.0 // indirect
 	github.com/andybalholm/brotli v1.0.5 // indirect
-	github.com/fasthttp/websocket v1.5.3 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
 	github.com/go-logr/logr v1.4.1 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.0 // indirect
@@ -38,11 +39,9 @@ require (
 	github.com/googleapis/gax-go/v2 v2.12.4 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
-	github.com/jackc/pgx/v5 v5.5.5 // indirect
 	github.com/jackc/puddle/v2 v2.2.1 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/klauspost/compress v1.17.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -52,7 +51,6 @@ require (
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasthttp v1.51.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
-	github.com/x448/float16 v0.8.4 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.49.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.49.0 // indirect

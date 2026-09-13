@@ -72,7 +72,7 @@ class HistoryKeyringRepositoryTest {
         var cacheWrites = 0
         var cacheDeletes = 0
 
-        override suspend fun saveHistoryKeyring(sealed: ByteArray): Result<Unit> {
+        override suspend fun saveHistoryKeyring(owner: String, sealed: ByteArray): Result<Unit> {
             if (saveFails) {
                 return Result.failure(IllegalStateException("Keystore wrapping unavailable"))
             }
@@ -81,17 +81,17 @@ class HistoryKeyringRepositoryTest {
             return Result.success(Unit)
         }
 
-        override suspend fun loadHistoryKeyring(): Result<ByteArray?> {
+        override suspend fun loadHistoryKeyring(owner: String): Result<ByteArray?> {
             if (loadFails) return Result.failure(IllegalStateException("could not be unwrapped"))
             return Result.success(blob?.copyOf())
         }
 
-        override suspend fun deleteHistoryKeyring(): Result<Unit> {
+        override suspend fun deleteHistoryKeyring(owner: String): Result<Unit> {
             blob = null
             return Result.success(Unit)
         }
 
-        override suspend fun saveHistoryKeyringCache(plain: ByteArray): Result<Unit> {
+        override suspend fun saveHistoryKeyringCache(owner: String, plain: ByteArray): Result<Unit> {
             if (cacheSaveFails) {
                 return Result.failure(IllegalStateException("Keystore wrapping unavailable"))
             }
@@ -100,12 +100,12 @@ class HistoryKeyringRepositoryTest {
             return Result.success(Unit)
         }
 
-        override suspend fun loadHistoryKeyringCache(): Result<ByteArray?> {
+        override suspend fun loadHistoryKeyringCache(owner: String): Result<ByteArray?> {
             if (cacheLoadFails) return Result.failure(IllegalStateException("cache unreadable"))
             return Result.success(cache?.copyOf())
         }
 
-        override suspend fun deleteHistoryKeyringCache(): Result<Unit> {
+        override suspend fun deleteHistoryKeyringCache(owner: String): Result<Unit> {
             cacheDeletes++
             if (cacheDeleteFails) return Result.failure(IllegalStateException("cache delete failed"))
             cache = null
@@ -113,10 +113,10 @@ class HistoryKeyringRepositoryTest {
         }
 
         private var generation: Long? = null
-        override suspend fun saveHistoryKeyringGeneration(generation: Long) =
+        override suspend fun saveHistoryKeyringGeneration(owner: String, generation: Long) =
             Result.success(Unit).also { this.generation = generation }
-        override suspend fun loadHistoryKeyringGeneration() = Result.success(generation)
-        override suspend fun deleteHistoryKeyringGeneration() =
+        override suspend fun loadHistoryKeyringGeneration(owner: String) = Result.success(generation)
+        override suspend fun deleteHistoryKeyringGeneration(owner: String) =
             Result.success(Unit).also { generation = null }
     }
 

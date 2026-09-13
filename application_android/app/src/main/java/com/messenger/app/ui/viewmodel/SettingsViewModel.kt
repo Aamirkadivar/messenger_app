@@ -98,7 +98,7 @@ class SettingsViewModel @Inject constructor(
     private val chatApiService: ChatApiService,
     private val tokenManager: TokenManager,
     private val e2eeVaultRepository: E2EEVaultRepository,
-    private val conversationDao: com.messenger.app.data.local.dao.ConversationDao,
+    private val conversationDao: com.messenger.app.data.local.dao.ScopedConversationDao,
     private val historyRotation: com.messenger.app.data.repository.HistoryRotationCoordinator
 ) : ViewModel() {
 
