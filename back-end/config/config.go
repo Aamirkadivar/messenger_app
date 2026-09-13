@@ -21,7 +21,6 @@ type Config struct {
 	JWTSecret                  string `mapstructure:"JWT_SECRET"`
 	JWTExpiration              int64  `mapstructure:"JWT_EXPIRATION"`
 	RefreshTokenExpiration     int64  `mapstructure:"REFRESH_TOKEN_EXPIRATION"`
-	EncryptionKey              string `mapstructure:"ENCRYPTION_KEY"`
 	FirebaseServiceAccount     string `mapstructure:"FIREBASE_SERVICE_ACCOUNT"`
 	FirebaseServiceAccountPath string `mapstructure:"FIREBASE_SERVICE_ACCOUNT_PATH"`
 	// TURN (coturn) config for call NAT traversal - see back-end/turnserver.conf.
@@ -105,7 +104,6 @@ func LoadConfig() *Config {
 		JWTSecret:                  getEnv("JWT_SECRET", ""),
 		JWTExpiration:              getEnvInt64("JWT_EXPIRATION", 24),
 		RefreshTokenExpiration:     getEnvInt64("REFRESH_TOKEN_EXPIRATION", 168),
-		EncryptionKey:              getEnv("ENCRYPTION_KEY", "default-encryption-key"),
 		FirebaseServiceAccount:     getEnv("FIREBASE_SERVICE_ACCOUNT", ""),
 		FirebaseServiceAccountPath: getEnv("FIREBASE_SERVICE_ACCOUNT_PATH", ""),
 		TURNSecret:                 getEnv("TURN_SECRET", ""),

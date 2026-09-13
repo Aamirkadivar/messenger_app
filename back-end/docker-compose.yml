@@ -40,7 +40,6 @@ services:
       JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
       JWT_EXPIRATION: 24
       REFRESH_TOKEN_EXPIRATION: 168
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-your-32-byte-encryption-key-here}
       FIREBASE_SERVICE_ACCOUNT_PATH: /app/firebase/service-account.json
       TURN_SECRET: ${TURN_SECRET}
       TURN_HOST: ${TURN_HOST:-localhost}
